@@ -412,6 +412,11 @@ export function createCameras(aircraftGroup, renderer) {
 
   function onViewKey(e) {
     if (e.repeat || e.metaKey) return;
+    // Same guard input.js uses: never steal a keystroke aimed at a text field.
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) {
+      return;
+    }
     if (e.code === 'KeyV') panelView = !panelView;
   }
 
