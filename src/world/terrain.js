@@ -510,13 +510,33 @@ export async function createTerrain(scene, opts = {}) {
   //
   // Each pass descends one level, so MAX_LEVEL + 2 is a hard bound on the loop
   // and the break is what normally ends it.
-  buildDeadline = Infinity;
-  let passes = 0;
-  for (; passes <= MAX_LEVEL + 1; passes++) {
-    selectFrom(cfg.originX, cfg.originY, cfg.originZ);
-    if (prefetch.length === 0) break;
-    drainPrefetch();
+  /**
+   * Run selection to a fixed point at (x, y, z), building every chunk it asks
+   * for, with no time budget. Blocking, and deliberately so.
+   *
+   * Called at bootstrap, and again by main.js after a teleport — jumping 84 km
+   * to Mount Rainier lands in a part of the tree that has never been visited,
+   * and letting the streamer converge over the next ~120 frames means two
+   * seconds of flying above a 4 km-cell approximation of the Cascades. Costs
+   * about a second of stall at the moment of the jump, which is the right
+   * trade for a discontinuity the user asked for.
+   *
+   * @returns {number} passes taken (each pass descends one LOD level)
+   */
+  function converge(x, y, z) {
+    const prevDeadline = buildDeadline;
+    buildDeadline = Infinity;
+    let n = 0;
+    for (; n <= MAX_LEVEL + 1; n++) {
+      selectFrom(x, y, z);
+      if (prefetch.length === 0) break;
+      drainPrefetch();
+    }
+    buildDeadline = prevDeadline;
+    return n;
   }
+
+  const passes = converge(cfg.originX, cfg.originY, cfg.originZ);
   buildDeadline = 0;
   const tNodes = performance.now();
 
@@ -817,7 +837,7 @@ export async function createTerrain(scene, opts = {}) {
     }
   }
 
-  return { group, getHeightAt, update, dispose };
+  return { group, getHeightAt, update, converge, dispose };
 }
 
 // ===========================================================================

@@ -555,9 +555,36 @@ export function createInput(domElement) {
     keys.clear();
   }
 
+  /**
+   * Force the throttle lever to a position, 0..1.
+   *
+   * ADDITIVE to MODULES.md §2.12 and still a pure sensor: this moves the
+   * modelled LEVER, exactly as pressing Z or X does, and the next get() picks
+   * it up like any other lever position. main.js needs it because teleporting
+   * the aeroplane to 3,000 ft has to set cruise power with it — otherwise you
+   * arrive at altitude with the throttle closed.
+   *
+   * @param {number} v 0 = idle, 1 = full
+   */
+  function setThrottle(v) {
+    controls.throttle = clamp(Number.isFinite(v) ? v : 0, 0, 1);
+  }
+
+  /** Drop any flap selection back to clean, matching the F-key notch state. */
+  function setFlaps(v) {
+    let best = 0;
+    for (let i = 1; i < FLAP_NOTCHES.length; i += 1) {
+      if (Math.abs(FLAP_NOTCHES[i] - v) < Math.abs(FLAP_NOTCHES[best] - v)) best = i;
+    }
+    flapIndex = best;
+    controls.flaps = FLAP_NOTCHES[best];
+  }
+
   return {
     get,
     dispose,
+    setThrottle,
+    setFlaps,
     setMouseYoke,
     isMouseYoke: () => mouseYoke,
     hasGamepad: () => readPad() !== null,

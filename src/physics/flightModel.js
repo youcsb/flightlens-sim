@@ -1007,18 +1007,42 @@ export function createFlightModel(opts = {}) {
    * it is pre-squatted by the static spring deflection so it does not visibly
    * settle on the first frame.
    *
+   * A fourth, OPTIONAL argument places the aircraft in the air. It is additive
+   * to MODULES.md §2.10 and every field is optional; omit it and behaviour is
+   * exactly what it was. It exists because a location picker has to be able to
+   * say "3,400 m beside Mount Rainier at 110 kt" without knowing where the
+   * scene origin is, and re-creating the flight model to do that would throw
+   * away the state object every other module is holding a reference to.
+   *
+   * `altitudeMslM` wins over `altitudeAglM` when both are given, and is
+   * clamped so it can never place the aircraft underground.
+   *
    * @param {number} [lat] degrees
    * @param {number} [lon] degrees
    * @param {number} [headingDeg] TRUE heading, 0..360
+   * @param {{altitudeAglM?:number, altitudeMslM?:number, airspeedMs?:number}} [placement]
    */
-  function reset(lat, lon, headingDeg) {
+  function reset(lat, lon, headingDeg, placement) {
     const useLat = Number.isFinite(lat) ? lat : cfg.startLat;
     const useLon = Number.isFinite(lon) ? lon : cfg.startLon;
     const useHdg = Number.isFinite(headingDeg) ? headingDeg : cfg.startHeadingDeg;
 
     llToLocal(useLat, useLon, _local);
     const ground = groundHeightFn(_local.x, _local.z);
-    const agl = Math.max(0, cfg.startAltitudeAglM);
+    let agl = Math.max(0, cfg.startAltitudeAglM);
+    let speed = Math.max(0, cfg.startAirspeedMs);
+    if (placement) {
+      if (Number.isFinite(placement.altitudeAglM)) {
+        agl = Math.max(0, placement.altitudeAglM);
+      }
+      if (Number.isFinite(placement.altitudeMslM)) {
+        // The ground below may be higher than the requested MSL — over the
+        // Cascades that is easy to ask for by accident. Never spawn inside a
+        // mountain; 30 m is one wingspan of daylight.
+        agl = Math.max(30, placement.altitudeMslM - ground);
+      }
+      if (Number.isFinite(placement.airspeedMs)) speed = Math.max(0, placement.airspeedMs);
+    }
     state.position.set(
       _local.x,
       ground + GEAR_H + agl - (agl > 0 ? 0 : STATIC_SQUAT),
@@ -1029,7 +1053,7 @@ export function createFlightModel(opts = {}) {
     // -Z, which is the identity orientation, so heading maps to -yaw.
     state.orientation.setFromEuler(_euler.set(0, -useHdg * DEG_TO_RAD, 0, 'YXZ'));
     state.angularVelocity.set(0, 0, 0);
-    state.airspeedMs = Math.max(0, cfg.startAirspeedMs);
+    state.airspeedMs = speed;
     state.alphaRad = 0;
     state.betaRad = 0;
 
@@ -1049,7 +1073,11 @@ export function createFlightModel(opts = {}) {
     surfRoll = 0;
     surfYaw = 0;
     flapPos = 0;
-    engineSpool = 0;
+    // An airborne spawn starts with the engine already making cruise power.
+    // Spooling up from zero at 3,000 ft means the aeroplane appears in a
+    // descent, which reads as a bug rather than as a glider start.
+    engineSpool = agl > 0 ? 0.7 : 0;
+    state.rpm = cfg.idleRpm + engineSpool * (cfg.maxRpm - cfg.idleRpm);
     state.flapsPos = 0;
     state.flaps = 0;
     state.brakes = 0;

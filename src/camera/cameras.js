@@ -243,6 +243,12 @@ class Spring1 {
     this.x = value;
     this.v = 0;
   }
+
+  /** Place the spring AND give it a velocity — see Spring3.settle(). */
+  set(value, velocity) {
+    this.x = value;
+    this.v = velocity;
+  }
 }
 
 /** Three independent Spring1s, kept as a struct to avoid per-frame allocation. */
@@ -268,6 +274,28 @@ class Spring3 {
     this.sx.snap(v.x);
     this.sy.snap(v.y);
     this.sz.snap(v.z);
+  }
+
+  /**
+   * Put the spring straight into the steady state it would otherwise take a
+   * second to reach: at `pos`, already travelling at `vel`.
+   *
+   * `snap()` alone is wrong for a moving subject. A critically-damped spring
+   * chasing a target that moves at v settles a fixed distance BEHIND it —
+   * exactly `v * 2*zeta/omega`, which is what CHASE_LEAD feeds forward to
+   * cancel. Snapping the spring onto the fed-forward target therefore places
+   * the camera where the boom and the lead cancel, i.e. on top of the
+   * aeroplane, and then lets it drift back over the next second. On the ground
+   * it looks fine because v is zero; teleport in at 100 kt and the first
+   * second of the new location is filmed from inside the fuselage.
+   *
+   * @param {THREE.Vector3} pos
+   * @param {THREE.Vector3} vel
+   */
+  settle(pos, vel) {
+    this.sx.set(pos.x, vel.x);
+    this.sy.set(pos.y, vel.y);
+    this.sz.set(pos.z, vel.z);
   }
 }
 
@@ -346,6 +374,8 @@ export function createCameras(aircraftGroup, renderer) {
   const _q = new THREE.Quaternion();
   const _acPos = new THREE.Vector3();
   const _vel = new THREE.Vector3();
+  /** The velocity feed-forward buildChase applied this frame, if any. */
+  const _lead = new THREE.Vector3();
 
   const api = {
     /** @type {THREE.PerspectiveCamera} Reassigned by cycle(). Read fresh each frame. */
@@ -354,10 +384,24 @@ export function createCameras(aircraftGroup, renderer) {
     mode: MODE_NAMES[0],
     cycle,
     setMode,
+    snap,
     update,
     onResize,
     dispose,
   };
+
+  /**
+   * Drop the smoothing for one frame so the next update() places the camera
+   * exactly where it belongs instead of springing toward it.
+   *
+   * main.js calls this after a teleport. Without it, jumping 84 km to Mount
+   * Rainier makes the chase camera sweep the whole way across the map at
+   * spring speed, which reads as the world sliding past rather than as a cut.
+   */
+  function snap() {
+    primed = false;
+    flybyPlanted = false;
+  }
 
   // =========================================================================
   // View input (owned here — input.js deliberately leaves the wheel alone)
@@ -530,8 +574,10 @@ export function createCameras(aircraftGroup, renderer) {
 
     _target.add(_acPos);
 
-    // Velocity feed-forward kills the constant lag; see the header.
-    _target.addScaledVector(_vel, CHASE_LEAD);
+    // Velocity feed-forward kills the constant lag; see the header. Recorded
+    // so a prime/snap can subtract it again — see Spring3.settle().
+    _lead.copy(_vel).multiplyScalar(CHASE_LEAD);
+    _target.add(_lead);
 
     liftAboveGround(_target, MIN_GROUND_CLEARANCE);
 
@@ -656,6 +702,9 @@ export function createCameras(aircraftGroup, renderer) {
     const headed = state && Number.isFinite(state.headingDeg) ? state : { headingDeg: 0 };
 
     const mode = MODE_NAMES[index];
+    // Only chase feeds velocity forward; clear it so a prime in any other mode
+    // does not subtract last frame's lead.
+    _lead.set(0, 0, 0);
 
     switch (mode) {
       case 'chase':
@@ -691,8 +740,10 @@ export function createCameras(aircraftGroup, renderer) {
       posSpring.snap(_pos);
     } else {
       if (!primed) {
-        posSpring.snap(_target);
-        _pos.copy(_target);
+        // Land on the pose the spring converges to, not on the fed-forward
+        // target — see Spring3.settle().
+        _pos.copy(_target).sub(_lead);
+        posSpring.settle(_pos, _vel);
       } else {
         posSpring.sx.omega = mode === 'orbit' ? ORBIT_OMEGA : CHASE_OMEGA;
         posSpring.sy.omega = posSpring.sx.omega;
