@@ -317,10 +317,48 @@ const MAX_N_PER_W = 8;
  * pirouettes. Measured with 30 deg: a mere 0.15 of pedal held through the
  * takeoff roll swung the heading 250 deg. Real pilots use about a degree; a
  * keyboard gives you all of it or none.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE FADE IS 1/V^1.5 AND NOT LINEAR
+ * ---------------------------------------------------------------------------
+ * Reducing STEER_MAX to 10 deg was necessary but not sufficient, because the
+ * problem is the SHAPE of the fade, not its endpoint. A steering angle delta
+ * held at ground speed V yields a yaw rate of roughly V*tan(delta)/wheelbase —
+ * so a fade that decays SLOWER than 1/V hands the pilot MORE yaw authority the
+ * faster they go, which is precisely backwards and is what made the takeoff
+ * roll uncontrollable.
+ *
+ * Measured on the old linear fade (gain = 1 - (V-3)/25, floor 0.15):
+ *
+ *   no rudder at all        KBFI 32L, heading 330 -> 305 by 39 kt, off the
+ *                           runway every time (slipstream, ~2.5 deg/s left)
+ *   full right rudder held  heading 330 -> 149 in six seconds, still only
+ *                           26 kt: a pirouette on the nosewheel
+ *
+ * There was no keyboard input in between that held the centreline, because at
+ * 20 m/s the old curve still gave 0.32 of 10 deg = 3.3 deg of nosewheel, i.e.
+ * a 29 m turn radius at 40 kt.
+ *
+ * A 1/V law gives constant yaw-rate authority at every speed; V_REF/V raised to
+ * 1.5 lets it fall off a little faster still, which leaves full deflection for
+ * taxiing and almost none for the roll. Resulting full-pedal authority:
+ *
+ *   3 m/s  (taxi)   10 deg    ~30 deg/s   tight enough to turn onto a runway
+ *   10 m/s (20 kt)  1.6 deg   ~10 deg/s
+ *   20 m/s (39 kt)  0.6 deg   ~7 deg/s    against 2.5 deg/s of slipstream
+ *
+ * That ratio — roughly 3x the disturbance — is what makes the centreline
+ * holdable with partial pedal instead of being a choice between two failures.
+ * The AERODYNAMIC rudder is untouched by any of this; it is a separate moment
+ * (cN) and keeps full authority for slips and crosswind landings.
  */
 const STEER_MAX = 0.18; // 10 deg
-const STEER_FADE_START = 3; // m/s
-const STEER_FADE_SPAN = 25; // m/s
+/** Ground speed below which full pedal means full nosewheel, m/s. */
+const STEER_REF_MS = 3;
+/** Exponent on the V_REF/V fade. 1.0 = constant yaw-rate authority. */
+const STEER_FADE_EXP = 1.5;
+/** Never quite zero, so there is still a nudge available at speed. */
+const STEER_FLOOR = 0.02;
 
 /**
  * @param {FlightModelOpts} [opts]
@@ -806,7 +844,13 @@ export function createFlightModel(opts = {}) {
     const gspd = Math.sqrt(
       state.velocity.x * state.velocity.x + state.velocity.z * state.velocity.z,
     );
-    const steerGain = clamp(1 - (gspd - STEER_FADE_START) / STEER_FADE_SPAN, 0.15, 1);
+    // Nosewheel authority falls as (V_REF/V)^1.5 — see STEER_MAX. Decaying at
+    // least as fast as 1/V is what stops yaw authority GROWING with speed.
+    const steerGain = clamp(
+      (STEER_REF_MS / Math.max(gspd, STEER_REF_MS)) ** STEER_FADE_EXP,
+      STEER_FLOOR,
+      1,
+    );
     const steerAngle = surfYaw * STEER_MAX * steerGain;
     const cosS = Math.cos(steerAngle);
     const sinS = Math.sin(steerAngle);

@@ -83,6 +83,7 @@
 import * as THREE from 'three';
 import { clamp, damp, DEG_TO_RAD, RAD_TO_DEG } from '../core/units.js';
 import { getElevationLocal } from '../geo/elevation.js';
+import { eventCode } from '../core/keycode.js';
 
 // ---------------------------------------------------------------------------
 // Depth range
@@ -149,10 +150,35 @@ const CHASE_LEAD = (2 * CHASE_ZETA) / CHASE_OMEGA;
 const CHASE_FOV = 58;
 const CHASE_FOV_SPEED = 7;
 
-/** Cockpit eye point in BODY axes (-Z nose, +X right, +Y up), metres. */
-const EYE_FORWARD = new THREE.Vector3(0, 0.62, -1.35);
+/**
+ * Cockpit eye point in BODY axes (-Z nose, +X right, +Y up), metres.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS IS A SEATING POSITION, NOT A FRAMING CHOICE
+ * ---------------------------------------------------------------------------
+ * Measured against aircraft/model.js's actual geometry, the previous value
+ * (0, 0.62, -1.35) put the pilot's eye 0.18 m behind the instrument panel and
+ * 0.02 m above its top edge — i.e. with their chin on the glareshield. A panel
+ * that close subtends an enormous angle, so it filled the bottom half of the
+ * windscreen and the view forward was a slot.
+ *
+ * The geometry that fixes it, all read out of model.js's FUSELAGE table:
+ *
+ *   panel face      z = -1.53, top edge y = 0.60
+ *   cowl top        y = 0.61 at the firewall (z = -1.78), falling forward
+ *   cabin roof      y = 0.91 through the whole front cabin
+ *   windscreen      cut into the crown from z = -1.76 to -1.30
+ *
+ * Seating the eye at (0, 0.76, -0.86) gives a real cockpit's numbers: the
+ * panel is 0.68 m away (a normal arm's reach rather than a face-plant), the
+ * eye clears the panel top by 0.16 m, the cowl top sits 9.2 deg below the
+ * horizon so you see over the nose, and there is 0.15 m of headroom to the
+ * cabin roof. The forward line of sight leaves through the windscreen glazing,
+ * not through the shell.
+ */
+const EYE_FORWARD = new THREE.Vector3(0, 0.76, -0.86);
 /** Eye point for the panel-down view: lower and slightly further forward. */
-const EYE_PANEL = new THREE.Vector3(0, 0.5, -1.55);
+const EYE_PANEL = new THREE.Vector3(0, 0.70, -0.95);
 /** How far the panel view tilts the gaze down, degrees. */
 const PANEL_PITCH_DEG = 28;
 const COCKPIT_FOV = 68;
@@ -461,7 +487,7 @@ export function createCameras(aircraftGroup, renderer) {
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) {
       return;
     }
-    if (e.code === 'KeyV') panelView = !panelView;
+    if (eventCode(e) === 'KeyV') panelView = !panelView;
   }
 
   canvas.addEventListener('contextmenu', onContextMenu);

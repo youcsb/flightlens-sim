@@ -150,6 +150,16 @@ group — `main.js` writes the transform onto it.
 
 ## 2. Module interfaces
 
+### 2.0 `src/core/keycode.js` — one key identity for every listener
+
+```js
+eventCode(e) -> string   // e.code, or a code synthesised from e.key. Never null.
+```
+
+Used by `controls/input.js`, `camera/cameras.js` and `main.js`. See §2.12 for
+why binding to `e.code` alone loses control of the aircraft entirely on some
+input methods.
+
 ### 2.1 `src/core/units.js` — conversions and helpers
 
 ```js
@@ -302,6 +312,16 @@ Runway = {
 }
 ```
 
+**The deck bends where — and only where — the DEM demands it.** A runway is
+drawn on a fitted plane, but that plane is capped at a small lift, so anywhere
+the DEM lacks an airport's earthworks the ground poked through and the runway
+rendered in pieces. `buildDeckProfile` raises the deck locally to
+`max(plane, terrain + 0.25 m)`. A runway whose plane already clears the ground
+is left bit-identical (median bend across the region: **9 cm**; KBFI: 2.4 cm);
+only two runways bend more than 5 m, worst being KSEA 16R/34L at **12.9 m**,
+whose Miller Creek embankment is simply not in the source DEM. Flush beats flat
+— the DEM is the collision surface (§1.4).
+
 **`headingDeg` is TRUE, not magnetic.** The upstream `le_heading_degT` column
 frequently is not: KBFI publishes 140 where its own endpoints give 150.13 and
 150 is correct. The baker computes from endpoints and validates against
@@ -369,8 +389,21 @@ opts = {
   loadDem = true,
   exaggeration = 1,      // KEEP AT 1. Anything else makes the terrain a lie.
   seaLevelM = SEA_LEVEL_M,
+  detail = true,         // load the z13 Seattle inset as a second layer
+  water = true,          // draw the sea plane and the freshwater lake quads
+  lodQuality = 1,        // scales the CDLOD screen-error budget
+  originX = 0,           // where to build the first full chunk set, local
+  originY = 400,         //   metres. The default is already correct because
+  originZ = 0,           //   the scene origin IS the spawn (§1.3); it only
+                         //   matters if someone moves the spawn.
 }
 ```
+
+The returned handle also carries `converge(x, y, z) -> passes`, which runs the
+LOD selector to a fixed point around a point in local metres. `createTerrain`
+calls it once at bootstrap so frame 0 already has fine ground; `main.js` calls
+it again after a teleport, **before** moving the camera, so the camera's
+ground-clearance floor reads real terrain rather than the root node.
 
 **`createTerrain` is `async`** — it awaits the DEM so the first rendered frame
 already has real ground under the aircraft. It returns `group`, not `mesh`.
@@ -467,7 +500,8 @@ airspeedMs, alphaRad
 
 // display
 airspeedKts, altitudeFt, altitudeAglFt, verticalSpeedFpm,
-headingDeg, pitchDeg, rollDeg, rpm, stalled, onGround
+headingDeg, pitchDeg, rollDeg, rpm, stalled, onGround,
+flaps, brakes, loadFactor
 
 // geodetic mirror, recomputed every step
 lat, lon
@@ -476,6 +510,17 @@ lat, lon
 `altitudeFt` is MSL (`y = 0` is sea level). `altitudeAglFt` is above the terrain
 directly below — with real elevation the ground moves, so an altimeter alone
 tells you nothing about whether you are about to hit Rainier.
+
+**Both altitudes are measured at the WHEELS, not the CG datum.** Parked at KBFI
+that is the difference between reading 21 ft (correct, and what acceptance
+check 2 asks for) and 24.6 ft. A resting aircraft therefore shows
+`altitudeAglFt ≈ -0.3` — the gear springs' static compression, about 11 cm —
+and that is right, not a sinking bug.
+
+`reset()` takes an optional fourth argument,
+`placement = {altitudeAglM?, altitudeMslM?, airspeedMs?}`, so `main.js` can put
+the aircraft airborne at a named place. `altitudeMslM` is floored at 30 m AGL:
+asking for 11,000 ft near Rainier must never spawn you inside the mountain.
 
 `reset()` takes **lat/lon, not scene metres**, so callers can say "put me on
 KBFI 32L" without knowing where the origin is. All three arguments are optional
@@ -510,8 +555,24 @@ within the frame, do not stash it. Timing is derived internally, so it takes no
 `dt`. Never touches the scene, the flight model, or the DOM beyond listeners.
 
 Bindings: `W/S` or `↑/↓` pitch · `A/D` or `←/→` roll · `Q/E` yaw ·
-`Shift`/`Ctrl` throttle · `X` idle · `Z` full · `F` flaps · `B` brakes.
-App-level keys live in `main.js`: `C` cycles camera, `R` resets.
+`Shift`/`Ctrl` throttle · `X` idle · `Z` full · `F` flaps · `B` brakes ·
+`G` gear · `M` mouse yoke.
+App-level keys live in `main.js`: `C` camera, `R` reset, `P`/`Esc` pause,
+`T` time of day, `N` mute, `H` help, `1`–`4` jump to a place. `V` (panel view)
+lives in `cameras.js`.
+
+`setThrottle(v)` / `setFlaps(v)` are additive: they let `main.js` set the levers
+when it teleports the aircraft, because arriving at 3,000 ft with the throttle
+closed is a glider start, not a cruise.
+
+**Every keyboard listener resolves its key through `core/keycode.js#eventCode`,
+never `e.code` directly.** `e.code` is the right thing to bind to — it names the
+physical key, so WASD keeps its shape on any layout — but it is the empty string
+on virtual keyboards, some IME and accessibility paths, remote-desktop clients,
+and synthetic events. Binding to it alone means those users get an aircraft that
+silently does not respond: the events arrive and match nothing, and there is no
+error to find. `eventCode` prefers `code` and falls back to a code synthesised
+from `e.key`.
 
 ### 2.13 `src/camera/cameras.js` — the view rig
 
@@ -606,7 +667,9 @@ Cheap, specific, and each one falsifies a whole class of bug.
    sea-level data, not from an artist.
 6. **Wheels touch where the ground is drawn.** Land anywhere, on a slope. No
    sinking, no hovering beyond a metre or two on steep ground.
-7. **KSEA is 8.8 km south of KBFI** and its runways point ~176°, not ~180°
-   (see §2.5 — this one currently fails pending a surveyed override).
+7. **KSEA is 8.8 km south of KBFI** — measured 8,829 m on bearing 185.1°. Its
+   three runways are surveyed overrides at **180.34° true = 164.74° magnetic**,
+   which is what rounds to the "16" on the numbers. Runway designators are
+   MAGNETIC; do not "fix" these to 160.
 8. **No landmark outside the region.** Console shows no `[landmarks] dropping…`
    warnings; if it does, a Q-ID is wrong.

@@ -584,6 +584,88 @@ function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
   return { h0, slope, lift, rms, graded };
 }
 
+/**
+ * Build the height profile the runway deck is actually drawn at.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY A PROFILE AND NOT JUST THE PLANE
+ * ---------------------------------------------------------------------------
+ * `fitRunwayPlane` returns a plane plus a single global `lift`, and that lift
+ * is capped at MAX_LIFT_M (2.5 m) for a good reason: an uncapped lift would
+ * float the pavement metres above the ground the aircraft actually collides
+ * with (MODULES.md §1.4). But the cap has a visible cost. Where the DEM is
+ * badly wrong under a runway, terrain pokes straight through the deck and the
+ * runway is drawn in pieces.
+ *
+ * Measured at KSEA 16R/34L, whose Miller Creek embankment (up to 50 m of fill,
+ * placed 2004-08) is simply not in the DEM: 11.1 m of RMS under a flat deck, so
+ * the middle third of an 8,500 ft runway was buried and the runway rendered as
+ * two disconnected fragments with a hill in the gap.
+ *
+ * The fix is to let the deck rise — locally, and only where the ground demands
+ * it — rather than to lift the whole ribbon. The profile is
+ *
+ *     deck(t) = max(plane(t) + lift, maxTerrainAcross(t) + MIN_LIFT_M)
+ *
+ * which has the property that matters: **a runway whose plane already clears
+ * the terrain everywhere is left exactly as it was.** For 100 of the 108 drawn
+ * runways this is bit-identical to the old plane, so the flat, correctly-graded
+ * common case is untouched. Only the handful sitting on a DEM that disagrees
+ * with reality bend, and they bend to stay flush with the collision surface,
+ * which is the trade §1.4 asks for.
+ *
+ * Sampled across the full width, not just the centreline — a runway cut into a
+ * side slope shows the ground at its edges first.
+ *
+ * @returns {{sample:(t:number)=>number, segs:number, conformed:boolean,
+ *            maxBendM:number}}
+ */
+function buildDeckProfile(ax, az, dx, dz, rx, rz, lengthM, widthM, fit) {
+  /** Station spacing. Fine enough that the linear span between two stations
+   *  cannot hide a hill the samples missed. */
+  const STEP_M = 25;
+  const n = clamp(Math.round(lengthM / STEP_M) + 1, 5, 256);
+  const step = lengthM / (n - 1);
+  const half = widthM / 2;
+  const hs = new Float64Array(n);
+
+  let conformed = false;
+  let maxBendM = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i * step;
+    const plane = fit.h0 + fit.slope * t + fit.lift;
+    let maxTerr = -Infinity;
+    for (let k = -2; k <= 2; k++) {
+      const s = (k / 2) * half;
+      const e = getElevationLocal(ax + dx * t + rx * s, az + dz * t + rz * s);
+      if (e > maxTerr) maxTerr = e;
+    }
+    const needed = maxTerr + MIN_LIFT_M;
+    if (needed > plane) {
+      hs[i] = needed;
+      conformed = true;
+      if (needed - plane > maxBendM) maxBendM = needed - plane;
+    } else {
+      hs[i] = plane;
+    }
+  }
+
+  const sample = (t) => {
+    const u = clamp(t / step, 0, n - 1);
+    const i = Math.min(n - 2, Math.floor(u));
+    const f = u - i;
+    return hs[i] + (hs[i + 1] - hs[i]) * f;
+  };
+
+  // A flat deck needs no more geometry than it ever did; a bent one needs a
+  // vertex per station or the pavement cuts the corner off its own profile.
+  const segs = conformed
+    ? n - 1
+    : clamp(Math.round(lengthM / 120), 1, 48);
+
+  return { sample, segs, conformed, maxBendM };
+}
+
 // ---------------------------------------------------------------------------
 // Geometry sinks — everything merges, so the whole region is a handful of draws
 // ---------------------------------------------------------------------------
@@ -1100,6 +1182,9 @@ export function buildRunwayMeshes(scene, list = airports) {
   const group = new THREE.Group();
   group.name = 'airports';
 
+  /** Decks that had to bend to stay above the DEM. Reported, not hidden. */
+  const conformedDecks = [];
+
   const drawable = [];
   for (const airport of list || []) {
     if (!RUNWAY_TYPES.has(airport.type)) continue;
@@ -1169,7 +1254,18 @@ export function buildRunwayMeshes(scene, list = airports) {
 
     const widthM = clamp((rw.widthFt > 0 ? rw.widthFt : 75) * FT_TO_M, 6, 120);
     const fit = fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM);
-    const deck = (t) => fit.h0 + fit.slope * t + fit.lift;
+    // The deck follows the plane wherever the plane clears the ground, and
+    // rises to stay flush wherever the DEM disagrees with the real earthworks.
+    // Identical to the bare plane for every runway that did not need it.
+    const prof = buildDeckProfile(ax, az, dx, dz, rx, rz, lengthM, widthM, fit);
+    const deck = prof.sample;
+    if (prof.conformed) {
+      conformedDecks.push({
+        ident: airport.ident,
+        runway: `${rw.leIdent}/${rw.heIdent}`,
+        bendM: prof.maxBendM,
+      });
+    }
 
     /** Runway-local (t, s) -> scene point, on the pavement. */
     const at = (t, s, dy = 0) => [
@@ -1183,8 +1279,9 @@ export function buildRunwayMeshes(scene, list = airports) {
 
     // --- Pavement. Segmented along its length so the fitted gradient is real
     // geometry rather than a single tilted quad (identical for a straight line,
-    // but it keeps the vertex density sane for lighting).
-    const segs = clamp(Math.round(lengthM / 120), 1, 48);
+    // but it keeps the vertex density sane for lighting). A deck that had to
+    // conform to the terrain gets a vertex per profile station instead.
+    const segs = prof.segs;
     const pav = sinkFor(cls);
     for (let i = 0; i < segs; i++) {
       const t0 = (i / segs) * lengthM;
@@ -1468,8 +1565,17 @@ export function buildRunwayMeshes(scene, list = airports) {
     group.add(lights);
   }
 
-  group.userData = { runways: meta, count: meta.length };
+  group.userData = { runways: meta, count: meta.length, conformedDecks };
   reportDeckFit(meta);
+  if (conformedDecks.length) {
+    const worst = conformedDecks.slice().sort((a, b) => b.bendM - a.bendM).slice(0, 5);
+    console.info(
+      `[airports] ${conformedDecks.length} deck(s) bent to stay above a DEM that ` +
+        'does not have the airport\'s earthworks (flush beats flat — MODULES.md §1.4): ' +
+        worst.map((d) => `${d.ident} ${d.runway} +${d.bendM.toFixed(1)} m`).join(', ') +
+        (conformedDecks.length > worst.length ? `, +${conformedDecks.length - worst.length} more` : ''),
+    );
+  }
   if (scene) scene.add(group);
   return group;
 }

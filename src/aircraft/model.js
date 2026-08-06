@@ -1413,18 +1413,30 @@ export function createAircraft(scene, opts = {}) {
   // scene render-target per frame, and at 60 fps over a 90 km terrain that is
   // not a trade worth making for four windows. Plain alpha plus a strong
   // clearcoat gets the same read at chase distance for nothing.
+  //
+  // BALANCED FROM INSIDE, NOT OUTSIDE. opacity 0.30 with envMapIntensity 1.6
+  // reads well in the chase view — the glass catches the sky and the aeroplane
+  // looks glazed rather than open. Seen from the COCKPIT, where the camera is
+  // 1 m from the same surface and looking through it at the thing the sim
+  // exists to show, that combination is a milky veil over the whole windscreen:
+  // the sky reflection is added on top of everything beyond it, and at 1.6x it
+  // beat the terrain it was supposed to be revealing.
+  //
+  // The windscreen is the primary view in a flight simulator, so it wins the
+  // argument. Reflection is kept — a raked screen genuinely does catch skylight
+  // — just brought back to where Seattle is visible through it.
   const glassMat = track(new THREE.MeshPhysicalMaterial({
     color: 0x8fa6b8,
     metalness: 0.0,
     roughness: 0.06,
     transparent: true,
-    opacity: 0.30,
+    opacity: 0.16,
     clearcoat: 1.0,
     clearcoatRoughness: 0.03,
     side: THREE.DoubleSide,
     depthWrite: false,
     envMap,
-    envMapIntensity: 1.6,
+    envMapIntensity: 0.5,
   }));
 
   const cabinLining = track(new THREE.MeshStandardMaterial({
@@ -1482,6 +1494,27 @@ export function createAircraft(scene, opts = {}) {
 
   // Cabin lining, so the windows look into an interior rather than out the
   // far side of the aeroplane.
+  //
+  // THE LINING MUST CARRY THE SAME OPENINGS AS THE SHELL. It is BackSide and
+  // the cockpit eye sits inside it, so an unbroken lining is an opaque box
+  // around the pilot: the side windows show grey trim instead of Seattle, and
+  // — because the lining's roof slopes down through the windscreen station
+  // about 0.4 m in front of the eye — the forward view is blocked outright.
+  //
+  // The openings are cut OVERSIZE. The lining is lofted at a coarser ring and
+  // station spacing than the shell (32/0.12 vs 48/0.055), so quad centres fall
+  // in different places and an exactly-matching rectangle would leave slivers
+  // of lining poking into the window edges. Growing the hole hides the lining
+  // behind the shell's own aperture instead, which is where a real door post
+  // and window frame are anyway.
+  const LINING_WINDOW_MARGIN_Z = 0.09; // metres of station
+  const LINING_WINDOW_MARGIN_U = 0.022; // ring fraction
+  const liningWindows = WINDOWS.map((w) => ({
+    z0: w.z0 - LINING_WINDOW_MARGIN_Z,
+    z1: w.z1 + LINING_WINDOW_MARGIN_Z,
+    u0: w.u0 - LINING_WINDOW_MARGIN_U,
+    u1: w.u1 + LINING_WINDOW_MARGIN_U,
+  }));
   const liningTable = FUSELAGE
     .filter((r) => r[0] > -1.95 && r[0] < 1.10)
     .map((r) => [r[0], r[1] * 0.94, r[2] * 0.94, r[3], r[4]]);
@@ -1489,7 +1522,7 @@ export function createAircraft(scene, opts = {}) {
   for (let z = liningTable[0][0]; z <= liningTable[liningTable.length - 1][0]; z += 0.12) {
     liningZ.push(z);
   }
-  const lining = buildFuselage(liningTable, liningZ, 32, []);
+  const lining = buildFuselage(liningTable, liningZ, 32, liningWindows);
   add(lining.shell, cabinLining);
   if (lining.glass) lining.glass.dispose();
 

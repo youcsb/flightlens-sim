@@ -55,6 +55,7 @@ import { createOverlay } from './ui/overlay.js';
 import { createInput } from './controls/input.js';
 import { createCameras } from './camera/cameras.js';
 import { createSoundscape } from './audio/soundscape.js';
+import { eventCode } from './core/keycode.js';
 
 const appEl = document.getElementById('app');
 const hudEl = document.getElementById('hud');
@@ -345,7 +346,12 @@ async function boot() {
     // that can start an AudioContext. Cheap and idempotent.
     if (!muted) sound.resume();
 
-    switch (e.code) {
+    // `e.code` is empty on virtual keyboards and some accessibility paths —
+    // see core/keycode.js. Same normalisation input.js and cameras.js use, so
+    // all three agree on what key was pressed.
+    const code = eventCode(e);
+
+    switch (code) {
       case 'KeyC':
         overlay.setCamera(cameras.cycle());
         break;
@@ -383,7 +389,7 @@ async function boot() {
       case 'Digit2':
       case 'Digit3':
       case 'Digit4':
-        gotoPlace(Number(e.code.slice(5)) - 1);
+        gotoPlace(Number(code.slice(5)) - 1);
         break;
       default:
         break;

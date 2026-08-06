@@ -60,6 +60,7 @@
  */
 
 import { clamp } from '../core/units.js';
+import { eventCode } from '../core/keycode.js';
 
 // ---------------------------------------------------------------------------
 // Keyboard ramp tuning. See the header for the reasoning behind each number.
@@ -222,14 +223,18 @@ export function createInput(domElement) {
     // Never swallow the user's browser shortcuts, and never fly the plane
     // while they are typing into a field someone else added to the page.
     if (e.metaKey || isEditable(e.target)) return;
+    // `e.code` is empty on virtual keyboards, some IME/accessibility paths and
+    // remote-desktop clients. eventCode() falls back to `e.key` so those can
+    // still fly; see core/keycode.js.
+    const code = eventCode(e);
     if (e.repeat) {
-      if (HANDLED_CODES.has(e.code)) e.preventDefault();
+      if (HANDLED_CODES.has(code)) e.preventDefault();
       return;
     }
-    keys.add(e.code);
+    keys.add(code);
 
     // Discrete actions fire on the edge, not every frame.
-    switch (e.code) {
+    switch (code) {
       case 'KeyF':
         flapIndex = (flapIndex + 1) % FLAP_NOTCHES.length;
         controls.flaps = FLAP_NOTCHES[flapIndex];
@@ -252,16 +257,17 @@ export function createInput(domElement) {
         break;
     }
 
-    if (HANDLED_CODES.has(e.code)) e.preventDefault();
+    if (HANDLED_CODES.has(code)) e.preventDefault();
   }
 
   function onKeyUp(e) {
-    keys.delete(e.code);
+    const code = eventCode(e);
+    keys.delete(code);
     // macOS does not deliver keyup for other keys while Command is held, so a
     // Cmd-Tab away can leave the elevator jammed. Clearing on any Meta-flagged
     // event is the cheap, reliable fix.
     if (e.metaKey) keys.clear();
-    if (HANDLED_CODES.has(e.code)) e.preventDefault();
+    if (HANDLED_CODES.has(code)) e.preventDefault();
   }
 
   /** Losing focus must not leave a key stuck down mid-flight. */
