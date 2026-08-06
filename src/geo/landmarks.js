@@ -1,56 +1,57 @@
 /**
  * landmarks.js — recognisable things at their true coordinates.
  *
- * STUB IMPLEMENTATION: the loader and placement are real; the meshes are
- * proportioned placeholder solids (a tapered tower for the Space Needle, a
- * cone for a peak, a box for a building). The Landmarks agent replaces
- * buildLandmarkMesh() and nothing else needs to change.
- *
- * Contract: see MODULES.md § landmarks
+ * Contract: MODULES.md §2.6.
  *
  *   loadLandmarks() -> Promise<Landmark[]>
+ *   getLandmarks() / getLandmark(name)
  *   placeLandmarks(scene) -> THREE.Group
+ *   disposeLandmarks(group)
+ *   nearestLandmark(lat, lon, maxDistanceM?)
+ *
+ * This module owns WHERE things go. src/world/landmarkModels.js owns what they
+ * look like. The split matters: placement is geography and must be exactly
+ * right; modelling is craft and can be improved without touching a coordinate.
  *
  * ---------------------------------------------------------------------------
  * WHY THE DATA IS BAKED, AND WHY A BBOX FILTER IS NOT ENOUGH
  * ---------------------------------------------------------------------------
  * Source: Wikidata SPARQL, baked by scripts/bake-landmarks.mjs. Querying by
- * English label is wildly ambiguous. A probe of ten names returned 58 rows, of
- * which 49 were wrong: Mount Adams appears in New Hampshire, Maryland, Ohio,
- * Colorado, New Zealand and Australia; there is a Mount Rainier in Maryland.
+ * English label is wildly ambiguous. A 33-name probe returned 69 rows, of which
+ * 30 were in our bbox and several of THOSE were still wrong:
  *
- * Filtering to our bbox removes most of them but NOT all, and it also removes
- * things we might want:
- *   - "Mount Baker" inside the bbox at 47.5766,-122.2977 is a Seattle
- *     NEIGHBOURHOOD, not the volcano;
- *   - the actual Mount Baker volcano is at 48.7773,-121.8132, which is north of
- *     our northern edge and so correctly excluded;
- *   - "Mount Rainier" returns two in-bbox items, the mountain (Q194057) and a
- *     second node at 46.8528,-121.7604.
+ *   - "Mount Baker" returns 18 items. The two inside our bbox are a light rail
+ *     station and a Seattle neighbourhood; the volcano is at 48.7773, outside
+ *     it. A bbox filter keeps both wrong answers and discards the right one.
+ *   - "Mount Rainier" returns the mountain (Q194057) and a glacier node 120 m
+ *     away, both in bbox. There is also one in Maryland.
+ *   - "Glacier Peak" returns 11 items and zero in bbox — the real summit is
+ *     0.09 deg east of our eastern edge.
  *
- * => The baker resolves each landmark by WIKIDATA Q-ID from a curated table,
- *    and uses the bbox only as a safety assertion. A landmark that resolves
- *    outside REGION_BBOX is a bug and is dropped with a warning. Never ship a
- *    label-only lookup.
+ * => The baker resolves every landmark by WIKIDATA Q-ID and additionally
+ *    asserts the result lands within 400 m of a coordinate pinned in its
+ *    curated table. The bbox is the last line of defence, not the filter.
+ *    loadLandmarks() re-applies it here anyway, because a namesake slipping
+ *    through fails SILENTLY — you get a stadium in the wrong state and no error.
  *
  * ---------------------------------------------------------------------------
- * HEIGHTS
+ * HEIGHTS AND BASES
  * ---------------------------------------------------------------------------
- * `heightM` is height ABOVE ITS OWN BASE, not above sea level — 184 m for the
- * Space Needle. Landmarks are placed at getElevation(lat, lon), so the DEM
- * supplies the base and heightM stacks on top.
+ * `heightM` is height ABOVE THE LANDMARK'S OWN BASE — 184 m for the Space
+ * Needle, not 184 m MSL. Every landmark is placed at getElevation(lat, lon), so
+ * the DEM supplies the base and heightM stacks on top of it.
  *
- * Peaks are the exception and are marked kind:'peak'. Their summit elevation is
- * already in the DEM (Mount Rainier reads ~4390 m there), so drawing a cone of
- * heightM on top would produce an 8 km mountain. Peaks get heightM = 0 and are
- * rendered as a label/marker only. THE MOUNTAIN ITSELF IS TERRAIN — if Rainier
- * does not look right, that is an elevation bug, not a landmark bug.
+ * PEAKS ARE TERRAIN. kind:'peak' entries carry heightM = 0 and get no mesh:
+ * Mount Rainier's summit is already in the DEM at ~4390 m, and drawing a
+ * 4392 m cone on top of it would produce an 8.8 km mountain. If Rainier looks
+ * wrong, that is an elevation bug, not a landmark bug.
  */
 
 import * as THREE from 'three';
 import { llToLocal, inBbox, REGION_BBOX, distanceBetween } from './coords.js';
 import { getElevation } from './elevation.js';
 import { fetchJsonOrNull } from '../core/assets.js';
+import { buildLandmarkModel, buildDowntownMass } from '../world/landmarkModels.js';
 
 /**
  * @typedef {Object} Landmark
@@ -60,7 +61,12 @@ import { fetchJsonOrNull } from '../core/assets.js';
  * @property {number} heightM     Height above its own base, metres. 0 for peaks.
  * @property {LandmarkKind} kind
  * @property {string} [wikidataId] e.g. "Q5317". Provenance; useful for re-baking.
- * @property {number} [widthM]    Footprint hint for the placeholder mesh.
+ * @property {number} [widthM]     Short-axis footprint, metres.
+ * @property {number} [lengthM]    Long-axis footprint, metres. Defaults to widthM.
+ * @property {number} [headingDeg] TRUE bearing of the long axis. Default 0.
+ * @property {string} [model]      Builder key in world/landmarkModels.js.
+ * @property {boolean} [roof]      Stadium has a roof (changes the truss layout).
+ * @property {string} [heightSrc]  'wikidata' | 'curated' | 'dem'. Provenance.
  */
 
 /**
@@ -82,6 +88,7 @@ const FALLBACK_LANDMARKS = [
     kind: 'tower',
     wikidataId: 'Q5317',
     widthM: 42,
+    model: 'spaceNeedle',
   },
   {
     name: 'Mount Rainier',
@@ -104,11 +111,8 @@ let loadPromise = null;
 
 /**
  * Load the baked landmark set. Idempotent; concurrent callers share one fetch.
- *
- * Every entry is re-checked against REGION_BBOX here as well as in the baker.
- * That is deliberate belt-and-braces: a namesake decoy slipping through is the
- * single most likely way this feature goes wrong, and it fails silently — you
- * just get an Eiffel Tower in the wrong state and no error.
+ * Never throws and never blocks the boot — a missing bake degrades to the
+ * built-in pair (MODULES.md §1.6).
  *
  * @returns {Promise<Landmark[]>}
  */
@@ -161,94 +165,88 @@ export function getLandmark(name) {
 // Placement
 // ---------------------------------------------------------------------------
 
-const TOWER_COLOUR = 0xd8d2c4;
-const ACCENT_COLOUR = 0xc8532e;
-const BUILDING_COLOUR = 0x8d949e;
+const DEG = Math.PI / 180;
+const _p = { x: 0, z: 0 };
 
 /**
- * Placeholder geometry for one landmark, with its base at local y = 0.
- * REPLACE THIS — it is the whole point of the Landmarks agent's job. The
- * contract to preserve is only: origin at the base, +Y up, real-world metres.
+ * Rotation about +Y that maps a model's local +X onto a true bearing.
  *
- * @param {Landmark} l
- * @returns {THREE.Object3D|null} null for kinds that are label-only.
+ * Scene axes are +X east, -Z north (MODULES.md §1.2), so bearing b is the
+ * direction (sin b, 0, -cos b). Rotating +X by theta about +Y gives
+ * (cos theta, 0, -sin theta); equating the two gives theta = 90 - b.
+ *
+ * Sanity: b = 90 (east) -> theta = 0, +X stays east. b = 0 (north) ->
+ * theta = 90 deg, +X becomes (0, 0, -1) = north. Both correct.
+ *
+ * @param {number} headingDeg
+ * @returns {number} radians
  */
-function buildLandmarkMesh(l) {
-  const h = l.heightM;
-
-  if (l.kind === 'peak' || h <= 0) {
-    // Peaks are terrain. Nothing to draw — the DEM already did it.
-    return null;
-  }
-
-  if (l.kind === 'tower') {
-    // Space Needle proportions: a slim tripod shaft carrying a saucer at ~0.85h.
-    const obj = new THREE.Group();
-    const shaft = new THREE.Mesh(
-      new THREE.CylinderGeometry(h * 0.028, h * 0.09, h * 0.86, 12),
-      new THREE.MeshLambertMaterial({ color: TOWER_COLOUR }),
-    );
-    shaft.position.y = h * 0.43;
-    obj.add(shaft);
-
-    const saucer = new THREE.Mesh(
-      new THREE.CylinderGeometry(h * 0.115, h * 0.155, h * 0.055, 24),
-      new THREE.MeshLambertMaterial({ color: ACCENT_COLOUR }),
-    );
-    saucer.position.y = h * 0.86;
-    obj.add(saucer);
-
-    const spire = new THREE.Mesh(
-      new THREE.CylinderGeometry(h * 0.004, h * 0.016, h * 0.11, 8),
-      new THREE.MeshLambertMaterial({ color: TOWER_COLOUR }),
-    );
-    spire.position.y = h * 0.945;
-    obj.add(spire);
-    return obj;
-  }
-
-  // Generic block for buildings, stadiums, everything else.
-  const w = l.widthM ?? Math.max(20, h * 0.28);
-  const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(w, h, w),
-    new THREE.MeshLambertMaterial({ color: BUILDING_COLOUR }),
-  );
-  mesh.position.y = h / 2;
-  return mesh;
+function yawForHeading(headingDeg) {
+  return (90 - (headingDeg ?? 0)) * DEG;
 }
 
-const _p = { x: 0, z: 0 };
+/**
+ * Radius of the keep-out disc a modelled landmark punches in the filler mass,
+ * so no anonymous block grows up through Columbia Center or the Needle's legs.
+ */
+function footprintRadius(l) {
+  const long = Math.max(l.lengthM ?? 0, l.widthM ?? 0);
+  if (long > 0) return long * 0.62 + 18;
+  return Math.max(35, (l.heightM ?? 0) * 0.2);
+}
 
 /**
  * Build and attach the landmark group.
  *
- * ASYNC-SAFE BY DESIGN: this returns an EMPTY group immediately and fills it in
+ * ASYNC-SAFE BY DESIGN: this returns an EMPTY group immediately and fills it
  * once loadLandmarks() resolves, kicking off that load itself if nobody has.
- * Callers therefore never need to await it or re-attach anything — hold the
- * group, it populates itself. The trade-off is that group.children is empty on
- * the frame you call this, so do not measure it synchronously.
+ * Callers never await it and never re-attach anything — hold the group, it
+ * populates itself. The trade-off is that group.children is empty on the frame
+ * you call this, so do not measure it synchronously.
  *
  * @param {THREE.Scene|THREE.Object3D} scene Parent to attach to. May be null.
+ * @param {object} [opts]
+ * @param {boolean} [opts.cityMass=true] Add the procedural downtown filler.
  * @returns {THREE.Group} Named 'landmarks'.
  */
-export function placeLandmarks(scene) {
+export function placeLandmarks(scene, opts = {}) {
   const group = new THREE.Group();
   group.name = 'landmarks';
   if (scene) scene.add(group);
 
   loadLandmarks().then((list) => {
+    const keepOut = [];
+    let placed = 0;
+
     for (const l of list) {
-      const obj = buildLandmarkMesh(l);
-      if (!obj) continue;
-      llToLocal(l.lat, l.lon, _p);
       // The DEM supplies the base elevation, so a landmark sits on the real
-      // ground rather than floating at an assumed sea level.
-      obj.position.set(_p.x, getElevation(l.lat, l.lon), _p.z);
+      // ground rather than at an assumed sea level. Bridges are the exception
+      // that proves it: the Tacoma Narrows entry sits mid-channel, so its
+      // elevation IS 0, and the model measures its deck up from the waterline.
+      llToLocal(l.lat, l.lon, _p);
+      const baseY = getElevation(l.lat, l.lon);
+
+      const obj = buildLandmarkModel(l);
+      if (!obj) continue; // peaks and anything too small to see from the air
+
+      obj.position.set(_p.x, baseY, _p.z);
+      obj.rotation.y = yawForHeading(l.headingDeg);
       obj.name = `landmark-${l.name}`;
-      obj.userData = { ...l };
-      obj.castShadow = true;
+      obj.userData = { ...l, baseElevationM: baseY };
       group.add(obj);
+      keepOut.push({ x: _p.x, z: _p.z, radiusM: footprintRadius(l) });
+      placed++;
     }
+
+    if (opts.cityMass !== false) {
+      const mass = buildDowntownMass({ exclude: keepOut });
+      if (mass) group.add(mass);
+    }
+
+    console.info(
+      `[landmarks] ${placed} modelled, ${list.length - placed} label-only, ` +
+        `of ${list.length} loaded`,
+    );
   });
 
   return group;
@@ -256,22 +254,42 @@ export function placeLandmarks(scene) {
 
 /**
  * Release the GPU resources held by a group from placeLandmarks().
+ *
+ * Geometries and materials are deduplicated first. landmarkModels.js shares
+ * both aggressively — one leg geometry serves all three of the Needle's legs,
+ * one concrete material serves a dozen landmarks — so a naive per-mesh dispose
+ * would call dispose() on the same resource many times.
+ *
  * @param {THREE.Group} group
  */
 export function disposeLandmarks(group) {
   if (!group) return;
+  const geometries = new Set();
+  const materials = new Set();
+
   group.traverse((o) => {
-    if (o.isMesh) {
-      o.geometry?.dispose();
-      if (Array.isArray(o.material)) o.material.forEach((m) => m.dispose());
-      else o.material?.dispose();
-    }
+    if (o.geometry) geometries.add(o.geometry);
+    const mtl = o.material;
+    if (Array.isArray(mtl)) mtl.forEach((mm) => materials.add(mm));
+    else if (mtl) materials.add(mtl);
   });
+
+  for (const g of geometries) g.dispose();
+  for (const mm of materials) {
+    mm.map?.dispose();
+    mm.dispose();
+  }
+  group.clear();
   group.removeFromParent();
 }
 
 /**
  * Nearest landmark to a geodetic point — for a "what am I looking at" readout.
+ *
+ * Searches ALL loaded landmarks, including the label-only ones with no mesh.
+ * That is the point: the Fremont Troll is 5.5 m tall and invisible from the
+ * air, but flying over it and being told so is exactly the payoff for having
+ * real coordinates.
  *
  * @param {number} lat
  * @param {number} lon

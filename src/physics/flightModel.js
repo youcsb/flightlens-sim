@@ -1,12 +1,14 @@
 /**
  * flightModel.js — the flight dynamics model. The single owner of aircraft state.
  *
- * STUB IMPLEMENTATION. Arcade kinematics: stick inputs drive body rotation
- * rates directly, throttle drives speed along the nose vector, and the ground
- * is a hard floor. There are no aerodynamic forces yet. Replace the internals;
- * do not change the exported signature or the shape of `state`.
+ * A six-degree-of-freedom rigid-body model of a Cessna/Cub-class light single.
+ * Forces and moments come from real aerodynamics — dynamic pressure, a lift
+ * curve with a genuine stall break, induced + parasite drag, ISA air density,
+ * a propeller power/thrust curve — and from four sprung landing-gear contact
+ * points that carry weight, roll, brake and steer. Nothing here is a rate
+ * table: the aircraft flies because the sum of forces says so.
  *
- * Contract: see MODULES.md § flight model
+ * Contract: see MODULES.md § 2.10
  *
  *   createFlightModel(opts) -> { state, step(dt, inputs, groundHeight), reset(lat, lon, headingDeg) }
  *
@@ -16,8 +18,28 @@
  * Physics code must read the metric ones. UI code must read the display ones.
  * Nothing outside this module may write to `state`.
  *
- * WORLD AXES: +X east, +Y up, -Z north.
- * BODY AXES:  -Z nose, +X right wing, +Y up. (Matches aircraft/model.js.)
+ * ---------------------------------------------------------------------------
+ * AXES — read this before touching a sign
+ * ---------------------------------------------------------------------------
+ * WORLD (MODULES.md §1.2): +X east, +Y up, -Z north.
+ * BODY  (matches aircraft/model.js): -Z nose, +X right wing, +Y up.
+ *
+ * Aerodynamics is written in the textbook AERO frame (x forward, y right,
+ * z down) because every stability derivative in the literature is quoted in
+ * it. The mapping is fixed and used in exactly two places (`toAero`-style
+ * reads at the top of integrate(), and the torque conversion at the bottom):
+ *
+ *     aero x (fwd)   = -body Z          u = -vBody.z
+ *     aero y (right) = +body X          v = +vBody.x
+ *     aero z (down)  = -body Y          w = -vBody.y
+ *
+ *     roll rate  p =  -w_body.z         roll torque  L -> tau_body.z = -L
+ *     pitch rate q =  +w_body.x         pitch torque M -> tau_body.x = +M
+ *     yaw rate   r =  -w_body.y         yaw torque   N -> tau_body.y = -N
+ *
+ * Consequently the body-frame inertias are (Ix = pitch inertia,
+ * Iy = yaw inertia, Iz = roll inertia). That looks wrong at a glance and is
+ * not; the body axes are simply not the aero axes.
  *
  * ---------------------------------------------------------------------------
  * GEOGRAPHY
@@ -33,6 +55,23 @@
  * centimetre the aircraft will spawn buried in, or hovering above, the runway.
  * Both must ultimately be elevation.getElevationLocal — see MODULES.md § the
  * ground-height invariant.
+ *
+ * The caller supplies ONE ground sample, at the aircraft's own (x, z). All
+ * four gear contact points are tested against that single height, i.e. the
+ * ground is treated as locally flat over the ~4 m gear footprint. Runways are
+ * flat and this keeps the invariant intact; sampling terrain per wheel would
+ * mean this module reaching into elevation.js and owning a second opinion
+ * about where the ground is.
+ *
+ * ---------------------------------------------------------------------------
+ * TIMESTEP
+ * ---------------------------------------------------------------------------
+ * step() is an accumulator over a genuinely FIXED 1/240 s substep. Sprung gear
+ * and tyre friction are stiff relative to a 60 Hz frame; integrating them at
+ * frame rate turns a hard landing into a launch. A frame hitch spends more
+ * substeps, not a bigger one, so the model is frame-rate independent and
+ * cannot be exploded by a stalled tab. The <=4 ms accumulator residue is
+ * carried to the next frame.
  */
 
 import * as THREE from 'three';
@@ -45,6 +84,9 @@ import {
   MS_TO_FPM,
   RAD_TO_DEG,
   DEG_TO_RAD,
+  GRAVITY,
+  RHO_SEA_LEVEL,
+  airDensity,
 } from '../core/units.js';
 import { llToLocal, localToLl } from '../geo/coords.js';
 
@@ -60,10 +102,23 @@ import { llToLocal, localToLl } from '../geo/coords.js';
  *  @property {number} [gearHeightM]      Ground clearance of the datum, metres. Default 1.2.
  *  @property {number} [massKg]           All-up mass. Default 1100.
  *  @property {number} [wingAreaM2]       Reference wing area. Default 16.2.
- *  @property {number} [maxSpeedMs]       Stub-only: speed at full throttle. Default 85.
- *  @property {number} [stallSpeedMs]     Speed below which `stalled` latches. Default 25.
+ *  @property {number} [maxSpeedMs]       Advisory Vne, m/s. Default 85 (~165 kt).
+ *  @property {number} [stallSpeedMs]     CLEAN 1-g stall speed. Sets CLmax. Default 25 (~48.6 kt).
  *  @property {number} [idleRpm]          Default 700.
  *  @property {number} [maxRpm]           Default 2700.
+ *  --- additive, all optional, sensible C172-class defaults ---
+ *  @property {number} [wingSpanM]        Default 11.0 -> aspect ratio 7.47.
+ *  @property {number} [fuselageLengthM]  Default 8.28, used only for inertia scaling.
+ *  @property {number} [maxPowerW]        Shaft power at sea level. Default 132000 (177 hp).
+ *  @property {number} [propEfficiency]   Default 0.85.
+ *  @property {number} [staticThrustN]    Sea-level full-power static thrust. Default 2650.
+ *  @property {number} [cd0]              Zero-lift drag coefficient. Default 0.034.
+ *  @property {number} [oswald]           Span efficiency. Default 0.80.
+ *  @property {number} [inertiaRollKgM2]  Default 1285 * mass/1100.
+ *  @property {number} [inertiaPitchKgM2] Default 1825 * mass/1100.
+ *  @property {number} [inertiaYawKgM2]   Default 2667 * mass/1100.
+ *  @property {number} [windEastMs]       Steady wind, m/s toward east. Default 0.
+ *  @property {number} [windNorthMs]      Steady wind, m/s toward north. Default 0.
  */
 
 const DEFAULTS = {
@@ -87,30 +142,242 @@ const DEFAULTS = {
   stallSpeedMs: 25,
   idleRpm: 700,
   maxRpm: 2700,
+
+  wingSpanM: 11.0,
+  fuselageLengthM: 8.28,
+  maxPowerW: 132000,
+  propEfficiency: 0.85,
+  staticThrustN: 2650,
+  cd0: 0.034,
+  oswald: 0.8,
+  inertiaRollKgM2: 0,
+  inertiaPitchKgM2: 0,
+  inertiaYawKgM2: 0,
+  windEastMs: 0,
+  windNorthMs: 0,
 };
 
-/** Stub-only body rotation rates at full stick deflection, radians/second. */
-const PITCH_RATE = 0.9;
-const ROLL_RATE = 1.8;
-const YAW_RATE = 0.5;
+// ---------------------------------------------------------------------------
+// Fixed integration
+// ---------------------------------------------------------------------------
+/** Physics substep, seconds. Chosen for the gear springs, not the aerodynamics. */
+const FIXED_DT = 1 / 240;
+/** dt is clamped to 0.1 s (contract), so 24 substeps covers it; 32 is headroom. */
+const MAX_SUBSTEPS = 32;
 
-const NEUTRAL_INPUTS = {
-  pitch: 0,
-  roll: 0,
-  yaw: 0,
-  throttle: 0,
-  flaps: 0,
-  brakes: 0,
-};
+// ---------------------------------------------------------------------------
+// Airframe aerodynamics — C172-class stability derivatives, per RADIAN.
+// Sourced from the standard Roskam/JSBSim Cessna 172 dataset and then trimmed
+// against the target envelope (see the ENVELOPE block at the bottom of this
+// file for the arithmetic these were checked against).
+// ---------------------------------------------------------------------------
+const CL0 = 0.25; // lift coefficient at zero geometric alpha (cambered wing + incidence)
+const ALPHA_SOFT = 3 * DEG_TO_RAD; // width of the rounded-over top of the lift curve
+const STALL_BREAK = 0.06; // rad; e-folding width of the post-stall collapse
+const CL_FLATPLATE = 1.05; // fully separated wing behaves like a flat plate
+const CD_SEPARATED = 1.6; // drag multiplier for a fully separated wing
+const CD_BETA = 0.55; // parasite drag per radian^2 of sideslip — slipping costs energy
+const NEG_STALL_SCALE = 0.88; // a cambered wing stalls sooner inverted
+
+const CL_Q = 3.9; // lift from pitch rate
+const CL_DE = 0.43; // lift from elevator
+
+const CM0 = 0.05; // sets the hands-off trim speed (~91 kt at gross)
+const CM_ALPHA = -1.1; // longitudinal static stability
+const CM_Q = -12.4; // pitch damping
+const CM_DE = -1.28; // elevator power
+const CM_FLAP = -0.12; // flaps pitch the nose down
+const CM_STALL = -0.28; // centre of pressure marches aft when the wing lets go
+
+const CY_BETA = -0.31;
+const CY_DR = 0.187;
+
+const CROLL_BETA = -0.089; // dihedral effect: sideslip rolls you out of it
+const CROLL_P = -0.47; // roll damping
+const CROLL_R = 0.096; // yaw rate rolls the aircraft (roll-yaw coupling)
+const CROLL_DA = 0.229; // aileron power
+const CROLL_DR = -0.0147; // right rudder rolls right (direct term)
+const CROLL_STALL = 0.02; // asymmetric separation -> wing drop
+
+const CN_BETA = 0.065; // weathercock stability
+const CN_P = -0.03; // roll rate yaws adversely
+const CN_R = -0.099; // yaw damping
+const CN_DA = -0.014; // ADVERSE YAW — right aileron yaws left
+const CN_DR = -0.072; // rudder power
+
+/** Maximum control-surface travel, radians. */
+const DE_MAX = 0.42; // elevator, 24 deg
+const DA_MAX = 0.35; // aileron, 20 deg
+const DR_MAX = 0.4; // rudder, 23 deg
+
+/** Control surfaces have mass; the stick is not the surface. rad/s at full travel. */
+const SURFACE_RATE = 4.0;
+
+/** Flap system. */
+const FLAP_TRAVEL_RATE = 0.2; // full travel in 5 s
+const FLAP_DCL0 = 0.72; // lift-curve shift at full flap
+const FLAP_DCLMAX = 0.62; // CLmax increase at full flap
+const FLAP_DCD = 0.065; // parasite drag at full flap
+const VFE_MS = 43.7; // 85 kt: flaps blow back above this
+
+/**
+ * Propeller / engine.
+ *
+ * Thrust is  T(V) = P * eta / (V^3 + knee^3)^(1/3),  with `knee` solved so that
+ * T(0) is the configured static thrust. The cube, not a square root, and not
+ * the naive P/V: P/V is singular at rest, and a sqrt blend sags so hard through
+ * 40 m/s that the climb rate came out at 407 fpm against a book 730 — measured.
+ * The cube holds thrust near-flat through the takeoff roll (which is what a
+ * real fixed-pitch prop does) and still rolls it off by cruise. Vmax then had
+ * to be pulled back to 120 kt with cd0, which is why cd0 is 0.037 rather than
+ * the 0.029 a clean C172 shows: this airframe is drag-limited on top end and
+ * thrust-rich down low, exactly like the real one.
+ */
+const THRUST_KNEE_MS = 37.5; // legacy reference; the real knee is derived below
+const WINDMILL_RPM_PER_MS = 22; // a stopped throttle still turns the prop
+const WINDMILL_CD0 = 0.006; // a windmilling prop is a disc of drag
+const SLIPSTREAM_ARM_M = 0.26; // propwash over the fin -> left yaw under power
+const TORQUE_ARM_M = 0.12; // engine torque -> left roll under power
+
+/** Ground effect: induced drag falls within a wingspan of the surface. */
+const GROUND_EFFECT_K = 16; // McCormick's (16 h/b)^2 / (1 + (16 h/b)^2)
+
+/**
+ * Landing gear. Body-frame offsets in metres with `y` measured UP from the
+ * wheel plane (so the actual body offset is y - gearHeightM), +X right,
+ * -Z forward.
+ *
+ * Four points, not one: a single contact point cannot know the difference
+ * between sitting on the mains and sitting on the nosewheel, which is exactly
+ * the difference between a takeoff roll that needs speed and one that does not.
+ * The mains sit 0.30 m AFT of the CG and the nosewheel 1.10 m forward, so the
+ * static nose load is W * 0.3/1.4 and the elevator has to beat it before the
+ * nose will come up. It cannot do that below about 33 kt.
+ */
+const CONTACTS = [
+  {
+    name: 'nose',
+    x: 0, y: 0, z: -1.1,
+    k: 26000, c: 3000,
+    steer: true, brake: false,
+    muRoll: 0.025, muSide: 0.75,
+    vRefLong: 0.35, vRefSide: 0.25,
+  },
+  {
+    name: 'left',
+    x: -1.3, y: 0.02, z: 0.3,
+    k: 42000, c: 4700,
+    steer: false, brake: true,
+    muRoll: 0.022, muSide: 0.95,
+    vRefLong: 0.3, vRefSide: 0.25,
+  },
+  {
+    name: 'right',
+    x: 1.3, y: 0.02, z: 0.3,
+    k: 42000, c: 4700,
+    steer: false, brake: true,
+    muRoll: 0.022, muSide: 0.95,
+    vRefLong: 0.3, vRefSide: 0.25,
+  },
+  {
+    // Tail tie-down. Not a wheel — it is the over-rotation limit. Contacts at
+    // roughly 12 deg nose-up, which is what stops "full aft stick at walking
+    // pace" from levitating the aeroplane.
+    name: 'tail',
+    x: 0, y: 0.6, z: 3.0,
+    k: 45000, c: 5000,
+    steer: false, brake: false,
+    muRoll: 0.55, muSide: 0.55,
+    vRefLong: 0.4, vRefSide: 0.4,
+  },
+];
+
+const MU_BRAKE = 0.55;
+/**
+ * Rebound damping, as a fraction of compression damping. A one-sided damper
+ * (compression only) pogos: nothing bleeds the energy the spring gives back.
+ */
+const REBOUND_DAMP = 0.7;
+/**
+ * Ceiling on the DAMPER term alone, in weights, per leg. The spring peak at a
+ * 500 fpm arrival is about 2.5 g and that is the number that should show on the
+ * accelerometer. Undamped-cap, the c*v term spikes to 5.7 g in the first
+ * millisecond of contact — measured — which is an artifact of modelling a
+ * steel leaf spring as a viscous dashpot, not a real load.
+ */
+const MAX_DAMP_PER_W = 2;
+/** Per-contact normal-force ceiling, in units of aircraft weight. Stops a bad
+ *  terrain sample from firing the aeroplane into orbit. */
+const MAX_N_PER_W = 8;
+/**
+ * Nosewheel steering. 10 deg is the real pedal-linked travel on a C172 (tighter
+ * turns come from differential braking, which this model does not have), and it
+ * is not a comfort choice: the tyre model is geometrically honest, so a 1.7 m
+ * wheelbase at 30 deg of nosewheel gives a 2.9 m turn radius and the aeroplane
+ * pirouettes. Measured with 30 deg: a mere 0.15 of pedal held through the
+ * takeoff roll swung the heading 250 deg. Real pilots use about a degree; a
+ * keyboard gives you all of it or none.
+ */
+const STEER_MAX = 0.18; // 10 deg
+const STEER_FADE_START = 3; // m/s
+const STEER_FADE_SPAN = 25; // m/s
 
 /**
  * @param {FlightModelOpts} [opts]
- * @returns {{ state: Object, step: (dt: number, inputs: Object, groundHeight: number) => Object, reset: (lat?: number, lon?: number, headingDeg?: number) => void }}
+ * @returns {{ state: Object, config: Object, step: (dt: number, inputs: Object, groundHeight: number) => Object, reset: (lat?: number, lon?: number, headingDeg?: number) => void }}
  */
 export function createFlightModel(opts = {}) {
   const cfg = { ...DEFAULTS, ...opts };
   const groundHeightFn =
     typeof cfg.groundHeightFn === 'function' ? cfg.groundHeightFn : () => 0;
+
+  // -------------------------------------------------------------------------
+  // Derived airframe constants — computed once, never per frame.
+  // -------------------------------------------------------------------------
+  const MASS = Math.max(1, cfg.massKg);
+  const WEIGHT = MASS * GRAVITY;
+  const S_WING = Math.max(0.1, cfg.wingAreaM2);
+  const SPAN = Math.max(0.1, cfg.wingSpanM);
+  const AR = (SPAN * SPAN) / S_WING;
+  const CHORD = S_WING / SPAN;
+  const K_INDUCED = 1 / (Math.PI * AR * cfg.oswald);
+  /** Finite-wing lift-curve slope, Helmbold. ~4.96 /rad for AR 7.47. */
+  const CL_ALPHA = (2 * Math.PI) / (1 + 2 / AR);
+
+  /**
+   * CLmax is DERIVED from the configured clean stall speed, so `stallSpeedMs`
+   * is a real knob rather than decoration. 25 m/s at gross gives CLmax 1.74,
+   * i.e. Vs1 = 48.6 kt — the C172's book number. Full flap adds FLAP_DCLMAX,
+   * which brings Vs0 to about 41.7 kt: "stall ~40 kt", honestly arrived at.
+   */
+  const CL_MAX = clamp(
+    WEIGHT /
+      (0.5 * RHO_SEA_LEVEL * cfg.stallSpeedMs * cfg.stallSpeedMs * S_WING),
+    0.9,
+    2.4,
+  );
+
+  const massScale = MASS / 1100;
+  const lenScale = (cfg.fuselageLengthM / 8.28) ** 2;
+  const spanScale = (SPAN / 11) ** 2;
+  const I_ROLL = cfg.inertiaRollKgM2 || 1285 * massScale * spanScale;
+  const I_PITCH = cfg.inertiaPitchKgM2 || 1825 * massScale * lenScale;
+  const I_YAW = cfg.inertiaYawKgM2 || 2667 * massScale * lenScale;
+
+  const P_MAX = cfg.maxPowerW;
+  const ETA = cfg.propEfficiency;
+  /** Knee speed that makes T(0) land on the configured static thrust. */
+  const THRUST_KNEE = (P_MAX * ETA) / Math.max(1, cfg.staticThrustN);
+  const THRUST_KNEE3 = THRUST_KNEE * THRUST_KNEE * THRUST_KNEE;
+
+  const GEAR_H = cfg.gearHeightM;
+  const MAX_N = MAX_N_PER_W * WEIGHT;
+  const maxDamp = MAX_DAMP_PER_W * WEIGHT;
+  /** Static spring deflection, so reset() can park the aircraft already
+   *  settled instead of dropping it 10 cm onto the runway. */
+  let kTotal = 0;
+  for (let i = 0; i < 3; i++) kTotal += CONTACTS[i].k;
+  const STATIC_SQUAT = WEIGHT / kTotal;
 
   /**
    * Aircraft state. Mutated in place every step — hold the reference, don't
@@ -127,12 +394,14 @@ export function createFlightModel(opts = {}) {
     orientation: new THREE.Quaternion(),
     /** @type {THREE.Vector3} Body-frame angular velocity, RADIANS/SECOND. */
     angularVelocity: new THREE.Vector3(),
-    /** Airspeed, METRES/SECOND. The authoritative speed value. */
+    /** TRUE airspeed, METRES/SECOND. The authoritative speed value. */
     airspeedMs: 0,
-    /** Angle of attack, RADIANS. Stub always reports 0. */
+    /** Angle of attack, RADIANS, + = nose above the relative wind. */
     alphaRad: 0,
 
     // --- display values (UI reads these; recomputed each step) ------------
+    /** True airspeed in KNOTS — the display mirror of airspeedMs. For an
+     *  honest ASI needle use `indicatedAirspeedKts` instead. */
     airspeedKts: 0,
     /** Altitude above mean sea level (world y = 0), FEET. */
     altitudeFt: 0,
@@ -148,9 +417,10 @@ export function createFlightModel(opts = {}) {
     verticalSpeedFpm: 0,
     /** Propeller/engine speed, REVOLUTIONS PER MINUTE. */
     rpm: 0,
-    /** True while the wing is stalled. */
+    /** True while the wing is stalled. AoA-based, with hysteresis — NOT a
+     *  speed threshold. You can stall this aircraft at any speed. */
     stalled: false,
-    /** True while the gear is in contact with the terrain. */
+    /** True while any gear leg is carrying load. */
     onGround: false,
 
     // --- geodetic position (derived from `position` every step) -----------
@@ -159,15 +429,536 @@ export function createFlightModel(opts = {}) {
     lat: 0,
     /** Longitude, DEGREES. */
     lon: 0,
+
+    // --- ADDITIVE extras (not in MODULES.md §2.10; safe to ignore) --------
+    /** Angle of attack, DEGREES. */
+    alphaDeg: 0,
+    /** Sideslip, RADIANS / DEGREES. + = relative wind from the right. */
+    betaRad: 0,
+    betaDeg: 0,
+    /** Indicated (density-corrected) airspeed, KNOTS. This is what a real ASI
+     *  reads and what the stall actually tracks. Diverges hard over Rainier. */
+    indicatedAirspeedKts: 0,
+    /** Speed over the ground, KNOTS. */
+    groundSpeedKts: 0,
+    /** Load factor along the body vertical, in g. 1.0 in level flight. */
+    loadFactor: 1,
+    /** Approaching the critical angle of attack — the buffet, not the break. */
+    stallWarning: false,
+    /** Fraction of separated flow over the wing, 0..1. 0 until the break. */
+    separation: 0,
+    /** Commanded flap position, 0..1, after travel-rate and blow-back limits. */
+    flapsPos: 0,
+    /** Propeller thrust, NEWTONS. */
+    thrustN: 0,
+    /** Total gear spring compression, METRES (sum over legs). */
+    gearCompressionM: 0,
+    /** Vertical speed, METRES/SECOND (metric primary for verticalSpeedFpm). */
+    verticalSpeedMs: 0,
   };
 
-  // Scratch objects, allocated once — step() must not allocate per frame.
-  const _forward = new THREE.Vector3();
+  /** Read-only derived numbers — useful for a HUD or a test, never written to. */
+  const config = Object.freeze({
+    massKg: MASS,
+    weightN: WEIGHT,
+    wingAreaM2: S_WING,
+    wingSpanM: SPAN,
+    aspectRatio: AR,
+    chordM: CHORD,
+    clAlphaPerRad: CL_ALPHA,
+    clMaxClean: CL_MAX,
+    clMaxFlapped: CL_MAX + FLAP_DCLMAX,
+    inducedK: K_INDUCED,
+    stallSpeedCleanMs: cfg.stallSpeedMs,
+    stallSpeedFlappedMs: Math.sqrt(
+      WEIGHT / (0.5 * RHO_SEA_LEVEL * S_WING * (CL_MAX + FLAP_DCLMAX)),
+    ),
+    vneMs: cfg.maxSpeedMs,
+    inertiaRoll: I_ROLL,
+    inertiaPitch: I_PITCH,
+    inertiaYaw: I_YAW,
+    gearHeightM: GEAR_H,
+    staticSquatM: STATIC_SQUAT,
+    fixedDt: FIXED_DT,
+  });
+
+  // -------------------------------------------------------------------------
+  // Scratch — allocated once. step() must not allocate. (MODULES.md §1.8)
+  // -------------------------------------------------------------------------
   const _euler = new THREE.Euler();
-  const _deltaRot = new THREE.Quaternion();
   const _tmpEuler = new THREE.Euler();
+  const _dq = new THREE.Quaternion();
+  const _qInv = new THREE.Quaternion();
+  const _air = new THREE.Vector3();
+  const _vBody = new THREE.Vector3();
+  const _fBody = new THREE.Vector3();
+  const _fWorld = new THREE.Vector3();
+  const _accel = new THREE.Vector3();
+  const _bodyUp = new THREE.Vector3();
+  const _fwd = new THREE.Vector3();
+  const _wind = new THREE.Vector3();
+  const _omegaWorld = new THREE.Vector3();
+  const _rWorld = new THREE.Vector3();
+  const _vPoint = new THREE.Vector3();
+  const _fContact = new THREE.Vector3();
+  const _fGround = new THREE.Vector3();
+  const _tGround = new THREE.Vector3();
+  const _tBody = new THREE.Vector3();
+  const _cross = new THREE.Vector3();
   const _local = { x: 0, z: 0 };
   const _ll = { lat: 0, lon: 0 };
+  const _cl = { cl: 0, sep: 0 };
+
+  _wind.set(cfg.windEastMs, 0, -cfg.windNorthMs);
+
+  // Control-surface positions (rate-limited images of the stick), -1..+1.
+  let surfPitch = 0;
+  let surfRoll = 0;
+  let surfYaw = 0;
+  let flapPos = 0;
+  /** Lagged engine state, 0..1. Drives thrust AND the rpm needle. */
+  let engineSpool = 0;
+  // Parsed inputs for the current step(), read by every substep.
+  let inPitch = 0;
+  let inRoll = 0;
+  let inYaw = 0;
+  let inThrottle = 0;
+  let inFlaps = 0;
+  let inBrakes = 0;
+  // Integration accumulator and a clock used only for stall-buffet phase.
+  let accumulator = 0;
+  let clock = 0;
+  // Running ground-height for refreshDisplay between substeps.
+  let lastGround = 0;
+
+  // ---------------------------------------------------------------------------
+  // Lift curve
+  // ---------------------------------------------------------------------------
+  /**
+   * CL and separation fraction as a function of angle of attack measured from
+   * the ZERO-LIFT line (so camber and flap deflection just move the origin).
+   *
+   * Three regions:
+   *   1. linear,  CL = a * alphaEff
+   *   2. the last ALPHA_SOFT before the peak, rounded over to zero slope —
+   *      real wings do not have a corner there, and a corner makes the buffet
+   *      feel like a switch
+   *   3. past the peak, an exponential collapse (e-folding STALL_BREAK) from
+   *      CLmax toward flat-plate CL = 1.05 sin(2a).
+   *
+   * The result: CL falls ~30% within 7 deg of the break and keeps falling,
+   * while CD rises by an order of magnitude. That is a stall you have to fly
+   * out of, and the only way out is down — nothing in here lets you recover by
+   * pulling harder, because pulling harder raises alpha and alpha is the whole
+   * problem.
+   *
+   * @param {number} aEff  alpha relative to the zero-lift line, radians
+   * @param {number} aMaxPos positive-side critical alphaEff, radians
+   * @param {{cl:number, sep:number}} out
+   */
+  function liftCurve(aEff, aMaxPos, out) {
+    const sign = aEff >= 0 ? 1 : -1;
+    const a = aEff >= 0 ? aEff : -aEff;
+    const aMax = sign > 0 ? aMaxPos : aMaxPos * NEG_STALL_SCALE;
+    const knee = aMax - ALPHA_SOFT;
+
+    if (a <= knee) {
+      out.cl = sign * CL_ALPHA * a;
+      out.sep = 0;
+      return out;
+    }
+    if (a <= aMax) {
+      // Quadratic that matches value and slope at `knee` and flattens at aMax.
+      const t = (a - knee) / ALPHA_SOFT;
+      out.cl =
+        sign * CL_ALPHA * (knee + ALPHA_SOFT * (t - 0.5 * t * t));
+      out.sep = 0;
+      return out;
+    }
+    const clPeak = CL_ALPHA * (aMax - 0.5 * ALPHA_SOFT);
+    const w = 1 - Math.exp(-(a - aMax) / STALL_BREAK);
+    const flat =
+      CL_FLATPLATE * Math.sin(2 * (a < Math.PI * 0.5 ? a : Math.PI * 0.5));
+    out.cl = sign * (clPeak * (1 - w) + flat * w);
+    out.sep = w;
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // One fixed physics substep
+  // ---------------------------------------------------------------------------
+  /**
+   * @param {number} h  substep, seconds — always FIXED_DT
+   * @param {number} gh terrain elevation, metres MSL, at the aircraft's (x, z)
+   */
+  function integrate(h, gh) {
+    clock += h;
+
+    // --- control surfaces lag the stick -----------------------------------
+    surfPitch = moveToward(surfPitch, inPitch, SURFACE_RATE * h);
+    surfRoll = moveToward(surfRoll, inRoll, SURFACE_RATE * h);
+    surfYaw = moveToward(surfYaw, inYaw, SURFACE_RATE * h);
+
+    // --- atmosphere --------------------------------------------------------
+    const rho = airDensity(state.position.y);
+    const sigma = rho / RHO_SEA_LEVEL;
+
+    // --- relative wind, body frame, aero frame -----------------------------
+    _qInv.copy(state.orientation).conjugate(); // unit quaternion: conjugate == inverse
+    _air.copy(state.velocity).sub(_wind);
+    _vBody.copy(_air).applyQuaternion(_qInv);
+    const u = -_vBody.z; // forward
+    const vR = _vBody.x; // right
+    const wD = -_vBody.y; // down
+    const V = Math.sqrt(u * u + vR * vR + wD * wD);
+
+    let alpha = 0;
+    let beta = 0;
+    if (V > 0.5) {
+      alpha = Math.atan2(wD, u > 0.5 ? u : 0.5);
+      beta = Math.asin(clamp(vR / V, -1, 1));
+    }
+
+    const qbar = 0.5 * rho * V * V;
+    const qS = qbar * S_WING;
+
+    // --- body rates -> aero rates ------------------------------------------
+    const p = -state.angularVelocity.z;
+    const q = state.angularVelocity.x;
+    const r = -state.angularVelocity.y;
+    // Non-dimensional rates go singular at V -> 0; the 12 m/s floor keeps the
+    // damping terms finite. Below that qbar is tiny anyway, so it never shows.
+    const vRef = V > 12 ? V : 12;
+    const pHat = (p * SPAN) / (2 * vRef);
+    const qHat = (q * CHORD) / (2 * vRef);
+    const rHat = (r * SPAN) / (2 * vRef);
+
+    // --- flaps: travel rate, then blow-back above Vfe ----------------------
+    const blowBack = clamp(1 - (V - VFE_MS) / 12, 0, 1);
+    const flapCmd = Math.min(clamp(inFlaps, 0, 1), blowBack);
+    flapPos = moveToward(flapPos, flapCmd, FLAP_TRAVEL_RATE * h);
+
+    // --- lift curve, shifted and stretched by flap ------------------------
+    const cl0Eff = CL0 + FLAP_DCL0 * flapPos;
+    const alphaZeroLift = -cl0Eff / CL_ALPHA;
+    const alphaEffMax =
+      (CL_MAX + FLAP_DCLMAX * flapPos) / CL_ALPHA + 0.5 * ALPHA_SOFT;
+    const alphaEff = alpha - alphaZeroLift;
+    liftCurve(alphaEff, alphaEffMax, _cl);
+    const clWing = _cl.cl;
+    const sep = _cl.sep;
+
+    // --- engine ------------------------------------------------------------
+    // One lagged engine state drives BOTH the rpm gauge and the thrust, so
+    // what you hear and what you feel are the same number. Naturally aspirated
+    // power lapse with density: P/P0 = (sigma - 0.117) / 0.883.
+    engineSpool = damp(engineSpool, inThrottle, 2.5, h);
+    const powerLapse = clamp((sigma - 0.117) / 0.883, 0, 1);
+    const shaftW = P_MAX * powerLapse * (0.03 + 0.97 * engineSpool);
+    const thrust = (shaftW * ETA) / Math.cbrt(V * V * V + THRUST_KNEE3);
+    state.thrustN = thrust;
+
+    // rpm: commanded by the same spool state, but the airstream will drive the
+    // prop faster than idle on the way down — a glide is not a silent glide.
+    const cmdRpm =
+      cfg.idleRpm +
+      engineSpool * (cfg.maxRpm - cfg.idleRpm) * (0.55 + 0.45 * sigma);
+    const windmillRpm = V * WINDMILL_RPM_PER_MS;
+    state.rpm = Math.min(
+      cfg.maxRpm,
+      cmdRpm > windmillRpm ? cmdRpm : windmillRpm,
+    );
+
+    // --- drag --------------------------------------------------------------
+    // Ground effect: induced drag collapses inside a wingspan of the surface.
+    const hAgl = Math.max(0, state.position.y - gh);
+    const hb = (GROUND_EFFECT_K * hAgl) / SPAN;
+    const groundEffect = (hb * hb) / (1 + hb * hb);
+
+    const cdWindmill = WINDMILL_CD0 * (1 - clamp(inThrottle, 0, 1));
+    const cdInduced = K_INDUCED * groundEffect * clWing * clWing;
+    const sinA = Math.sin(alphaEff);
+    const cdSep = sep * CD_SEPARATED * sinA * sinA;
+    const cd =
+      cfg.cd0 + cdWindmill + FLAP_DCD * flapPos + cdInduced + CD_BETA * beta * beta + cdSep;
+
+    // --- control deflections, radians -------------------------------------
+    // Stick +1 pitch = nose up. Elevator TE-down is positive, so pull is
+    // negative deflection. Stick +1 yaw = RIGHT rudder, and CN_DR is negative,
+    // so right rudder is negative deflection too.
+    let de = -surfPitch * DE_MAX;
+    const da = surfRoll * DA_MAX;
+    const dr = -surfYaw * DR_MAX;
+
+    // A stalled wing dumps its wake over the tailplane, so you cannot pull
+    // FURTHER into the stall — but the elevator keeps full authority the other
+    // way, because pushing is the recovery and taking that away would be a lie
+    // in the opposite direction. Ailerons lose most of their bite (the tips
+    // separate first); the rudder keeps all of its.
+    if (sep > 0 && de < 0) de *= 1 - 0.5 * sep;
+    const daEff = da * (1 - 0.6 * sep);
+
+    // --- aerodynamic coefficients -----------------------------------------
+    const cl = clWing + CL_Q * qHat + CL_DE * de;
+    const cy = CY_BETA * beta + CY_DR * dr;
+
+    // Deterministic, slowly wandering asymmetry so the stall drops a wing
+    // instead of mushing straight ahead. Two incommensurate sines, no RNG, so
+    // a replay is a replay.
+    const asym =
+      0.55 * Math.sin(clock * 1.7) + 0.45 * Math.sin(clock * 0.63 + 1.1);
+
+    const cRoll =
+      CROLL_BETA * beta +
+      CROLL_P * pHat +
+      CROLL_R * rHat +
+      CROLL_DA * daEff +
+      CROLL_DR * dr +
+      CROLL_STALL * sep * asym;
+
+    const cM =
+      CM0 +
+      CM_ALPHA * alpha +
+      CM_Q * qHat +
+      CM_DE * de +
+      CM_FLAP * flapPos +
+      CM_STALL * sep;
+
+    const cN =
+      CN_BETA * beta +
+      CN_P * pHat +
+      CN_R * rHat +
+      CN_DA * daEff +
+      CN_DR * dr;
+
+    // --- aerodynamic + propulsive forces, aero frame -----------------------
+    const lift = qS * cl;
+    const drag = qS * cd;
+    const side = qS * cy;
+
+    const ca = Math.cos(alpha);
+    const sa = Math.sin(alpha);
+    const xA = lift * sa - drag * ca + thrust;
+    const yA = side;
+    const zA = -lift * ca - drag * sa;
+
+    // aero -> body: x_body = y_aero, y_body = -z_aero, z_body = -x_aero
+    _fBody.set(yA, -zA, -xA);
+    _fWorld.copy(_fBody).applyQuaternion(state.orientation);
+
+    // --- moments, aero frame ----------------------------------------------
+    const qSb = qS * SPAN;
+    const qSc = qS * CHORD;
+    // Torque and slipstream are LOW-SPEED, HIGH-POWER effects here, faded out
+    // by 45 m/s. Not a simplification for its own sake: a real aeroplane's
+    // wing rigging and aileron/rudder trim tabs are set to cancel these at
+    // cruise, and this model has no trim axis to cancel them with. Applied
+    // flat, a constant 170 N.m of torque roll walks the aircraft into a
+    // 45-degree left bank over two minutes of hands-off cruise — measured,
+    // not hypothetical. Faded, you get what you should: right rudder on the
+    // takeoff roll and in the climb, hands off at cruise.
+    const propEffect = clamp(1 - V / 45, 0, 1);
+    let momL = qSb * cRoll - TORQUE_ARM_M * thrust * propEffect;
+    let momM = qSc * cM;
+    // Propwash spirals onto the fin: left yaw. This is why a real single
+    // needs right rudder on the takeoff roll.
+    let momN = qSb * cN - SLIPSTREAM_ARM_M * thrust * propEffect;
+
+    // --- landing gear ------------------------------------------------------
+    _fGround.set(0, 0, 0);
+    _tGround.set(0, 0, 0);
+    let normalTotal = 0;
+    let compressionTotal = 0;
+
+    // Steering: the nosewheel follows the pedals, fading out as the rudder
+    // takes over. Rotating a heading vector about +Y by +phi turns it LEFT
+    // (heading = -yaw, MODULES.md §1.2), so a right pedal is -phi.
+    const gspd = Math.sqrt(
+      state.velocity.x * state.velocity.x + state.velocity.z * state.velocity.z,
+    );
+    const steerGain = clamp(1 - (gspd - STEER_FADE_START) / STEER_FADE_SPAN, 0.15, 1);
+    const steerAngle = surfYaw * STEER_MAX * steerGain;
+    const cosS = Math.cos(steerAngle);
+    const sinS = Math.sin(steerAngle);
+
+    _omegaWorld.copy(state.angularVelocity).applyQuaternion(state.orientation);
+    _fwd.set(0, 0, -1).applyQuaternion(state.orientation);
+    // Nose direction projected onto the ground plane.
+    let fx = _fwd.x;
+    let fz = _fwd.z;
+    let flen = Math.sqrt(fx * fx + fz * fz);
+    if (flen < 1e-4) {
+      fx = 0;
+      fz = -1;
+      flen = 1;
+    }
+    fx /= flen;
+    fz /= flen;
+
+    const brake = clamp(inBrakes, 0, 1);
+
+    for (let i = 0; i < CONTACTS.length; i++) {
+      const cp = CONTACTS[i];
+      _rWorld.set(cp.x, cp.y - GEAR_H, cp.z).applyQuaternion(state.orientation);
+      const py = state.position.y + _rWorld.y;
+      const pen = gh - py;
+      if (pen <= 0) continue;
+
+      _cross.crossVectors(_omegaWorld, _rWorld);
+      _vPoint.copy(state.velocity).add(_cross);
+
+      // Spring + damper along world up. Damping only resists compression, so
+      // the gear never sucks the aircraft back down on rebound.
+      let damp2 = -cp.c * _vPoint.y;
+      if (_vPoint.y > 0) damp2 *= REBOUND_DAMP;
+      if (damp2 > maxDamp) damp2 = maxDamp;
+      else if (damp2 < -maxDamp) damp2 = -maxDamp;
+      let fn = cp.k * pen + damp2;
+      if (fn < 0) fn = 0;
+      if (fn > MAX_N) fn = MAX_N;
+      normalTotal += fn;
+      compressionTotal += pen;
+
+      // Wheel-plane axes. Only the nosewheel steers.
+      let wfx = fx;
+      let wfz = fz;
+      if (cp.steer) {
+        wfx = fx * cosS - fz * sinS;
+        wfz = fx * sinS + fz * cosS;
+      }
+      const wrx = -wfz; // right = fwd rotated -90 deg about +Y
+      const wrz = wfx;
+
+      const vLong = _vPoint.x * wfx + _vPoint.z * wfz;
+      const vLat = _vPoint.x * wrx + _vPoint.z * wrz;
+
+      const muLong = cp.brake ? cp.muRoll + (MU_BRAKE - cp.muRoll) * brake : cp.muRoll;
+      // tanh, not sign(): a discontinuity at zero slip velocity chatters at
+      // any timestep. tanh is smooth, bounded by mu*N, and its slope near zero
+      // is small enough (mu*N/vRef * h / m << 2) to stay explicit-stable.
+      const fLong = -muLong * fn * Math.tanh(vLong / cp.vRefLong);
+      const fLat = -cp.muSide * fn * Math.tanh(vLat / cp.vRefSide);
+
+      _fContact.set(wfx * fLong + wrx * fLat, fn, wfz * fLong + wrz * fLat);
+      _fGround.add(_fContact);
+      _cross.crossVectors(_rWorld, _fContact);
+      _tGround.add(_cross);
+    }
+
+    state.gearCompressionM = compressionTotal;
+    const onGround = normalTotal > 0.02 * WEIGHT;
+    state.onGround = onGround;
+
+    if (normalTotal > 0) {
+      _fWorld.add(_fGround);
+      // World torque -> body torque -> aero moments.
+      _tBody.copy(_tGround).applyQuaternion(_qInv);
+      momM += _tBody.x;
+      momN += -_tBody.y;
+      momL += -_tBody.z;
+    }
+
+    // --- accelerometer (specific force, i.e. everything but gravity) -------
+    _accel.copy(_fWorld).multiplyScalar(1 / MASS);
+    _bodyUp.set(0, 1, 0).applyQuaternion(state.orientation);
+    state.loadFactor = _accel.dot(_bodyUp) / GRAVITY;
+
+    // --- gravity, then linear integration ---------------------------------
+    _fWorld.y -= WEIGHT;
+    state.velocity.addScaledVector(_fWorld, h / MASS);
+    state.position.addScaledVector(state.velocity, h);
+
+    // --- angular integration (Euler's equations, aero axes) ---------------
+    // The (I - I) q r terms are what make a rolling pull want to yaw and a
+    // yawing roll want to pitch. They cost three multiplies; keep them.
+    const pDot = (momL + (I_PITCH - I_YAW) * q * r) / I_ROLL;
+    const qDot = (momM + (I_YAW - I_ROLL) * p * r) / I_PITCH;
+    const rDot = (momN + (I_ROLL - I_PITCH) * p * q) / I_YAW;
+
+    const pN = p + pDot * h;
+    const qN = q + qDot * h;
+    const rN = r + rDot * h;
+    // aero -> body: wx = q, wy = -r, wz = -p
+    state.angularVelocity.set(qN, -rN, -pN);
+
+    // First-order quaternion update. At h = 1/240 s and the rates a light
+    // single can generate (< 3 rad/s), the truncation error is ~1e-5 rad per
+    // step and the renormalise absorbs it.
+    _dq.set(
+      state.angularVelocity.x * h * 0.5,
+      state.angularVelocity.y * h * 0.5,
+      state.angularVelocity.z * h * 0.5,
+      1,
+    );
+    state.orientation.multiply(_dq).normalize();
+
+    // --- last-resort containment ------------------------------------------
+    // A terrain LOD pop or a teleport can put the datum below the surface. Do
+    // not try to solve that with springs; just place it back on the wheels.
+    const floor = gh - GEAR_H - 4;
+    if (state.position.y < floor) {
+      state.position.y = gh + GEAR_H - STATIC_SQUAT;
+      if (state.velocity.y < 0) state.velocity.y = 0;
+    }
+
+    // --- stall, from angle of attack, with hysteresis ----------------------
+    const critNow = alphaEff >= 0 ? alphaEffMax : -alphaEffMax * NEG_STALL_SCALE;
+    const past = alphaEff >= 0 ? alphaEff - critNow : critNow - alphaEff;
+    if (V > 6) {
+      if (state.stalled) {
+        // 2 deg of hysteresis: you have to actually unload the wing, not just
+        // twitch the stick, before the model calls it recovered.
+        if (past < -2 * DEG_TO_RAD) state.stalled = false;
+      } else if (past > 0) {
+        state.stalled = true;
+      }
+      state.stallWarning = past > -5 * DEG_TO_RAD;
+    } else {
+      state.stalled = false;
+      state.stallWarning = false;
+    }
+
+    state.alphaRad = alpha;
+    state.betaRad = beta;
+    state.airspeedMs = V;
+    state.separation = sep;
+    state.flapsPos = flapPos;
+  }
+
+  /** Move `cur` toward `target` by at most `maxDelta`. */
+  function moveToward(cur, target, maxDelta) {
+    const d = target - cur;
+    if (d > maxDelta) return cur + maxDelta;
+    if (d < -maxDelta) return cur - maxDelta;
+    return target;
+  }
+
+  /** Recompute every display-unit field from the metric primaries. */
+  function refreshDisplay(groundHeight) {
+    state.airspeedKts = state.airspeedMs * MS_TO_KTS;
+    const rho = airDensity(state.position.y);
+    state.indicatedAirspeedKts =
+      state.airspeedMs * Math.sqrt(rho / RHO_SEA_LEVEL) * MS_TO_KTS;
+    state.groundSpeedKts =
+      Math.sqrt(
+        state.velocity.x * state.velocity.x + state.velocity.z * state.velocity.z,
+      ) * MS_TO_KTS;
+    state.altitudeFt = state.position.y * M_TO_FT;
+    state.altitudeAglFt = (state.position.y - groundHeight) * M_TO_FT;
+    state.verticalSpeedMs = state.velocity.y;
+    state.verticalSpeedFpm = state.velocity.y * MS_TO_FPM;
+    state.alphaDeg = state.alphaRad * RAD_TO_DEG;
+    state.betaDeg = state.betaRad * RAD_TO_DEG;
+
+    localToLl(state.position.x, state.position.z, _ll);
+    state.lat = _ll.lat;
+    state.lon = _ll.lon;
+
+    _tmpEuler.setFromQuaternion(state.orientation, 'YXZ');
+    state.headingDeg = wrapDeg(-_tmpEuler.y * RAD_TO_DEG);
+    state.pitchDeg = _tmpEuler.x * RAD_TO_DEG;
+    state.rollDeg = -_tmpEuler.z * RAD_TO_DEG;
+  }
 
   /**
    * Place the aircraft at a real-world position.
@@ -178,7 +969,9 @@ export function createFlightModel(opts = {}) {
    * aircraft to any field.
    *
    * Vertical placement uses `groundHeightFn`, so the aircraft lands on the
-   * wheels at the real field elevation rather than at an assumed altitude.
+   * wheels at the real field elevation rather than at an assumed altitude, and
+   * it is pre-squatted by the static spring deflection so it does not visibly
+   * settle on the first frame.
    *
    * @param {number} [lat] degrees
    * @param {number} [lon] degrees
@@ -187,15 +980,14 @@ export function createFlightModel(opts = {}) {
   function reset(lat, lon, headingDeg) {
     const useLat = Number.isFinite(lat) ? lat : cfg.startLat;
     const useLon = Number.isFinite(lon) ? lon : cfg.startLon;
-    const useHdg = Number.isFinite(headingDeg)
-      ? headingDeg
-      : cfg.startHeadingDeg;
+    const useHdg = Number.isFinite(headingDeg) ? headingDeg : cfg.startHeadingDeg;
 
     llToLocal(useLat, useLon, _local);
     const ground = groundHeightFn(_local.x, _local.z);
+    const agl = Math.max(0, cfg.startAltitudeAglM);
     state.position.set(
       _local.x,
-      ground + cfg.gearHeightM + Math.max(0, cfg.startAltitudeAglM),
+      ground + GEAR_H + agl - (agl > 0 ? 0 : STATIC_SQUAT),
       _local.z,
     );
 
@@ -205,31 +997,29 @@ export function createFlightModel(opts = {}) {
     state.angularVelocity.set(0, 0, 0);
     state.airspeedMs = Math.max(0, cfg.startAirspeedMs);
     state.alphaRad = 0;
+    state.betaRad = 0;
 
-    _forward.set(0, 0, -1).applyQuaternion(state.orientation);
-    state.velocity.copy(_forward).multiplyScalar(state.airspeedMs);
+    _fwd.set(0, 0, -1).applyQuaternion(state.orientation);
+    state.velocity.copy(_fwd).multiplyScalar(state.airspeedMs).add(_wind);
 
     state.stalled = false;
-    state.onGround = cfg.startAltitudeAglM <= 0;
+    state.stallWarning = false;
+    state.separation = 0;
+    state.loadFactor = 1;
+    state.onGround = agl <= 0;
     state.rpm = cfg.idleRpm;
+    state.thrustN = 0;
+    state.gearCompressionM = 0;
+
+    surfPitch = 0;
+    surfRoll = 0;
+    surfYaw = 0;
+    flapPos = 0;
+    engineSpool = 0;
+    state.flapsPos = 0;
+    accumulator = 0;
+    lastGround = ground;
     refreshDisplay(ground);
-  }
-
-  /** Recompute every display-unit field from the metric primaries. */
-  function refreshDisplay(groundHeight) {
-    state.airspeedKts = state.airspeedMs * MS_TO_KTS;
-    state.altitudeFt = state.position.y * M_TO_FT;
-    state.altitudeAglFt = (state.position.y - groundHeight) * M_TO_FT;
-    state.verticalSpeedFpm = state.velocity.y * MS_TO_FPM;
-
-    localToLl(state.position.x, state.position.z, _ll);
-    state.lat = _ll.lat;
-    state.lon = _ll.lon;
-
-    _tmpEuler.setFromQuaternion(state.orientation, 'YXZ');
-    state.headingDeg = wrapDeg(-_tmpEuler.y * RAD_TO_DEG);
-    state.pitchDeg = _tmpEuler.x * RAD_TO_DEG;
-    state.rollDeg = -_tmpEuler.z * RAD_TO_DEG;
   }
 
   /**
@@ -244,79 +1034,70 @@ export function createFlightModel(opts = {}) {
    * @returns {Object} The same `state` object, for convenience.
    */
   function step(dt, inputs, groundHeight = 0) {
-    const h = clamp(Number.isFinite(dt) ? dt : 0, 0, 0.1);
-    const inp = { ...NEUTRAL_INPUTS, ...(inputs || {}) };
-    const gh = Number.isFinite(groundHeight) ? groundHeight : 0;
+    const frame = clamp(Number.isFinite(dt) ? dt : 0, 0, 0.1);
+    const gh = Number.isFinite(groundHeight) ? groundHeight : lastGround;
+    lastGround = gh;
 
-    if (h === 0) {
+    // Read inputs field by field — spreading into a fresh object would
+    // allocate every frame (MODULES.md §1.8).
+    if (inputs) {
+      inPitch = clamp(numOr(inputs.pitch, 0), -1, 1);
+      inRoll = clamp(numOr(inputs.roll, 0), -1, 1);
+      inYaw = clamp(numOr(inputs.yaw, 0), -1, 1);
+      inThrottle = clamp(numOr(inputs.throttle, 0), 0, 1);
+      inFlaps = clamp(numOr(inputs.flaps, 0), 0, 1);
+      inBrakes = clamp(numOr(inputs.brakes, 0), 0, 1);
+    } else {
+      inPitch = inRoll = inYaw = inThrottle = inFlaps = inBrakes = 0;
+    }
+
+    if (frame === 0) {
       refreshDisplay(gh);
       return state;
     }
 
-    const pitchIn = clamp(inp.pitch, -1, 1);
-    const rollIn = clamp(inp.roll, -1, 1);
-    const yawIn = clamp(inp.yaw, -1, 1);
-    const throttle = clamp(inp.throttle, 0, 1);
-    const brakes = clamp(inp.brakes, 0, 1);
-    const flaps = clamp(inp.flaps, 0, 1);
-
-    // --- engine ------------------------------------------------------------
-    const targetRpm = cfg.idleRpm + throttle * (cfg.maxRpm - cfg.idleRpm);
-    state.rpm = damp(state.rpm, targetRpm, 2.5, h);
-
-    // --- attitude ----------------------------------------------------------
-    // Stub: stick position IS the body rotation rate. Control authority fades
-    // toward zero as the aircraft slows, so it feels vaguely aeroplane-like.
-    const authority = clamp(state.airspeedMs / 30, 0, 1);
-    state.angularVelocity.set(
-      pitchIn * PITCH_RATE * authority,
-      -yawIn * YAW_RATE * authority,
-      -rollIn * ROLL_RATE * authority,
-    );
-
-    _deltaRot.setFromEuler(
-      _euler.set(
-        state.angularVelocity.x * h,
-        state.angularVelocity.y * h,
-        state.angularVelocity.z * h,
-        'XYZ',
-      ),
-    );
-    // Body-frame rotation: post-multiply.
-    state.orientation.multiply(_deltaRot).normalize();
-
-    // --- speed -------------------------------------------------------------
-    const dragFromFlaps = 1 - 0.25 * flaps;
-    const targetSpeed = throttle * cfg.maxSpeedMs * dragFromFlaps;
-    state.airspeedMs = damp(state.airspeedMs, targetSpeed, 0.35, h);
-    if (state.onGround && brakes > 0) {
-      state.airspeedMs = damp(state.airspeedMs, 0, 3 * brakes, h);
+    accumulator += frame;
+    let n = 0;
+    while (accumulator >= FIXED_DT && n < MAX_SUBSTEPS) {
+      integrate(FIXED_DT, gh);
+      accumulator -= FIXED_DT;
+      n++;
     }
-    state.airspeedMs = Math.max(0, state.airspeedMs);
-
-    // --- velocity and position --------------------------------------------
-    _forward.set(0, 0, -1).applyQuaternion(state.orientation);
-    state.velocity.copy(_forward).multiplyScalar(state.airspeedMs);
-    state.position.addScaledVector(state.velocity, h);
-
-    // --- ground contact ----------------------------------------------------
-    const floor = gh + cfg.gearHeightM;
-    if (state.position.y <= floor) {
-      state.position.y = floor;
-      if (state.velocity.y < 0) state.velocity.y = 0;
-      state.onGround = true;
-    } else {
-      state.onGround = false;
-    }
-
-    // --- stall -------------------------------------------------------------
-    state.stalled = !state.onGround && state.airspeedMs < cfg.stallSpeedMs;
+    // Spiral-of-death guard: if we hit the cap the machine is behind, and
+    // hoarding the backlog only makes the next frame worse. Drop it.
+    if (n >= MAX_SUBSTEPS) accumulator = 0;
 
     refreshDisplay(gh);
     return state;
   }
 
+  function numOr(v, d) {
+    return typeof v === 'number' && Number.isFinite(v) ? v : d;
+  }
+
   reset();
 
-  return { state, step, reset };
+  return { state, config, step, reset };
 }
+
+/* ---------------------------------------------------------------------------
+ * ENVELOPE — the arithmetic these numbers were tuned against, at gross weight
+ * (1100 kg / 10,787 N), sea level, ISA. Re-derive before changing a constant.
+ *
+ *   CL_ALPHA      4.96 /rad     Helmbold, AR 7.47
+ *   CL_MAX        1.74          from stallSpeedMs = 25 m/s
+ *   alpha_crit    ~17.4 deg clean, ~1.1 deg lower at full flap
+ *   Vs1 (clean)   25.0 m/s = 48.6 kt
+ *   Vs0 (flap)    21.5 m/s = 41.7 kt
+ *   Vfe            43.7 m/s = 85 kt (flaps blow back above this)
+ *   Vy climb      38.6 m/s = 75 kt -> ~730 fpm
+ *   Vmax level    ~62 m/s  = ~120 kt at sea level, full throttle
+ *   Vne           85 m/s   = 165 kt (advisory; nothing enforces it)
+ *   L/D max       ~11 : 1
+ *   trim speed    ~47 m/s  = ~91 kt hands off, from CM0 = 0.05
+ *   ground roll   ~270 m; rotation needs ~55 kt, flies at ~57 kt
+ *   power lapse   59% of rated at Mount Rainier's summit (4,392 m, sigma 0.64).
+ *                 The service ceiling lands just under the summit, which is
+ *                 where a real 172's does. You can go and look at the mountain;
+ *                 you cannot fly over the top of it. That is the point.
+ * ------------------------------------------------------------------------- */
