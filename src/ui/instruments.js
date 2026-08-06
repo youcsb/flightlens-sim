@@ -806,11 +806,26 @@ function group(n) {
   return neg ? '-' + out : out;
 }
 
-/** Damp an angle the short way round, so 359 -> 1 does not spin backwards. */
+/**
+ * Damp an angle the short way round, so 359 -> 1 does not spin backwards.
+ *
+ * The result is re-wrapped into [0, 360). Without that the damped value is a
+ * free-running accumulator: every turn in the same direction adds another lap,
+ * so after ten minutes of circling the heading card is being handed
+ * `rotate(-3960)`. It renders identically — which is exactly why it survives a
+ * screenshot — but the number grows without bound, and a float that large has
+ * lost the precision the 0.01-degree formatting is asking for.
+ */
 function dampAngle(current, target, rate, dt) {
   let delta = wrapDeg(target - current);
   if (delta > 180) delta -= 360;
-  return current + delta * (1 - Math.exp(-rate * dt));
+  return wrapDeg(current + delta * (1 - Math.exp(-rate * dt)));
+}
+
+/** As dampAngle, but kept in [-180, 180) — bank angle is signed. */
+function dampBank(current, target, rate, dt) {
+  const w = dampAngle(current, target, rate, dt);
+  return w >= 180 ? w - 360 : w;
 }
 
 /** Write only when the string actually changed — avoids per-frame layout. */
@@ -987,7 +1002,14 @@ export function createInstruments(container) {
     lastMs = now;
 
     // --- read the display fields, defensively ------------------------------
-    const kt = num(state.airspeedKts);
+    // THE ASI SHOWS INDICATED AIRSPEED, not true. The face is marked in KIAS
+    // (Vs0 40, Vs1 48, Vfe 85, Vno 129, Vne 163) and a pitot-static instrument
+    // measures dynamic pressure, so it under-reads by sqrt(rho/rho0) with
+    // altitude. Feeding it TAS would put the needle 7 kt high over the Cascades
+    // and about 20 kt high at Rainier's summit — the arcs would be lying
+    // exactly where the terrain makes them matter. Falls back to TAS if the
+    // flight model has not published an indicated value.
+    const kt = num(pick(state.indicatedAirspeedKts, state.airspeedKts));
     const altFt = num(state.altitudeFt);
     const aglFt = num(state.altitudeAglFt);
     const vsFpm = num(state.verticalSpeedFpm);
@@ -997,7 +1019,11 @@ export function createInstruments(container) {
     const rpm = num(state.rpm);
 
     // Flaps / brakes: state first, caller-supplied inputs second, absent third.
-    const flapRaw = pick(state.flaps, inputs && inputs.flaps);
+    // `flapsPos` is the flight model's own rate-limited, blow-back-limited flap
+    // position, so it is preferred over the raw command — at 120 kt the lever
+    // says 30 degrees and the flaps are still up, and the gauge should agree
+    // with the aeroplane rather than with the switch.
+    const flapRaw = pick(pick(state.flapsPos, state.flaps), inputs && inputs.flaps);
     const brakeRaw = pick(state.brakes, inputs && inputs.brakes);
     const hasFlap = flapRaw !== null;
 
@@ -1047,7 +1073,7 @@ export function createInstruments(container) {
     } else {
       d.kt = damp(d.kt, kt, 4.5, dt);
       d.pitch = damp(d.pitch, pitch, 14, dt); // gyro: near immediate
-      d.roll = dampAngle(d.roll, roll, 14, dt);
+      d.roll = dampBank(d.roll, roll, 14, dt);
       d.altFt = damp(d.altFt, altFt, 5, dt);
       d.aglFt = damp(d.aglFt, aglFt, 5, dt);
       d.hdg = dampAngle(d.hdg, hdg, 7, dt);
@@ -1111,8 +1137,15 @@ export function createInstruments(container) {
     setText(el.hobbs, (hobbsSec / 3600).toFixed(1).padStart(6, '0'));
 
     // --- annunciators ------------------------------------------------------
+    // Two states, one lamp, exactly as a real stall-warning system behaves:
+    // the horn starts a few knots BEFORE the break (state.stallWarning — the
+    // buffet) and goes continuous once the wing actually lets go. Lit steady =
+    // you are approaching the critical angle of attack; flashing = you are past
+    // it. Without the warning stage the first indication is the break itself,
+    // which gives the pilot nothing to act on.
     const stalled = !!state.stalled;
-    setClassOn(el.lampStall, 'on', stalled);
+    const warning = stalled || !!state.stallWarning;
+    setClassOn(el.lampStall, 'on', warning);
     setClassOn(el.lampStall, 'blink', stalled);
     setClassOn(el.lampGnd, 'on', !!state.onGround);
     setClassOn(el.lampBrk, 'on', brakeRaw !== null && brakeRaw > 0.02);
@@ -1180,7 +1213,8 @@ export function createInstruments(container) {
     } else {
       setText(el.pos, '--.----°  ---.----°');
     }
-    setText(el.msl, `MSL ${group(altFt)} FT`);
+    // Damped, so the digits and the three hands are reading the same altitude.
+    setText(el.msl, `MSL ${group(d.altFt)} FT`);
   }
 
   /** Nearest field: ident, distance, bearing. Degrades to `----`. */

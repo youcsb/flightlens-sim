@@ -65,6 +65,14 @@ const AILERON_DOWN = 15 * DEG_TO_RAD;
 const RUDDER_MAX = 21 * DEG_TO_RAD;
 const FLAP_MAX = 30 * DEG_TO_RAD;
 
+/**
+ * Rates at which the surfaces chase the stick, per second of full travel.
+ * These are flightModel.js's SURFACE_RATE and FLAP_TRAVEL_RATE — the numbers
+ * have to match or the aeroplane you see is not the one you are flying.
+ */
+const SURFACE_RATE = 4.0;
+const FLAP_RATE = 0.2;
+
 /** Propeller blur thresholds, rpm. Below START the blades are solid. */
 const BLUR_START = 380;
 const BLUR_FULL = 950;
@@ -892,12 +900,92 @@ function makePropDiscTexture() {
 }
 
 /**
- * A tiny prefiltered environment so the paint and glass have something to
- * reflect. Without it, PBR metal lit only by a directional light and a
- * hemisphere reads as matte plastic: there is no reflection term at all.
+ * A procedural sky/ground environment as a small equirectangular DataTexture.
  *
- * Requires the renderer, which is why createAircraft takes an optional second
- * argument. Absent it, everything still renders — just flatter.
+ * WHY THIS EXISTS AND NOT JUST makeEnvironment(). Reflections are not a garnish
+ * on this aircraft, they are most of what sells it in the 20-50 m chase shot:
+ * a MeshPhysicalMaterial lit by nothing but a directional light and a
+ * hemisphere has no reflection term at all, so the paint reads as matte vinyl
+ * and the windows read as grey card. The clearcoat, the 0.85 metalness on the
+ * bare-metal parts and the 1.6 envMapIntensity on the glass are all doing
+ * nothing without an envMap.
+ *
+ * PMREMGenerator needs a WebGLRenderer, and `main.js` calls
+ * `createAircraft(scene)` with one argument — so on the real boot path the
+ * renderer-based version never runs. Rather than make the aeroplane's
+ * appearance depend on a call signature nobody is going to change, build the
+ * environment as raw pixels instead. Assigning a texture whose `mapping` is
+ * EquirectangularReflectionMapping makes three's own WebGLCubeUVMaps prefilter
+ * it through PMREM on first render, using the renderer it already has. Same
+ * result, no argument required.
+ *
+ * 128x64 is deliberately tiny: PMREM blurs it to a handful of mips and
+ * roughness 0.34 paint cannot resolve more than a gradient and a sun lobe.
+ *
+ * HALF float, not full. The sun lobe peaks around 2.6, so this has to be an HDR
+ * format or the highlight clips flat — but linear filtering of a 32-bit float
+ * texture is an extension in WebGL2 (OES_texture_float_linear) and is not
+ * guaranteed, while half-float linear filtering is core. A texture three cannot
+ * filter is a texture three cannot PMREM.
+ *
+ * Layout: v = 0 is the zenith, v = 1 the nadir, so y = cos(v * pi).
+ */
+function makeSkyEnvTexture() {
+  const W = 128;
+  const H = 64;
+  const data = new Uint16Array(W * H * 4);
+  const half = THREE.DataUtils.toHalfFloat;
+  // Same palette as the shader path below, so the two look like one aeroplane.
+  const GROUND = [0.16, 0.19, 0.15];
+  const HORIZON = [0.62, 0.68, 0.76];
+  const ZENITH = [0.2, 0.36, 0.7];
+  // Sun direction, matching the shader's (0.35, 0.55, -0.75) normalised.
+  const sl = Math.hypot(0.35, 0.55, -0.75);
+  const sun = [0.35 / sl, 0.55 / sl, -0.75 / sl];
+
+  const smoothstep = (a, b, x) => {
+    const t = clamp((x - a) / (b - a), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+
+  for (let j = 0; j < H; j++) {
+    const phi = ((j + 0.5) / H) * Math.PI;
+    const y = Math.cos(phi);
+    const sp = Math.sin(phi);
+    const h = clamp(y * 0.5 + 0.5, 0, 1);
+    for (let i = 0; i < W; i++) {
+      const theta = ((i + 0.5) / W) * TAU;
+      const dx = sp * Math.cos(theta);
+      const dz = sp * Math.sin(theta);
+      const k = (j * W + i) * 4;
+      const t = h < 0.5 ? smoothstep(0.3, 0.5, h) : smoothstep(0.5, 0.95, h);
+      const a = h < 0.5 ? GROUND : HORIZON;
+      const b = h < 0.5 ? HORIZON : ZENITH;
+      // A broad specular lobe so highlights have somewhere to come from.
+      const d = Math.max(0, dx * sun[0] + y * sun[1] + dz * sun[2]);
+      const s = Math.pow(d, 26) * 2.2;
+      data[k] = half(a[0] + (b[0] - a[0]) * t + 1.2 * s);
+      data[k + 1] = half(a[1] + (b[1] - a[1]) * t + 1.0 * s);
+      data[k + 2] = half(a[2] + (b[2] - a[2]) * t + 0.8 * s);
+      data[k + 3] = half(1);
+    }
+  }
+
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat, THREE.HalfFloatType);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.LinearSRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * A tiny prefiltered environment so the paint and glass have something to
+ * reflect. Higher quality than makeSkyEnvTexture (it is already prefiltered and
+ * skips a frame-one conversion), but it needs the renderer, which is why
+ * createAircraft takes an optional second argument.
  */
 function makeEnvironment(renderer) {
   const scene = new THREE.Scene();
@@ -1212,10 +1300,24 @@ export function createAircraft(scene, opts = {}) {
   };
 
   // ---- environment -------------------------------------------------------
+  // There is ALWAYS an envMap. If the caller handed us a renderer we prefilter
+  // a proper one; otherwise we hand three a raw equirect texture and let it
+  // prefilter that itself on the first render. The aircraft must never end up
+  // with envMap = null — see makeSkyEnvTexture for why that costs more than it
+  // sounds like.
   let envMap = null;
   if (opts.renderer) {
     try {
       envMap = makeEnvironment(opts.renderer);
+      disposables.push(envMap);
+    } catch (err) {
+      console.warn('[aircraft] prefiltered environment unavailable:', err && err.message);
+      envMap = null;
+    }
+  }
+  if (!envMap) {
+    try {
+      envMap = makeSkyEnvTexture();
       disposables.push(envMap);
     } catch (err) {
       console.warn('[aircraft] environment map unavailable:', err && err.message);
@@ -1831,11 +1933,20 @@ export function createAircraft(scene, opts = {}) {
   bladeGroup.position.z = -0.11;
   propPivot.add(bladeGroup);
   {
+    // Blade angle beta is measured from the PLANE OF ROTATION — 26 deg at the
+    // root washing out to 4 deg at the tip, which is a fixed-pitch cruise prop.
+    //
+    // buildLiftingSurface's `twist` is measured the other way. Its chord lies
+    // along +Z at twist = 0, and +Z here is the prop AXIS, so twist = 0 is a
+    // fully feathered blade and the blade angle is (90 - twist). Feeding beta
+    // straight in gives a 64 deg blade: edge-on, a paddle, visibly wrong the
+    // whole time the engine is at idle and the blades are still solid.
+    const beta = (s) => (26 - 22 * clamp((s - 0.18) / 0.77, 0, 1)) * DEG_TO_RAD;
     const bladePlanform = (s) => ({
       chord: 0.20 - 0.07 * Math.pow(clamp((s - 0.18) / 0.77, 0, 1), 1.8),
       zLE: 0,
       y: 0,
-      twist: (26 - 22 * clamp((s - 0.18) / 0.77, 0, 1)) * DEG_TO_RAD,
+      twist: Math.PI / 2 - beta(s),
       thick: 1 - 0.45 * clamp((s - 0.18) / 0.77, 0, 1),
     });
     const bg = buildLiftingSurface({
@@ -1856,10 +1967,14 @@ export function createAircraft(scene, opts = {}) {
       b.castShadow = true;
       b.rotation.z = i * Math.PI;
       bladeGroup.add(b);
-      // Yellow tip band.
-      const tip = new THREE.Mesh(track(new THREE.BoxGeometry(0.10, 0.03, 0.14)), bladeTipMat);
-      tip.position.set(Math.cos(i * Math.PI) * 0.88, Math.sin(i * Math.PI) * 0.88, 0);
-      bladeGroup.add(tip);
+      // Yellow tip band, PARENTED TO ITS BLADE. As a sibling of the blade it
+      // would need the 180 deg blade rotation folded into its own transform by
+      // hand, and it would not follow the blade's twist at all — which shows as
+      // a band lying across the chord instead of along it.
+      const tip = new THREE.Mesh(track(new THREE.BoxGeometry(0.10, 0.125, 0.022)), bladeTipMat);
+      tip.position.set(0.88, 0, 0);
+      tip.rotation.x = -beta(0.88); // align the band's long axis with the chord
+      b.add(tip);
     }
   }
 
@@ -1993,9 +2108,40 @@ export function createAircraft(scene, opts = {}) {
   // Animation
   // =========================================================================
 
+  // Actual surface positions, which LAG the stick. See setControlSurfaces.
+  let sPitch = 0;
+  let sRoll = 0;
+  let sYaw = 0;
+  let sFlap = 0;
+  let lastCallMs = -1;
+
+  /** Move `cur` toward `target` by at most `maxDelta`. */
+  function toward(cur, target, maxDelta) {
+    const d = target - cur;
+    return d > maxDelta ? cur + maxDelta : d < -maxDelta ? cur - maxDelta : target;
+  }
+
   /**
    * Deflect the control surfaces. Cosmetic only; this has no effect on physics.
    * Inputs are normalised stick deflections, NOT angles.
+   *
+   * THE SURFACES LAG THE STICK, at the same rates flightModel.js uses for the
+   * aerodynamic surfaces (4.0 /s) and the flap system (0.2 /s, five seconds
+   * lever to detent). Two reasons, and neither is polish:
+   *
+   *  - The flaps. `main.js` passes the raw input object, whose `flaps` field is
+   *    the LEVER, not the flap. The flight model rate-limits it and blows it
+   *    back above Vfe. Driving the mesh from the lever means the flaps snap to
+   *    30 degrees in one frame and stay there at 120 kt while the physics has
+   *    them up — the aeroplane visibly disagreeing with itself.
+   *  - A keyboard axis is a step function. Snapping the elevator through 24
+   *    degrees in 16 ms reads as a glitch rather than a control input, and it
+   *    is the single most obvious tell in a chase-camera comparison.
+   *
+   * dt is derived internally rather than taken as an argument, because the
+   * documented signature is `setControlSurfaces({pitch, roll, yaw})` and this
+   * module does not get to change it. It is clamped to 100 ms so a backgrounded
+   * tab returns to a sane pose instead of teleporting the surfaces.
    *
    * @param {{pitch?: number, roll?: number, yaw?: number, flaps?: number}} c
    *        pitch -1..+1 (+1 = stick back / nose up / elevator trailing edge up)
@@ -2005,10 +2151,20 @@ export function createAircraft(scene, opts = {}) {
    *                      object, so flaps animate with no integration work)
    */
   function setControlSurfaces(c) {
-    const pitch = clamp((c && c.pitch) || 0, -1, 1);
-    const roll = clamp((c && c.roll) || 0, -1, 1);
-    const yaw = clamp((c && c.yaw) || 0, -1, 1);
-    const flaps = clamp((c && c.flaps) || 0, 0, 1);
+    const now =
+      typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    const dt = lastCallMs < 0 ? 0 : Math.min((now - lastCallMs) / 1000, 0.1);
+    lastCallMs = now;
+
+    sPitch = toward(sPitch, clamp((c && c.pitch) || 0, -1, 1), SURFACE_RATE * dt);
+    sRoll = toward(sRoll, clamp((c && c.roll) || 0, -1, 1), SURFACE_RATE * dt);
+    sYaw = toward(sYaw, clamp((c && c.yaw) || 0, -1, 1), SURFACE_RATE * dt);
+    sFlap = toward(sFlap, clamp((c && c.flaps) || 0, 0, 1), FLAP_RATE * dt);
+
+    const pitch = sPitch;
+    const roll = sRoll;
+    const yaw = sYaw;
+    const flaps = sFlap;
 
     // Every hinge axis points +X-ish (or +Y for the rudder), so a positive
     // angle always means "trailing edge down" and the two sides only differ in
@@ -2057,8 +2213,11 @@ export function createAircraft(scene, opts = {}) {
     const r = rpm > 0 ? rpm : 0;
     const d = dt > 0.25 ? 0.25 : dt;
 
-    propPivot.rotation.z -= (r / 60) * TAU * d;
-    if (propPivot.rotation.z < -TAU) propPivot.rotation.z += TAU;
+    // Modulo, not a single conditional add: at 2700 rpm a 0.25 s frame is 11
+    // revolutions, and one += TAU leaves the angle 64 radians from where it
+    // should be. Wrapping properly also keeps the float small enough that the
+    // blade positions stay smooth after an hour of flying.
+    propPivot.rotation.z = ((propPivot.rotation.z - (r / 60) * TAU * d) % TAU + TAU) % TAU;
 
     const t = clamp((r - BLUR_START) / (BLUR_FULL - BLUR_START), 0, 1);
     // Blades never vanish entirely: a faint ghost is what a real prop looks

@@ -228,10 +228,10 @@ const VFE_MS = 43.7; // 85 kt: flaps blow back above this
  * the naive P/V: P/V is singular at rest, and a sqrt blend sags so hard through
  * 40 m/s that the climb rate came out at 407 fpm against a book 730 — measured.
  * The cube holds thrust near-flat through the takeoff roll (which is what a
- * real fixed-pitch prop does) and still rolls it off by cruise. Vmax then had
- * to be pulled back to 120 kt with cd0, which is why cd0 is 0.037 rather than
- * the 0.029 a clean C172 shows: this airframe is drag-limited on top end and
- * thrust-rich down low, exactly like the real one.
+ * real fixed-pitch prop does) and still rolls it off by cruise. cd0 is then
+ * what sets the top end: 0.034 rather than the 0.029 a clean C172 shows, which
+ * lands Vmax at a measured 126.6 kt. This airframe is drag-limited on top end
+ * and thrust-rich down low, exactly like the real one.
  */
 const THRUST_KNEE_MS = 37.5; // legacy reference; the real knee is derived below
 const WINDMILL_RPM_PER_MS = 22; // a stopped throttle still turns the prop
@@ -371,6 +371,26 @@ export function createFlightModel(opts = {}) {
   const THRUST_KNEE3 = THRUST_KNEE * THRUST_KNEE * THRUST_KNEE;
 
   const GEAR_H = cfg.gearHeightM;
+  /**
+   * Vertical offset from `position` to the number the altimeter shows.
+   *
+   * `position` is the CG / thrust-line datum, and the wheels hang `gearHeightM`
+   * below it. Reporting the datum's height means a parked aeroplane reads
+   * 3.9 ft AGL and 25 ft MSL on a 21 ft field, which fails MODULES.md §5 check
+   * 2 ("AGL ~ 0, ALT ~ 21 ft") and, worse, makes the radio-altimeter readout —
+   * the one number that tells the pilot about the terrain — permanently
+   * offset. Both display altitudes are therefore taken at the WHEELS.
+   *
+   * This is display-only. Every force in this file still acts on the datum.
+   */
+  const ALT_DATUM_M = GEAR_H;
+  /**
+   * Height of the wing above the datum, metres. Ground effect is a function of
+   * how far the WING is from the surface, not how far the CG is: measuring at
+   * the datum puts the wing a metre lower than it is and overstates the
+   * induced-drag reduction on the roll-out by roughly a factor of three.
+   */
+  const WING_HEIGHT_M = 0.96;
   const MAX_N = MAX_N_PER_W * WEIGHT;
   const maxDamp = MAX_DAMP_PER_W * WEIGHT;
   /** Static spring deflection, so reset() can park the aircraft already
@@ -403,9 +423,12 @@ export function createFlightModel(opts = {}) {
     /** True airspeed in KNOTS — the display mirror of airspeedMs. For an
      *  honest ASI needle use `indicatedAirspeedKts` instead. */
     airspeedKts: 0,
-    /** Altitude above mean sea level (world y = 0), FEET. */
+    /** Altitude above mean sea level (world y = 0), FEET, measured at the
+     *  WHEELS — see the note on ALT_DATUM_M. Parked at KBFI this reads the
+     *  published field elevation, 21 ft. */
     altitudeFt: 0,
-    /** Altitude above the terrain directly below, FEET. */
+    /** Altitude above the terrain directly below, FEET, measured at the
+     *  wheels. Zero (bar the static squat) when sitting on the ground. */
     altitudeAglFt: 0,
     /** Magnetic-north-agnostic true heading, DEGREES, 0..360, 0 = north. */
     headingDeg: 0,
@@ -449,6 +472,13 @@ export function createFlightModel(opts = {}) {
     separation: 0,
     /** Commanded flap position, 0..1, after travel-rate and blow-back limits. */
     flapsPos: 0,
+    /** Alias of `flapsPos`. ui/instruments.js reads `state.flaps`, and main.js
+     *  calls `instruments.update(state)` with no second argument, so without
+     *  this mirror the flap indicator has no source and blanks to `--`. */
+    flaps: 0,
+    /** Commanded wheel braking, 0..1. Mirrored for the same reason as `flaps`:
+     *  the HUD cannot see the input object. */
+    brakes: 0,
     /** Propeller thrust, NEWTONS. */
     thrustN: 0,
     /** Total gear spring compression, METRES (sum over legs). */
@@ -671,7 +701,7 @@ export function createFlightModel(opts = {}) {
 
     // --- drag --------------------------------------------------------------
     // Ground effect: induced drag collapses inside a wingspan of the surface.
-    const hAgl = Math.max(0, state.position.y - gh);
+    const hAgl = Math.max(0, state.position.y + WING_HEIGHT_M - gh);
     const hb = (GROUND_EFFECT_K * hAgl) / SPAN;
     const groundEffect = (hb * hb) / (1 + hb * hb);
 
@@ -923,6 +953,8 @@ export function createFlightModel(opts = {}) {
     state.airspeedMs = V;
     state.separation = sep;
     state.flapsPos = flapPos;
+    state.flaps = flapPos;
+    state.brakes = brake;
   }
 
   /** Move `cur` toward `target` by at most `maxDelta`. */
@@ -943,8 +975,10 @@ export function createFlightModel(opts = {}) {
       Math.sqrt(
         state.velocity.x * state.velocity.x + state.velocity.z * state.velocity.z,
       ) * MS_TO_KTS;
-    state.altitudeFt = state.position.y * M_TO_FT;
-    state.altitudeAglFt = (state.position.y - groundHeight) * M_TO_FT;
+    // Both altitudes are referenced to the wheels — see ALT_DATUM_M.
+    const wheelY = state.position.y - ALT_DATUM_M;
+    state.altitudeFt = wheelY * M_TO_FT;
+    state.altitudeAglFt = (wheelY - groundHeight) * M_TO_FT;
     state.verticalSpeedMs = state.velocity.y;
     state.verticalSpeedFpm = state.velocity.y * MS_TO_FPM;
     state.alphaDeg = state.alphaRad * RAD_TO_DEG;
@@ -1017,6 +1051,8 @@ export function createFlightModel(opts = {}) {
     flapPos = 0;
     engineSpool = 0;
     state.flapsPos = 0;
+    state.flaps = 0;
+    state.brakes = 0;
     accumulator = 0;
     lastGround = ground;
     refreshDisplay(ground);
@@ -1081,23 +1117,44 @@ export function createFlightModel(opts = {}) {
 }
 
 /* ---------------------------------------------------------------------------
- * ENVELOPE — the arithmetic these numbers were tuned against, at gross weight
+ * ENVELOPE
+ *
+ * DERIVED — the arithmetic the constants were chosen against, at gross weight
  * (1100 kg / 10,787 N), sea level, ISA. Re-derive before changing a constant.
  *
  *   CL_ALPHA      4.96 /rad     Helmbold, AR 7.47
  *   CL_MAX        1.74          from stallSpeedMs = 25 m/s
- *   alpha_crit    ~17.4 deg clean, ~1.1 deg lower at full flap
+ *   alpha_crit    ~18.7 deg clean (geometric), ~1.1 deg lower at full flap
  *   Vs1 (clean)   25.0 m/s = 48.6 kt
  *   Vs0 (flap)    21.5 m/s = 41.7 kt
- *   Vfe            43.7 m/s = 85 kt (flaps blow back above this)
- *   Vy climb      38.6 m/s = 75 kt -> ~730 fpm
- *   Vmax level    ~62 m/s  = ~120 kt at sea level, full throttle
+ *   Vfe           43.7 m/s = 85 kt (flaps blow back above this)
  *   Vne           85 m/s   = 165 kt (advisory; nothing enforces it)
- *   L/D max       ~11 : 1
  *   trim speed    ~47 m/s  = ~91 kt hands off, from CM0 = 0.05
- *   ground roll   ~270 m; rotation needs ~55 kt, flies at ~57 kt
- *   power lapse   59% of rated at Mount Rainier's summit (4,392 m, sigma 0.64).
- *                 The service ceiling lands just under the summit, which is
- *                 where a real 172's does. You can go and look at the mountain;
- *                 you cannot fly over the top of it. That is the point.
+ *
+ * MEASURED — none of the above proves the aeroplane flies. These come from
+ * `node scripts/flight-envelope.mjs`, which takes off, climbs, cruises, stalls
+ * and lands the model and prints what happened. Re-run it after any change
+ * here; do not update these numbers by hand.
+ *
+ *   ground roll        228 m (748 ft), rotates at 55 kt, flies at 57.5 kt
+ *   Vy                 80 kt -> 743 fpm  (curve is flat: 75 kt gives 738)
+ *   climb at 100 kt    605 fpm           (at 60 kt, 623 fpm)
+ *   cruise 75% power   109.6 kt level at 2,000 ft
+ *   Vmax level         126.6 kt, full throttle
+ *   stall, clean       47.4 KIAS at 18.7 deg alpha, power off, wings level
+ *   stall, full flap   41.5 KIAS
+ *   accelerated stall  89.0 KIAS at 3.06 g in a 55 deg bank — the break
+ *                      follows ANGLE OF ATTACK, not speed
+ *   height lost        ~157 ft, break to recovered, unloading promptly
+ *   glide ratio        9.0 : 1 power off
+ *   hands-off trim     101.9 kt at 65% power, phugoid stays inside 88-112 kt
+ *   touchdown loads    1.97 g at 200 fpm, 2.95 g at 400, 4.77 g at 700
+ *   frame independence 1.0 m of divergence over 30 s between 20 Hz and 200 Hz
+ *
+ *   power lapse        59% of rated at Mount Rainier's summit (4,392 m,
+ *                      sigma 0.641), and measured climb falls 764 fpm at 300 m
+ *                      to 297 fpm at 3,600 m. The service ceiling lands just
+ *                      under the summit, which is where a real 172's does. You
+ *                      can go and look at the mountain; you cannot fly over the
+ *                      top of it. That is the point.
  * ------------------------------------------------------------------------- */
