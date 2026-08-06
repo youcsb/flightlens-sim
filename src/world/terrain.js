@@ -37,11 +37,11 @@
  *
  *      cell / distance  <=  (S / GRID) / (LOD_K * S)  =  1 / (GRID * LOD_K)
  *
- * — INDEPENDENT OF S. That is the whole point: one constant, 1/256 rad here
- * (~4 px at 1080p / 60 deg FOV), governs the silhouette error everywhere, from
+ * — INDEPENDENT OF S. That is the whole point: one constant, 1/160 rad here
+ * (~6 px at 1080p / 60 deg FOV), governs the silhouette error everywhere, from
  * the runway threshold to Mount Rainier at 84 km. A naive "coarser when far"
- * scheme would render Rainier as a lump; this one gives it 256 m cells at
- * 84 km, roughly forty samples across the cone.
+ * scheme would render Rainier as a lump; this one puts 512 m cells on it at
+ * 84 km, about forty samples across the cone.
  *
  * POPPING is removed by geomorphing, not hidden by fog. Every vertex carries
  * the height it would have on its PARENT's lattice (aMorph.x). The vertex
@@ -114,6 +114,11 @@ import { clamp } from '../core/units.js';
  * @property {boolean} [water]       Build the sea + lake surfaces. Default true.
  * @property {number} [lodQuality]   Multiplies LOD_K. >1 = more triangles, sharper
  *           silhouettes, more draw calls. Default 1.
+ * @property {number} [originX] @property {number} [originY] @property {number} [originZ]
+ *           Where to build the first full set of chunks, in local scene metres.
+ *           Default (0, 400, 0) — the scene origin is the KBFI spawn by
+ *           construction (MODULES.md 1.3), so the default is already right; the
+ *           override exists for callers that move the spawn.
  */
 
 const DEFAULTS = {
@@ -127,6 +132,9 @@ const DEFAULTS = {
   seaLevelM: SEA_LEVEL_M,
   water: true,
   lodQuality: 1,
+  originX: 0,
+  originY: 400,
+  originZ: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,9 +147,8 @@ const DEFAULTS = {
  * Screen error is 1/(GRID * LOD_K) whichever way you split it, but the node
  * COUNT is not neutral: for a fixed error, halving GRID forces LOD_K to double,
  * and the number of nodes in a level's annulus goes as LOD_K^2. A 32-cell grid
- * at the same fidelity needs ~1,200 nodes and 1,200 draw calls — WebGL dies on
- * the call overhead long before the GPU notices the triangles. 64 cells at
- * LOD_K = 4 gives ~280 nodes, ~130 after frustum culling.
+ * at the same fidelity needs four times the draw calls — WebGL dies on the call
+ * overhead long before the GPU notices the triangles.
  */
 const GRID = 64;
 const VERTS_PER_SIDE = GRID + 1;
@@ -149,8 +156,36 @@ const GRID_VERTS = VERTS_PER_SIDE * VERTS_PER_SIDE; // 4225
 const SKIRT_VERTS = GRID * 4; // 256
 const NODE_VERTS = GRID_VERTS + SKIRT_VERTS; // 4481, comfortably under 65536
 
-/** A node subdivides while the camera is within LOD_K * nodeSize of it. */
-const LOD_K = 4.0;
+/**
+ * A node subdivides while the camera is within LOD_K * nodeSize of it.
+ *
+ * THIS NUMBER IS A BUDGET, NOT A TASTE SETTING. Nodes of a given level that end
+ * up drawn are exactly those whose box-distance falls in [K*S, 2*K*S), an
+ * annulus whose area goes as K^2*S^2 — so the count per level goes as K^2,
+ * INDEPENDENT of S, and is paid once for every level between the finest node
+ * and the draw radius. Here that is seven levels (512 m up to 32 km), and the
+ * cost is quadratic in K:
+ *
+ *   K = 4.0   ~2,500 nodes drawn   ~400 MB of vertex buffers
+ *   K = 2.5      608 nodes drawn    142 MB   <- measured, 881 alive
+ *
+ * K = 4 was the value this file shipped with, and it does not fit in any
+ * plausible cache. The failure is not a slow frame, it is a LIMIT CYCLE:
+ * evictStale() destroys chunks the next frame needs, visit() then refuses to
+ * subdivide (a node only subdivides once all four children own geometry), so
+ * the parent draws itself coarse, its children get rebuilt, and round it goes.
+ * Measured with a STATIONARY camera at the KBFI spawn it drew 243 nodes on
+ * frame 120 and 174 on frame 400, never the same set twice — continuous
+ * popping, 5 ms/frame of rebuilds forever, and Mount Rainier stuck on 2,048 m
+ * cells instead of 256. At K = 2.5 the same test draws an IDENTICAL 608 nodes
+ * on frames 30, 120 and 400, and update() falls to 0 ms.
+ *
+ * The price is screen error: 1/(GRID*K) goes from 1/256 rad to 1/160 (~6 px at
+ * 1080p / 60 deg FOV rather than ~4). That is the right trade for a terrain
+ * that actually converges. If you raise K, raise MAX_CACHED_NODES by K^2 in the
+ * same edit and re-run the stationary-camera test.
+ */
+const LOD_K = 2.5;
 
 /**
  * Root extent, metres. The region is 166 km E-W by 211 km N-S, so 262144 (2^18)
@@ -164,11 +199,24 @@ const MIN_NODE_SIZE = 512;
 const MAX_LEVEL = Math.round(Math.log2(ROOT_SIZE / MIN_NODE_SIZE)); // 9
 
 /**
- * Built geometries kept alive. ~160 KB each, so 384 is ~60 MB of GPU memory.
- * The working set in steady flight is ~280; the slack absorbs turns without
- * rebuilding what we just flew past.
+ * Built geometries kept alive. ~161 KB each, so 1,100 is ~177 MB of vertex
+ * buffers in the worst case.
+ *
+ * THIS MUST EXCEED THE WORKING SET or the LOD never converges — see LOD_K. The
+ * working set is not a guess: measured at the KBFI spawn with an unbounded
+ * cache, the selection settles on 608 drawn / 881 alive and then does not
+ * change at all between frame 30 and frame 400. 1,100 is that plus 25% of
+ * slack, which is what lets a 180-degree turn reuse the ground behind you
+ * instead of rebuilding it.
  */
-const MAX_CACHED_NODES = 384;
+const MAX_CACHED_NODES = 1100;
+
+/**
+ * Evict only once the cache is this far over. Without hysteresis, a working set
+ * that sits just above the cap makes evictStale() sort the whole array every
+ * single frame for the sake of one or two nodes.
+ */
+const EVICT_SLACK = 96;
 
 /** Per-frame build budget for PREFETCHING children, milliseconds. */
 const BUILD_BUDGET_MS = 4;
@@ -218,6 +266,28 @@ const SHORE_MAX_M = 4000;
  * plateau are flat too. The discriminator is that a lake is a LOCAL MINIMUM —
  * its perimeter rises away from it. Both tests together have no false positives
  * in this region; flatness alone has several.
+ *
+ * ---------------------------------------------------------------------------
+ * THE RIM HAS TO BE MEASURED AT A DISTANCE. This is the part that was wrong.
+ * ---------------------------------------------------------------------------
+ * The obvious basin test — compare the surface against the ring of cells
+ * immediately outside the flat component — CANNOT EVER PASS, and it silently
+ * rejected every lake in the region. The flatness test itself disqualifies a
+ * cell whose neighbour steps by 0.35 m, so the component is eroded one cell
+ * short of the shoreline and the ring immediately outside it is *still water*.
+ * Measured on Lake Washington: 74.2 km^2 of surface at 5.10 m, 1,456 rim cells
+ * averaging 5.15 m — 0.05 m of "rise" against a 1.00 m threshold. Console said
+ * "no freshwater lakes detected" and every lake in the sim was dry ground.
+ *
+ * So the rim is taken from a BFS dilation LAKE_RIM_DILATE cells out, which
+ * clears the eroded band and lands on real shore. Lake Washington then reads a
+ * rim mean of 16.2 m against a 5.10 m surface.
+ *
+ * The dilated rim needs one extra guard the tight ring did not: a tideflat or a
+ * river delta is flat, near sea level, and has land rising on three sides, so it
+ * passes a rise test. It is distinguished by having somewhere LOWER to drain to
+ * within the same 384 m — the open water it sits on. LAKE_RIM_BELOW_FRAC is
+ * that test, and it is what keeps the Nisqually and Duwamish deltas out.
  */
 const LAKE_BOX = Object.freeze({
   south: 47.05,
@@ -232,8 +302,20 @@ const LAKE_MIN_M = 1.2;
 const LAKE_MAX_M = 700;
 const LAKE_MIN_AREA_M2 = 0.25e6; // 0.25 km^2 — Green Lake is 1.0
 const LAKE_MAX_AREA_M2 = 500e6; // Lake Washington is 88; anything bigger is a bug
-/** The perimeter must average this much above the surface for it to be a basin. */
-const LAKE_RIM_RISE_M = 1.0;
+/** Cells to dilate outward before sampling the rim. 4 * 96 m = 384 m. */
+const LAKE_RIM_DILATE = 4;
+/** The dilated rim must average this much above the surface, metres. */
+const LAKE_RIM_RISE_M = 2.0;
+/** ...and this fraction of it must individually be above the surface. */
+const LAKE_RIM_ABOVE_FRAC = 0.6;
+/** A basin has nowhere lower to go: at most this fraction of the rim may be below. */
+const LAKE_RIM_BELOW_FRAC = 0.06;
+/**
+ * Grow the kept mask back over the one-cell band the flatness test ate, but
+ * only onto cells that are themselves at the lake's surface height. Without it
+ * every lake is drawn 96 m short of its own shoreline.
+ */
+const LAKE_EDGE_TOLERANCE_M = 0.75;
 
 // ---------------------------------------------------------------------------
 // Shared GLSL
@@ -277,6 +359,8 @@ vec3 tSrgb(vec3 c) { return c * c * (c * 0.305306011 + 0.682171111) + c * 0.0125
 
 const _camPos = new THREE.Vector3();
 const _probe = new Float32Array(81);
+/** Hoisted so evictStale()'s sort does not allocate a comparator per frame. */
+const byLastUsed = (a, b) => a.lastUsed - b.lastUsed;
 
 /**
  * Build the terrain and add it to `scene`.
@@ -318,6 +402,17 @@ export async function createTerrain(scene, opts = {}) {
   const field = buildRegionField(regionRect, cfg.seaLevelM);
   const tField = performance.now();
 
+  // Where the DEM actually has something to say. Outside it every layer misses
+  // and getElevation() returns SEA_LEVEL_M exactly — not approximately — so a
+  // node out there is a flat quad at y = 0 that the sea plane already covers.
+  // Drawing it anyway costs a chunk AND looks wrong: the water shader reads a
+  // zero-depth bed under it and paints the open ocean as sandy shallows.
+  //
+  // The margin is one z=11 tile (~13.3 km at this latitude), because the baker
+  // rounds the bbox out to tile boundaries and the real coverage runs that far
+  // past the nominal edge.
+  const demRect = computeDemRect(cfg.bbox, 16000);
+
   // -------------------------------------------------------------------------
   // 3. Lakes (needs the field so lake texels count as water for shore distance)
   // -------------------------------------------------------------------------
@@ -337,6 +432,8 @@ export async function createTerrain(scene, opts = {}) {
   const lakeMat = cfg.water
     ? makeWaterMaterial(fieldTexture, regionRect, cfg.seaLevelM, true)
     : null;
+  /** Hoisted: update() runs every frame and 1.8 forbids allocating in it. */
+  const waterMats = [seaMat, lakeMat].filter(Boolean);
 
   // -------------------------------------------------------------------------
   // 5. Quadtree
@@ -399,8 +496,27 @@ export async function createTerrain(scene, opts = {}) {
   // means paying for the whole working set here rather than streaming it in
   // over the first second, which would show the aircraft sitting on a coarse
   // approximation of the runway.
+  //
+  // ONE PASS IS NOT ENOUGH, and this is the trap the file shipped with. visit()
+  // deliberately refuses to subdivide a node until all four children own
+  // geometry — it queues them and draws itself this frame instead. So a single
+  // selectFrom() descends exactly zero levels: it emits the ROOT, a 262 km quad
+  // with 4 km cells, and queues four children that nobody builds because
+  // drainPrefetch() runs in update(), not here. Measured: `1 node drawn` on
+  // frame 0, ~120 frames to converge, and for those two seconds the aircraft
+  // sits on a plane that is hundreds of metres from the surveyed runway
+  // elevation. getHeightAt() is right the whole time, which is worse — the
+  // wheels are correct and the *picture* is wrong.
+  //
+  // Each pass descends one level, so MAX_LEVEL + 2 is a hard bound on the loop
+  // and the break is what normally ends it.
   buildDeadline = Infinity;
-  selectFrom(0, 400, 0);
+  let passes = 0;
+  for (; passes <= MAX_LEVEL + 1; passes++) {
+    selectFrom(cfg.originX, cfg.originY, cfg.originZ);
+    if (prefetch.length === 0) break;
+    drainPrefetch();
+  }
   buildDeadline = 0;
   const tNodes = performance.now();
 
@@ -411,11 +527,17 @@ export async function createTerrain(scene, opts = {}) {
     );
   }
   console.info(
-    `[terrain] ${nodes.size} nodes (${built.length} built, ${emitted.length} drawn), ` +
-      `${lakes ? lakes.kept : 0} lakes | dem ${(tDem - t0) | 0}ms, ` +
-      `field ${(tField - tDem) | 0}ms, lakes ${(tLakes - tField) | 0}ms, ` +
-      `mesh ${(tNodes - tLakes) | 0}ms`,
+    `[terrain] ${nodes.size} nodes (${built.length} built, ${emitted.length} drawn ` +
+      `after ${passes} LOD passes), ${lakes ? lakes.kept : 0} lakes | ` +
+      `dem ${(tDem - t0) | 0}ms, field ${(tField - tDem) | 0}ms, ` +
+      `lakes ${(tLakes - tField) | 0}ms, mesh ${(tNodes - tLakes) | 0}ms`,
   );
+  if (built.length > MAX_CACHED_NODES) {
+    console.warn(
+      `[terrain] working set ${built.length} exceeds MAX_CACHED_NODES ` +
+        `${MAX_CACHED_NODES}; the LOD will thrash. Raise the cache or LOD_K.`,
+    );
+  }
 
   // =========================================================================
   // Public surface
@@ -457,10 +579,15 @@ export async function createTerrain(scene, opts = {}) {
       const time = performance.now() * 0.001;
       const wx = Math.floor(_camPos.x / 256) * 256;
       const wz = Math.floor(_camPos.z / 256) * 256;
-      const sky =
-        scene.background && scene.background.isColor ? scene.background : null;
-      for (const m of [seaMat, lakeMat]) {
-        if (!m) continue;
+      // What the water reflects at a grazing angle is the sky at the horizon,
+      // and sky.js publishes exactly that as the fog colour — it is the average
+      // of the Preetham dome over the horizon ring, rewritten every time the sun
+      // moves. scene.background is NOT it: sky.js deliberately leaves it null
+      // (its dome covers every pixel), so reading it left the sea reflecting a
+      // hardcoded noon blue at dusk and at night.
+      const sky = scene.fog?.color ?? null;
+      for (let i = 0; i < waterMats.length; i++) {
+        const m = waterMats[i];
         m.userData.uniforms.uTime.value = time;
         m.userData.uniforms.uWaveOrigin.value.set(wx, wz);
         if (sky) m.userData.uniforms.uSkyColor.value.copy(sky);
@@ -509,15 +636,26 @@ export async function createTerrain(scene, opts = {}) {
     const x0 = regionRect.xMid - ROOT_SIZE / 2 + ix * size;
     const z0 = regionRect.zMid - ROOT_SIZE / 2 + iz * size;
 
+    const hasData =
+      x0 + size > demRect.xMin &&
+      x0 < demRect.xMax &&
+      z0 + size > demRect.zMin &&
+      z0 < demRect.zMax;
+
     // A cheap 9x9 probe gives a height range good enough for LOD distance and
-    // frustum bounds before the node is ever built.
-    fillHeightGrid(x0, z0, size / 8, size / 8, 9, 9, _probe);
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (let i = 0; i < 81; i++) {
-      const v = _probe[i];
-      if (v < lo) lo = v;
-      if (v > hi) hi = v;
+    // frustum bounds before the node is ever built. Skipped where there is no
+    // DEM: the answer is provably a flat zero and the node is never drawn.
+    let lo = 0;
+    let hi = 0;
+    if (hasData) {
+      fillHeightGrid(x0, z0, size / 8, size / 8, 9, 9, _probe);
+      lo = Infinity;
+      hi = -Infinity;
+      for (let i = 0; i < 81; i++) {
+        const v = _probe[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
     }
 
     node = {
@@ -528,6 +666,7 @@ export async function createTerrain(scene, opts = {}) {
       size,
       x0,
       z0,
+      hasData,
       cell: size / GRID,
       // Padded: a 9x9 probe of a 262 km node misses a lot of mountain.
       yMin: (lo - size * 0.05) * exag,
@@ -587,16 +726,21 @@ export async function createTerrain(scene, opts = {}) {
   }
 
   function visit(node, px, py, pz) {
+    // Two culls, both cheap and both before anything is built.
+    if (!node.hasData) return; // flat sea; the sea plane covers it
     const d = nodeDistance(node, px, py, pz);
     if (d > drawRadius) return;
 
     if (node.level < MAX_LEVEL && d < lodK * node.size) {
       const kids = ensureChildren(node);
+      // A no-data child counts as ready — it is never drawn, so waiting for a
+      // geometry it will never own would freeze this whole branch at its
+      // coarsest level. That is a hole in the LOD along every coastline.
       if (
-        kids[0].geometry &&
-        kids[1].geometry &&
-        kids[2].geometry &&
-        kids[3].geometry
+        (kids[0].geometry || !kids[0].hasData) &&
+        (kids[1].geometry || !kids[1].hasData) &&
+        (kids[2].geometry || !kids[2].hasData) &&
+        (kids[3].geometry || !kids[3].hasData)
       ) {
         visit(kids[0], px, py, pz);
         visit(kids[1], px, py, pz);
@@ -605,7 +749,7 @@ export async function createTerrain(scene, opts = {}) {
         return;
       }
       for (let i = 0; i < 4; i++) {
-        if (!kids[i].geometry) prefetch.push(kids[i]);
+        if (!kids[i].geometry && kids[i].hasData) prefetch.push(kids[i]);
       }
     }
 
@@ -657,9 +801,9 @@ export async function createTerrain(scene, opts = {}) {
   }
 
   function evictStale() {
-    if (built.length <= MAX_CACHED_NODES) return;
+    if (built.length <= MAX_CACHED_NODES + EVICT_SLACK) return;
     // Oldest first. Anything drawn this frame is untouchable.
-    built.sort((a, b) => a.lastUsed - b.lastUsed);
+    built.sort(byLastUsed);
     let i = 0;
     while (built.length > MAX_CACHED_NODES && i < built.length) {
       const n = built[i];
@@ -777,8 +921,20 @@ function buildNodeGeometry(node, sharedIndex, exag) {
   const drop = skirtDepthFor(c);
   const inv2c = 1 / (2 * c);
 
+  // Bounds over the WHOLE sampled block, border ring included. Every value the
+  // geomorph can ever produce is either a sample from _hgrid or a mean of two
+  // or four of them, so this brackets the morphed surface EXACTLY — no guessed
+  // padding. The old `cell * 4` slack inflated a level-1 node's box by 8 km
+  // vertically, which is 8 km of terrain the frustum can no longer cull.
   let minY = Infinity;
   let maxY = -Infinity;
+  for (let i = 0; i < W * W; i++) {
+    const v = _hgrid[i];
+    if (v < minY) minY = v;
+    if (v > maxY) maxY = v;
+  }
+  minY *= exag;
+  maxY *= exag;
 
   for (let j = 0; j <= GRID; j++) {
     const gj = j + 1;
@@ -827,9 +983,6 @@ function buildNodeGeometry(node, sharedIndex, exag) {
       mrp[v * 3] = parent;
       mrp[v * 3 + 1] = c;
       mrp[v * 3 + 2] = 0;
-
-      if (h < minY) minY = h;
-      if (h > maxY) maxY = h;
     }
   }
 
@@ -855,18 +1008,16 @@ function buildNodeGeometry(node, sharedIndex, exag) {
   geo.setAttribute('aMorph', new THREE.BufferAttribute(mrp, 3));
   geo.setIndex(sharedIndex);
 
-  // Set bounds by hand: computeBoundingSphere() would walk 4,481 vertices we
-  // have already measured, and the morph can lift a vertex above its sampled
-  // height, so the box needs slack anyway.
+  // Set bounds by hand: computeBoundingSphere() would walk 4,481 vertices whose
+  // range we already know exactly from the sampled block above.
   const half = node.size * 0.5;
-  const pad = node.cell * 4;
   geo.boundingBox = new THREE.Box3(
-    new THREE.Vector3(node.x0, minY - drop - pad, node.z0),
-    new THREE.Vector3(node.x0 + node.size, maxY + pad, node.z0 + node.size),
+    new THREE.Vector3(node.x0, minY - drop, node.z0),
+    new THREE.Vector3(node.x0 + node.size, maxY, node.z0 + node.size),
   );
   geo.boundingSphere = new THREE.Sphere(
     new THREE.Vector3(node.x0 + half, (minY + maxY) * 0.5, node.z0 + half),
-    Math.sqrt(2 * half * half + Math.pow((maxY - minY) * 0.5 + drop + pad, 2)),
+    Math.sqrt(2 * half * half + Math.pow((maxY - minY) * 0.5 + drop, 2)),
   );
 
   return geo;
@@ -1297,6 +1448,22 @@ function computeRegionRect(bbox) {
   };
 }
 
+/**
+ * The DEM's coverage in local metres, grown by `marginM`. Nodes wholly outside
+ * it are provably flat sea — every layer misses and getElevation() returns
+ * SEA_LEVEL_M — so they are not built and not drawn.
+ */
+function computeDemRect(bbox, marginM) {
+  const nw = llToLocal(bbox.north, bbox.west);
+  const se = llToLocal(bbox.south, bbox.east);
+  return {
+    xMin: Math.min(nw.x, se.x) - marginM,
+    xMax: Math.max(nw.x, se.x) + marginM,
+    zMin: Math.min(nw.z, se.z) - marginM,
+    zMax: Math.max(nw.z, se.z) + marginM,
+  };
+}
+
 function buildRegionField(rect, seaLevelM) {
   const n = FIELD_N;
   const dx = (rect.xMax - rect.xMin) / (n - 1);
@@ -1438,6 +1605,12 @@ function detectLakes() {
   const seen = new Uint8Array(nx * nz);
   const stack = new Int32Array(nx * nz);
   const comp = new Int32Array(nx * nz);
+  // Dilation scratch. `stampArr` is stamped with the component id rather than
+  // cleared, so the rim BFS costs nothing per component beyond the cells it
+  // actually touches.
+  const stampArr = new Int32Array(nx * nz);
+  const ring = new Int32Array(nx * nz);
+  let stamp = 0;
   const cellArea = cell * cell;
   let kept = 0;
   let cells = 0;
@@ -1445,6 +1618,7 @@ function detectLakes() {
 
   for (let start = 0; start < nx * nz; start++) {
     if (!flat[start] || seen[start]) continue;
+    stamp++;
     let sp = 0;
     let cp = 0;
     stack[sp++] = start;
@@ -1475,9 +1649,59 @@ function detectLakes() {
 
     // THE BASIN TEST. Flatness alone also selects the Kent valley floor and
     // airport aprons; a lake is distinguished by its rim rising away from it.
+    //
+    // The rim is taken LAKE_RIM_DILATE cells out, not from the touching ring —
+    // see the note above LAKE_BOX. Measuring it at the touching ring is a test
+    // no lake on earth can pass.
+    let head = 0;
+    let tail = 0;
+    for (let m = 0; m < cp; m++) {
+      const k = comp[m];
+      stampArr[k] = stamp;
+      ring[tail++] = k;
+    }
+    let levelEnd = tail;
     let rim = 0;
     let rimSum = 0;
     let rimAbove = 0;
+    let rimBelow = 0;
+    for (let step = 0; step < LAKE_RIM_DILATE && head < tail; step++) {
+      const end = levelEnd;
+      while (head < end) {
+        const k = ring[head++];
+        const i = k % nx;
+        const j = (k / nx) | 0;
+        for (let o = 0; o < 4; o++) {
+          const ii = i + (o === 0 ? -1 : o === 1 ? 1 : 0);
+          const jj = j + (o === 2 ? -1 : o === 3 ? 1 : 0);
+          if (ii < 0 || ii >= nx || jj < 0 || jj >= nz) continue;
+          const kk = jj * nx + ii;
+          if (stampArr[kk] === stamp) continue;
+          stampArr[kk] = stamp;
+          ring[tail++] = kk;
+          rim++;
+          rimSum += h[kk];
+          if (h[kk] > surface + 0.5) rimAbove++;
+          if (h[kk] < surface - 1.0) rimBelow++;
+        }
+      }
+      levelEnd = tail;
+    }
+    if (rim < 8) continue;
+    if (rimSum / rim < surface + LAKE_RIM_RISE_M) continue;
+    if (rimAbove / rim < LAKE_RIM_ABOVE_FRAC) continue;
+    // Somewhere lower to drain to within 384 m means it is a tideflat or a
+    // delta, not a basin.
+    if (rimBelow / rim > LAKE_RIM_BELOW_FRAC) continue;
+
+    for (let m = 0; m < cp; m++) {
+      mask[comp[m]] = 1;
+      level[comp[m]] = surface;
+    }
+
+    // Grow back over the one-cell band the flatness test ate, onto cells that
+    // are themselves at the lake's surface height.
+    let grown = 0;
     for (let m = 0; m < cp; m++) {
       const k = comp[m];
       const i = k % nx;
@@ -1487,24 +1711,21 @@ function detectLakes() {
         const jj = j + (o === 2 ? -1 : o === 3 ? 1 : 0);
         if (ii < 0 || ii >= nx || jj < 0 || jj >= nz) continue;
         const kk = jj * nx + ii;
-        if (flat[kk] && seen[kk]) continue;
-        rim++;
-        rimSum += h[kk];
-        if (h[kk] > surface + 0.25) rimAbove++;
+        if (mask[kk]) continue;
+        if (Math.abs(h[kk] - surface) > LAKE_EDGE_TOLERANCE_M) continue;
+        mask[kk] = 1;
+        level[kk] = surface;
+        grown++;
       }
     }
-    if (rim < 8) continue;
-    if (rimSum / rim < surface + LAKE_RIM_RISE_M) continue;
-    if (rimAbove / rim < 0.6) continue;
-
-    for (let m = 0; m < cp; m++) {
-      mask[comp[m]] = 1;
-      level[comp[m]] = surface;
-    }
-    cells += cp;
     kept++;
-    found.push({ areaKm2: area / 1e6, surfaceM: surface });
+    found.push({ areaKm2: (area + grown * cellArea) / 1e6, surfaceM: surface });
   }
+
+  // Counted from the mask, not accumulated: components can overlap the band an
+  // earlier lake grew into, and buildLakeGeometry sizes its buffers from this.
+  // An over-count leaves degenerate triangles at the world origin.
+  for (let i = 0; i < nx * nz; i++) if (mask[i]) cells++;
 
   if (found.length) {
     found.sort((a, b) => b.areaKm2 - a.areaKm2);

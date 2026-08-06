@@ -559,16 +559,42 @@ const SKY_FRAG = /* glsl */ `
 // Near-field cloud slab shaders
 // ---------------------------------------------------------------------------
 
+/**
+ * THE LOG-DEPTH CHUNKS ARE NOT OPTIONAL. main.js is required to build the
+ * renderer with `logarithmicDepthBuffer: true` (MODULES.md 2.13 — the near/far
+ * ratio is 0.35 m to 300 km and nothing else survives it). When that is on,
+ * every material three compiles writes `gl_FragDepth = log2(w) * FC * 0.5`
+ * instead of the interpolated hyperbolic z. A hand-written ShaderMaterial that
+ * omits these chunks keeps writing the hyperbolic value, and then depth-tests
+ * against a buffer full of logarithmic ones.
+ *
+ * The two curves are both monotonic in distance, so the bug does not look like
+ * garbage — it looks like *plausible but wrong occlusion*. Worked example at
+ * far = 300 km: terrain 60 km away writes 0.872, a cloud slab 5 km away writes
+ * 0.99993, so the near cloud loses the depth test to ground twelve times
+ * farther off and vanishes. Every cloud over open water, gone; the ones over
+ * nearby hills, kept. It reads as a rendering glitch, not a depth bug.
+ *
+ * The `#ifdef` inside three's chunks makes all of this inert if the renderer
+ * does not have the feature on, so this is safe either way. `<common>` is here
+ * for `isPerspectiveMatrix()`, which `logdepthbuf_vertex` calls.
+ *
+ * The sky dome does not need any of it: it has depthTest and depthWrite off.
+ */
 const CLOUD_VERT = /* glsl */ `
+  #include <common>
+  #include <logdepthbuf_pars_vertex>
   varying vec3 vWorld;
   void main() {
     vec4 wp = modelMatrix * vec4( position, 1.0 );
     vWorld = wp.xyz;
     gl_Position = projectionMatrix * viewMatrix * wp;
+    #include <logdepthbuf_vertex>
   }
 `;
 
 const CLOUD_FRAG = /* glsl */ `
+  #include <logdepthbuf_pars_fragment>
   varying vec3 vWorld;
 
   uniform vec3 uSunDir;
@@ -589,6 +615,10 @@ const CLOUD_FRAG = /* glsl */ `
   ${GLSL_CLOUD_DENSITY}
 
   void main() {
+    // Before the discards: the depth this fragment would occupy is a property of
+    // the geometry, not of whether the cloud happens to be opaque here.
+    #include <logdepthbuf_fragment>
+
     vec2 rel = vWorld.xz - cameraPosition.xz;
     float dist = length( rel );
 
