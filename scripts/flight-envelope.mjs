@@ -811,6 +811,192 @@ head('15. reset() puts it back on the wheels at a real place');
 }
 
 // ---------------------------------------------------------------------------
+head('16. solidity — the terrain is not a suggestion');
+// ---------------------------------------------------------------------------
+// Everything above this line is flown over FLAT ground, which is exactly why
+// none of it could catch the biggest defect the model had: the ground was not
+// solid. A 500 m wall relocated the aeroplane to the top of it in one frame
+// with its speed intact; a slope let it sled up the mountainside on the gear
+// springs, accelerating; and nothing anywhere set a "this flight is over" flag.
+//
+// These checks fly the aircraft AT things. Each one names the measured wrong
+// behaviour it exists to prevent.
+{
+  /**
+   * Fly EAST, level, at 119 kt, over a real height field — not a constant.
+   * reset(.., 90, ..) points the nose at +X and sets the velocity along it, so
+   * the only thing left to place is where the aeroplane starts.
+   */
+  function flyInto(ground, startY, seconds = 25, control = () => ({ throttle: 0.7 })) {
+    const m = createFlightModel({ groundHeightFn: ground });
+    m.reset(47.527042, -122.29995, 90, { altitudeMslM: startY, airspeedMs: 61.2 });
+    const s = m.state;
+    s.position.x = 0;
+    s.position.z = 0;
+    s.position.y = startY;
+    let peakY = s.position.y;
+    let peakKt = s.airspeedKts;
+    let peakG = 0;
+    const n = Math.round(seconds * 60);
+    for (let i = 0; i < n; i++) {
+      m.step(1 / 60, inputs(control(i / 60, s)), ground(s.position.x, s.position.z));
+      peakY = Math.max(peakY, s.position.y);
+      peakKt = Math.max(peakKt, s.airspeedKts);
+      peakG = Math.max(peakG, Math.abs(s.loadFactor));
+    }
+    return { s, peakY, peakKt, peakG };
+  }
+
+  // --- a vertical wall ------------------------------------------------------
+  // Was: y 502.6 -> 1001.2 m in ONE frame, 119 kt retained, onGround false.
+  {
+    const wall = (x) => (x > 400 ? 500 : 0);
+    const r = flyInto(wall, 250);
+    console.log(
+      `  wall at 119 kt: crashed=${r.s.crashed} [${r.s.crashReason}] ` +
+        `impact ${r.s.impactSpeedMs.toFixed(1)} m/s, final y ${r.s.position.y.toFixed(0)} m, ` +
+        `peak y ${r.peakY.toFixed(0)} m, final ${r.s.airspeedKts.toFixed(1)} kt`,
+    );
+    assert('a 500 m wall stops the aeroplane', r.s.crashed, r.s.crashDetail);
+    assert('the wall does not GIFT altitude', r.peakY < 400, `peak y ${r.peakY.toFixed(0)} m`);
+    assert('a wreck is not still flying', r.s.airspeedKts < 0.01);
+  }
+
+  // --- a hillside -----------------------------------------------------------
+  // Was: rode the springs to 2,268 m while ACCELERATING to 197 kt at 8.4 g.
+  for (const deg of [20, 30]) {
+    const t = Math.tan((deg * Math.PI) / 180);
+    const hill = (x) => (x > 200 ? (x - 200) * t : 0);
+    const r = flyInto(hill, 30);
+    console.log(
+      `  ${deg}° hillside at 119 kt: crashed=${r.s.crashed} [${r.s.crashReason}] ` +
+        `peak y ${r.peakY.toFixed(0)} m, peak ${r.peakKt.toFixed(0)} kt, peak ${r.peakG.toFixed(1)} g`,
+    );
+    assert(`a ${deg}° slope is solid`, r.s.crashed, r.s.crashDetail);
+    assert(`it does not SLED up a ${deg}° slope`, r.peakKt < 125, `peak ${r.peakKt.toFixed(0)} kt`);
+    assert(`it does not climb a ${deg}° slope on its springs`, r.peakY < 200, `${r.peakY.toFixed(0)} m`);
+  }
+
+  // --- a survivable landing must still be survivable ------------------------
+  // The whole risk of adding a crash state is false positives. 700 fpm is the
+  // hardest arrival section 12 calls acceptable; it must NOT be fatal.
+  {
+    const m = makeModel({ startAltitudeAglM: 0.05, startAirspeedMs: 30 });
+    m.state.velocity.y = -700 / 196.85039370078738;
+    fly(m, 20, () => ({ throttle: 0, pitch: 0.1, brakes: 0.3 }));
+    assert('a 700 fpm arrival is a hard landing, not a crash', !m.state.crashed, m.state.crashDetail);
+    const bad = makeModel({ startAltitudeAglM: 0.05, startAirspeedMs: 30 });
+    bad.state.velocity.y = -1400 / 196.85039370078738;
+    fly(bad, 20, () => ({ throttle: 0, pitch: 0.1, brakes: 0.3 }));
+    assert('a 1,400 fpm arrival is a crash', bad.state.crashed, bad.state.crashDetail);
+  }
+
+  // --- terrain that refines under a PARKED aeroplane ------------------------
+  // An LOD pop is not a crash. The aeroplane did nothing; the ground moved.
+  {
+    let base = FIELD_M;
+    const m = createFlightModel({ groundHeightFn: () => base });
+    const s = m.state;
+    for (let i = 0; i < 120; i++) m.step(1 / 60, inputs({ brakes: 1 }), base);
+    base = FIELD_M + 14;
+    for (let i = 0; i < 240; i++) m.step(1 / 60, inputs({ brakes: 1 }), base);
+    console.log(`  +14 m LOD pop under a parked aeroplane: crashed=${s.crashed}, AGL ${s.altitudeAglFt.toFixed(2)} ft`);
+    assert('a terrain LOD pop is not a crash', !s.crashed, s.crashDetail);
+    band('and it ends up on its wheels', s.altitudeAglFt, -1, 1, 'ft');
+  }
+
+  // --- one bad DEM sample ---------------------------------------------------
+  // Was: one frame of groundHeight = 160 m at y = 124.3 m -> y 161.2 m and a
+  // phantom +987 fpm that the next (correct) frame did not undo.
+  {
+    const m = makeModel({ startAltitudeAglM: 120, startAirspeedMs: 50 });
+    const s = m.state;
+    fly(m, 2, () => ({ throttle: 0.6 }));
+    const y0 = s.position.y;
+    const vs0 = s.verticalSpeedFpm;
+    m.step(1 / 60, inputs({ throttle: 0.6 }), FIELD_M + 160); // the void
+    const dy = s.position.y - y0;
+    const dvs = s.verticalSpeedFpm - vs0;
+    console.log(`  one-frame DEM void: dy ${dy.toFixed(3)} m, d(vs) ${dvs.toFixed(0)} fpm`);
+    band('a one-frame ground spike moves it', dy, -0.5, 0.5, 'm');
+    band('a one-frame ground spike does not launch it', dvs, -60, 60, 'fpm');
+    assert('a one-frame ground spike is not a crash', !s.crashed);
+  }
+
+  // --- a cliff that is really there IS accepted -----------------------------
+  // The void filter must not also filter out geography. Two frames of the same
+  // reading is proof; the aeroplane must react to it.
+  {
+    const m = makeModel({ startAltitudeAglM: 40, startAirspeedMs: 50 });
+    const s = m.state;
+    fly(m, 2, () => ({ throttle: 0.6 }));
+    for (let i = 0; i < 30; i++) m.step(1 / 60, inputs({ throttle: 0.6 }), FIELD_M + 200);
+    console.log(`  sustained +200 m step: crashed=${s.crashed} [${s.crashReason}]`);
+    assert('a cliff that persists is believed', s.crashed, s.crashDetail);
+  }
+
+  // --- the ground has a SLOPE, and the aeroplane knows it -------------------
+  // Was: parked on a 6 deg slope it read pitch 1.56 deg — it sat level, because
+  // step() took ONE scalar ground height for all four contacts.
+  {
+    const t = Math.tan((6 * Math.PI) / 180);
+    const hill = (x, z) => FIELD_M - z * t; // rises toward the north (-Z)
+    const m = createFlightModel({ groundHeightFn: hill });
+    const s = m.state;
+    m.reset(47.527042, -122.29995, 0); // nose north, i.e. uphill
+    const flat = createFlightModel({ groundHeightFn: () => FIELD_M });
+    for (let i = 0; i < 900; i++) {
+      m.step(1 / 60, inputs({ brakes: 1 }), hill(s.position.x, s.position.z));
+      flat.step(1 / 60, inputs({ brakes: 1 }), FIELD_M);
+    }
+    const dPitch = s.pitchDeg - flat.state.pitchDeg;
+    console.log(
+      `  parked on a 6° slope: pitch ${s.pitchDeg.toFixed(2)}° ` +
+        `(flat reference ${flat.state.pitchDeg.toFixed(2)}°, delta ${dPitch.toFixed(2)}°), ` +
+        `slope read ${s.terrainSlopeDeg.toFixed(2)}°`,
+    );
+    band('terrain slope is measured, not assumed', s.terrainSlopeDeg, 5.9, 6.1, 'deg');
+    // The delta is larger than the slope itself, and that is real: with the
+    // brakes on, the down-slope load transfer through a 1.2 m CG height unloads
+    // the nose leg. What must NOT happen is the old behaviour — sitting level.
+    band('parked pitch follows the hill', dPitch, 5, 12, 'deg');
+  }
+
+  // --- Vne is enforced ------------------------------------------------------
+  {
+    const m = makeModel({ startAltitudeAglM: 4000, startAirspeedMs: 60 });
+    const s = m.state;
+    let flagged = false;
+    fly(m, 60, () => {
+      if (s.overspeed) flagged = true;
+      return { throttle: 1, pitch: -0.3 };
+    });
+    console.log(
+      `  power dive from 4,000 m: overspeed flag seen=${flagged}, ` +
+        `crashed=${s.crashed} [${s.crashReason}] ${s.crashDetail}`,
+    );
+    assert('Vne is not decorative — the airframe fails', s.crashed && s.crashReason === 'overspeed');
+    assert('and the flag showed before the break', flagged);
+  }
+
+  // --- crashed is a LATCH, and only reset() clears it -----------------------
+  {
+    const m = makeModel({ startAltitudeAglM: 0.05, startAirspeedMs: 30 });
+    m.state.velocity.y = -2000 / 196.85039370078738;
+    fly(m, 5, () => ({ throttle: 1, pitch: 1 }));
+    assert('it is crashed', m.state.crashed);
+    const p = m.state.position.clone();
+    fly(m, 10, () => ({ throttle: 1, pitch: 1 }));
+    assert('full power does not un-crash it', m.state.crashed);
+    assert('a wreck does not move', m.state.position.distanceTo(p) < 1e-9);
+    band('a wreck has no airspeed', m.state.airspeedKts, -1e-9, 1e-9, 'kt');
+    m.reset();
+    assert('reset() clears the crash', !m.state.crashed && m.state.crashReason === '');
+    assert('and nothing went non-finite', finiteState(m.state));
+  }
+}
+
+// ---------------------------------------------------------------------------
 function fmtV(v) {
   return `${v.x.toFixed(0)}, ${v.y.toFixed(0)}, ${v.z.toFixed(0)}`;
 }

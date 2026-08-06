@@ -503,9 +503,30 @@ airspeedKts, altitudeFt, altitudeAglFt, verticalSpeedFpm,
 headingDeg, pitchDeg, rollDeg, rpm, stalled, onGround,
 flaps, brakes, loadFactor
 
+// airframe integrity — `crashed` is a LATCH, only reset() clears it
+crashed, crashReason, crashDetail,       // '' | terrain | gear | overstress | overspeed
+impactSpeedMs, impactLoadFactor, overspeed,
+terrainSlopeDeg, gearStrokeMaxM, gearBottomed
+
 // geodetic mirror, recomputed every step
 lat, lon
 ```
+
+**The terrain is solid.** A gear leg is a spring with a stop; past
+`config.gearStrokeM` it is structure, and structure that meets the surface at
+more than `config.crashClosingMs` **measured along the local surface normal**
+fails. Anything past `config.crashLoadFactor` fails too, as does anything past
+1.3 × Vne indicated. When it does, `state.crashed` latches, the wreck stops
+where it hit, and `step()` stops doing aerodynamics. Nothing un-crashes an
+aeroplane except `reset()`.
+
+`step()`'s `groundHeight` argument is the **reference** sample and still must be
+`terrain.getHeightAt` (§1.4). It is no longer the only sample: the model calls
+the same `groundHeightFn` once per wheel per substep near the ground, plus four
+times per frame around the datum for the surface normal. Same sampler, same
+surface, more questions — which is what a slope and a cliff face require. A
+one-frame spike in the reference sample is deferred until a second frame
+confirms it, so a DEM void cannot move the aeroplane and a cliff still can.
 
 `altitudeFt` is MSL (`y = 0` is sea level). `altitudeAglFt` is above the terrain
 directly below — with real elevation the ground moves, so an altimeter alone

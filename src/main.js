@@ -255,6 +255,8 @@ async function boot() {
   let timeIndex = 0;
   let paused = false;
   let muted = false;
+  /** Edge-detector so the crash is logged once, not sixty times a second. */
+  let crashLogged = false;
 
   /**
    * Resolve a place entry to a concrete spawn.
@@ -461,8 +463,21 @@ async function boot() {
     terrain.update(cameras.active);
     sky.update(paused ? 0 : dt);
 
-    // 6. hud + sound
+    // 6. hud + sound. The crash card is driven off the model's latched flag,
+    //    not off an event, so it survives a paused frame and a camera change.
     instruments.update(state, inputs);
+    overlay.setCrashed(state.crashed, state.crashDetail);
+    if (state.crashed !== crashLogged) {
+      crashLogged = state.crashed;
+      if (state.crashed) {
+        console.warn(
+          `[sim] CRASHED (${state.crashReason}): ${state.crashDetail} — ` +
+            `${state.impactSpeedMs.toFixed(1)} m/s, ${state.impactLoadFactor.toFixed(1)} g, ` +
+            `at ${state.lat.toFixed(5)}, ${state.lon.toFixed(5)}, ` +
+            `${state.altitudeFt.toFixed(0)} ft MSL`,
+        );
+      }
+    }
     sound.update(dt, state, inputs, paused);
 
     // 7. draw — read cameras.active fresh, cycle() reassigns it

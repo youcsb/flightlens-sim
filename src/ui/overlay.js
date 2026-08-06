@@ -100,6 +100,24 @@ const CSS = `
   font-size: 15px; letter-spacing: 0.34em; color: #ffffff;
   text-shadow: 0 2px 12px rgba(0,0,0,0.9); padding-left: 0.34em;
 }
+/* The crash card. A band like PAUSED, for the same reason — the chase camera
+   frames the aeroplane dead centre and the wreck is the thing worth looking at.
+   It sits below the toast so a "reset · KBFI" toast is still readable. */
+.ovl-crash {
+  position: absolute; left: 50%; top: 108px; transform: translateX(-50%);
+  display: none; pointer-events: none; text-align: center;
+  padding: 12px 22px; border-radius: 10px;
+  background: rgba(38,8,10,0.86); border: 1px solid rgba(255,120,120,0.55);
+  box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+  max-width: min(560px, 84vw);
+}
+.ovl-crash.show { display: block; }
+.ovl-crash .h {
+  font-size: 16px; letter-spacing: 0.3em; color: #ff8f8f; padding-left: 0.3em;
+  font-weight: 700;
+}
+.ovl-crash .d { margin-top: 6px; font-size: 12px; color: #ffd9d9; }
+.ovl-crash .n { margin-top: 8px; font-size: 11px; color: #ff9f9f; letter-spacing: 0.08em; }
 .ovl-load {
   position: absolute; inset: 0; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 14px;
@@ -202,6 +220,14 @@ export function createOverlay(container, o = {}) {
   pausedEl.innerHTML = '<span>PAUSED</span>';
   root.appendChild(pausedEl);
 
+  const crashEl = document.createElement('div');
+  crashEl.className = 'ovl-crash';
+  crashEl.innerHTML =
+    '<div class="h">CRASHED</div><div class="d"></div>' +
+    '<div class="n">R — reset and try again</div>';
+  const crashDetail = crashEl.querySelector('.d');
+  root.appendChild(crashEl);
+
   const loadEl = document.createElement('div');
   loadEl.className = 'ovl-load';
   loadEl.innerHTML =
@@ -215,6 +241,8 @@ export function createOverlay(container, o = {}) {
 
   let toastTimer = 0;
   let keysShown = true;
+  let crashShown = false;
+  let crashText = '';
 
   function row(parent, label) {
     const d = document.createElement('div');
@@ -260,6 +288,22 @@ export function createOverlay(container, o = {}) {
     },
     setPaused(p) {
       pausedEl.classList.toggle('show', !!p);
+    },
+    /**
+     * Show or hide the crash card. Called every frame with the model's latched
+     * `crashed` flag, so it is idempotent and cheap: the DOM is only written
+     * when the state actually changes.
+     *
+     * @param {boolean} on
+     * @param {string} [detail] one line, e.g. "gear collapsed — 21 m/s into 22° terrain"
+     */
+    setCrashed(on, detail) {
+      const want = !!on;
+      if (want === crashShown && (!want || detail === crashText)) return;
+      crashShown = want;
+      crashText = detail || '';
+      crashDetail.textContent = crashText;
+      crashEl.classList.toggle('show', want);
     },
     toggleKeys,
     toast(msg) {

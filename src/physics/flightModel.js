@@ -56,12 +56,39 @@
  * Both must ultimately be elevation.getElevationLocal — see MODULES.md § the
  * ground-height invariant.
  *
- * The caller supplies ONE ground sample, at the aircraft's own (x, z). All
- * four gear contact points are tested against that single height, i.e. the
- * ground is treated as locally flat over the ~4 m gear footprint. Runways are
- * flat and this keeps the invariant intact; sampling terrain per wheel would
- * mean this module reaching into elevation.js and owning a second opinion
- * about where the ground is.
+ * The caller supplies ONE ground sample, at the aircraft's own (x, z), and that
+ * sample remains the REFERENCE: it is what the radio altimeter reads against
+ * and what every other sample is sanity-checked against. But it is not the only
+ * sample taken, because a single scalar height cannot describe a slope, and an
+ * aeroplane that only ever meets locally flat ground is an aeroplane for which
+ * terrain is not solid. Measured, before this changed: level at 119 kt into a
+ * 500 m vertical wall relocated the aircraft from y = 502.6 m to y = 1001.2 m
+ * in ONE frame, with all 119 kt intact and onGround still false.
+ *
+ * So the model ALSO calls `groundHeightFn` itself:
+ *
+ *   - once per contact point, per substep, whenever the aircraft is within
+ *     CONTACT_SAMPLE_AGL_M of the reference surface. That is what lets it park
+ *     nose-up on a hill and what makes a cliff face register as a cliff face
+ *     under the leading wheel instead of as a floor that suddenly moved.
+ *   - four times per frame in a cross around the datum, to get the surface
+ *     NORMAL. Without a normal there is no way to tell a 3 m/s descent onto a
+ *     runway from a 60 m/s arrival at a rock wall, because both are "the
+ *     ground is now above the wheel".
+ *
+ * This does NOT break the one-place rule, and that is the point of insisting
+ * `groundHeightFn` be the same function step() is fed: every one of those extra
+ * samples goes through the caller's own sampler. The module still owns no
+ * opinion about where the ground is. It just asks more often.
+ *
+ * ---------------------------------------------------------------------------
+ * SOLIDITY
+ * ---------------------------------------------------------------------------
+ * The terrain is solid and the aeroplane can be destroyed. `state.crashed` is a
+ * latch that only reset() clears; while it is set, step() does no aerodynamics,
+ * the wreck does not move, and it certainly does not keep its airspeed. See the
+ * SOLIDITY constants block for the three thresholds and why each is where it
+ * is, and `flight-envelope.mjs` §16 for the flights that prove it.
  *
  * ---------------------------------------------------------------------------
  * TIMESTEP
@@ -119,6 +146,9 @@ import { llToLocal, localToLl } from '../geo/coords.js';
  *  @property {number} [inertiaYawKgM2]   Default 2667 * mass/1100.
  *  @property {number} [windEastMs]       Steady wind, m/s toward east. Default 0.
  *  @property {number} [windNorthMs]      Steady wind, m/s toward north. Default 0.
+ *  @property {boolean} [crashEnabled]    Terrain is SOLID and the airframe can be
+ *           destroyed. Default true. Set false only for a harness that wants to
+ *           measure something past the point where the aeroplane would break.
  */
 
 const DEFAULTS = {
@@ -155,6 +185,7 @@ const DEFAULTS = {
   inertiaYawKgM2: 0,
   windEastMs: 0,
   windNorthMs: 0,
+  crashEnabled: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -298,6 +329,90 @@ const MU_BRAKE = 0.55;
  * (compression only) pogos: nothing bleeds the energy the spring gives back.
  */
 const REBOUND_DAMP = 0.7;
+
+/* ---------------------------------------------------------------------------
+ * SOLIDITY — the terrain is not a suggestion
+ * ---------------------------------------------------------------------------
+ * A gear leg is a SPRING WITH A STOP. Past the stop it is not a spring any
+ * more, it is structure, and structure fails. Everything in this block exists
+ * so that the surface the terrain module draws is the surface the aeroplane
+ * cannot pass through.
+ *
+ * The three numbers that decide whether a contact is a landing or a crash:
+ *
+ *   GEAR_STROKE_M      how far a leg can travel before it bottoms out. Measured
+ *                      against the model's own hard-landing test: a 700 fpm
+ *                      arrival — already 4.8 g and the worst case the envelope
+ *                      script calls survivable — peaks at 25 cm on a main. 40 cm
+ *                      leaves margin over that and is still far less than the
+ *                      1.2 m of datum clearance, so "bottomed" always means the
+ *                      leg is fully compressed and never means "firm".
+ *
+ *   CRASH_CLOSING_MS   closing speed ALONG THE LOCAL SURFACE NORMAL at the
+ *                      moment the leg bottoms. 5 m/s is 984 fpm straight down —
+ *                      well past the 600 fpm (10 fps) ultimate design sink of a
+ *                      light single's gear, and the reason it is measured along
+ *                      the NORMAL rather than along world-down is that this is
+ *                      what makes a cliff face solid: fly level at 60 m/s into
+ *                      ground whose normal is horizontal and the closing speed
+ *                      is 60 m/s, not 0.
+ *
+ *   CRASH_LOAD_G       airframe ultimate load factor. A C172 is +3.8 g limit,
+ *                      x1.5 = 5.7 g ultimate. 6 g, magnitude, either sign.
+ *
+ * The normal is real, not assumed: sampleGroundNormal() probes the SAME height
+ * field the wheels roll on, four samples in a cross, once per frame.
+ */
+const GEAR_STROKE_M = 0.4;
+const CRASH_CLOSING_MS = 5.0;
+const CRASH_LOAD_G = 6.0;
+/**
+ * Structural failure speed, as a multiple of Vne (indicated). 1.3 x 165 kt =
+ * 214 kt IAS. Below it the airframe merely complains (`state.overspeed`);
+ * at it the wing comes off. Chosen so the model's own display-field check,
+ * which deliberately parks the aeroplane at 180 KIAS, still runs.
+ */
+const OVERSPEED_BREAK = 1.3;
+/**
+ * Half-width of the cross used to estimate the surface normal, metres. Wider
+ * than a gear track (2.6 m) would smooth a runway edge into a ramp; narrower
+ * than the DEM's finest post spacing would just resample the same triangle.
+ */
+const NORMAL_PROBE_M = 2.0;
+/**
+ * Above this height above the datum's ground sample, nothing can touch: skip
+ * the per-contact terrain sampling entirely. One wingspan plus the gear is the
+ * most any contact point can sit below the datum, so 30 m is generous.
+ */
+const CONTACT_SAMPLE_AGL_M = 30;
+/**
+ * Outlier rejection for a per-contact sample. The contacts span 4.1 m; no real
+ * surface puts one of them 150 m from the datum's own sample. A DEM void does.
+ */
+const CONTACT_OUTLIER_M = 150;
+/**
+ * Ground-sample jump filter. A one-frame spike in getHeightAt() — a DEM void,
+ * an LOD swap mid-refinement — used to be indistinguishable from a cliff, and
+ * the old code resolved both by teleporting. It is distinguishable in TIME: a
+ * cliff is still there on the next frame, a void is not. So a jump larger than
+ * the threshold is DEFERRED one frame and accepted only if the next sample
+ * confirms it. Cost of a genuine cliff: 16 ms of delay, one metre of travel.
+ * Cost of a void: nothing at all.
+ */
+const GROUND_JUMP_BASE_M = 12;
+/** Steepest slope accepted with zero delay, as a gradient. tan(63°) ~ 2. */
+const GROUND_JUMP_PER_MS = 2.0;
+/** Two samples this close together count as agreeing. */
+const GROUND_CONFIRM_M = 25;
+/**
+ * How far a crash is allowed to move the wreck to stop it sitting buried.
+ * Bounded on purpose: settling a belly-landing 30 cm out of the dirt is
+ * housekeeping, and lifting a wreck 500 m up the face of the cliff it just hit
+ * is the exact bug this whole block replaces.
+ */
+const WRECK_SETTLE_MAX_M = 2.0;
+/** Ground speed below which a containment trip is resolved, not fatal. */
+const CONTAINMENT_SAFE_MS = 3.0;
 /**
  * Ceiling on the DAMPER term alone, in weights, per leg. The spring peak at a
  * 500 fpm arrival is about 2.5 g and that is the number that should show on the
@@ -366,8 +481,8 @@ const STEER_FLOOR = 0.02;
  */
 export function createFlightModel(opts = {}) {
   const cfg = { ...DEFAULTS, ...opts };
-  const groundHeightFn =
-    typeof cfg.groundHeightFn === 'function' ? cfg.groundHeightFn : () => 0;
+  const hasGroundFn = typeof cfg.groundHeightFn === 'function';
+  const groundHeightFn = hasGroundFn ? cfg.groundHeightFn : () => 0;
 
   // -------------------------------------------------------------------------
   // Derived airframe constants — computed once, never per frame.
@@ -408,6 +523,8 @@ export function createFlightModel(opts = {}) {
   const THRUST_KNEE = (P_MAX * ETA) / Math.max(1, cfg.staticThrustN);
   const THRUST_KNEE3 = THRUST_KNEE * THRUST_KNEE * THRUST_KNEE;
 
+  const CRASH_ON = cfg.crashEnabled !== false;
+  const VNE_MS = Math.max(1, cfg.maxSpeedMs);
   const GEAR_H = cfg.gearHeightM;
   /**
    * Vertical offset from `position` to the number the altimeter shows.
@@ -484,6 +601,40 @@ export function createFlightModel(opts = {}) {
     /** True while any gear leg is carrying load. */
     onGround: false,
 
+    // --- solidity / airframe integrity ------------------------------------
+    /**
+     * THE FLIGHT IS OVER. Latched — nothing clears it but reset().
+     *
+     * Set when the aeroplane hits something it cannot survive: a gear leg
+     * bottomed out with real closing speed into the surface, an airframe load
+     * past ultimate, an indicated speed past the break, or a containment trip
+     * at speed. While it is true the aircraft does not move, the engine is
+     * dead, and step() does no aerodynamics.
+     */
+    crashed: false,
+    /**
+     * Why. One of '' | 'terrain' | 'gear' | 'overstress' | 'overspeed'.
+     * Present so the HUD can say something more useful than "you died".
+     */
+    crashReason: '',
+    /** Human-readable one-liner for the same, e.g. "gear collapsed — 21.4 m/s
+     *  into the surface". Empty until `crashed`. */
+    crashDetail: '',
+    /** Speed INTO the surface at the moment of the crash, m/s. */
+    impactSpeedMs: 0,
+    /** Load factor recorded at the moment of the crash, g. */
+    impactLoadFactor: 0,
+    /** IAS past Vne right now. Advisory: the airframe is still attached. */
+    overspeed: false,
+    /** Slope of the terrain under the aircraft, DEGREES from horizontal.
+     *  Derived from the same height field the wheels use. */
+    terrainSlopeDeg: 0,
+    /** Deepest single-leg compression this step, METRES. Reaches
+     *  GEAR_STROKE_M and stops — past that the leg is bottomed, not sprung. */
+    gearStrokeMaxM: 0,
+    /** True while at least one leg is bottomed out on its stop. */
+    gearBottomed: false,
+
     // --- geodetic position (derived from `position` every step) -----------
     /** Latitude, DEGREES. Convenience mirror of position, for the HUD and
      *  for nearest-airport / nearest-landmark lookups. */
@@ -548,6 +699,10 @@ export function createFlightModel(opts = {}) {
     gearHeightM: GEAR_H,
     staticSquatM: STATIC_SQUAT,
     fixedDt: FIXED_DT,
+    gearStrokeM: GEAR_STROKE_M,
+    crashClosingMs: CRASH_CLOSING_MS,
+    crashLoadFactor: CRASH_LOAD_G,
+    crashEnabled: CRASH_ON,
   });
 
   // -------------------------------------------------------------------------
@@ -598,6 +753,193 @@ export function createFlightModel(opts = {}) {
   let clock = 0;
   // Running ground-height for refreshDisplay between substeps.
   let lastGround = 0;
+
+  // ---------------------------------------------------------------------------
+  // Ground sampling — FOUR points and a normal, not one scalar
+  // ---------------------------------------------------------------------------
+  /**
+   * Terrain height under each gear contact, metres MSL. Refilled every substep
+   * while the aircraft is within CONTACT_SAMPLE_AGL_M of the surface and left
+   * alone otherwise, because nothing up there can touch.
+   *
+   * This is the fix for the interface bug, not just the implementation one: a
+   * single scalar ground height cannot describe a slope, so the aeroplane could
+   * only ever sit level. With four samples it sits on the ground it is actually
+   * on — nose low downhill, one main first in a crosswind landing on a crowned
+   * runway — and, crucially, a vertical face registers as a vertical face under
+   * the leading contacts instead of as a floor that suddenly moved.
+   */
+  const contactGround = new Float64Array(CONTACTS.length);
+  /** Unit normal of the height field at the datum. Starts flat. */
+  let normX = 0;
+  let normY = 1;
+  let normZ = 0;
+  /** Deferred ground sample awaiting confirmation — see GROUND_JUMP_BASE_M. */
+  let pendingGround = 0;
+  let pendingValid = false;
+  /** Cumulative time past the overspeed break, seconds. */
+  let overspeedTime = 0;
+
+  /**
+   * Reject a one-frame ground-sample spike without rejecting a cliff.
+   *
+   * @param {number} raw   this frame's getHeightAt() at the datum
+   * @param {number} frame frame time, seconds
+   * @returns {number}     the height the physics should believe
+   */
+  function acceptGround(raw, frame) {
+    if (!Number.isFinite(raw)) return lastGround;
+    const gs = Math.sqrt(
+      state.velocity.x * state.velocity.x + state.velocity.z * state.velocity.z,
+    );
+    // How far real terrain can move under the aircraft in one frame: a 12 m
+    // floor (so a stationary aeroplane tolerates DEM refinement without a
+    // hiccup) plus ground speed x frame time x tan(63°). At 60 m/s and 60 Hz
+    // that is 14 m of vertical change accepted with no delay at all — a 2:1
+    // slope taken at 117 kt. Anything steeper is either a cliff, in which case
+    // it will still be there in 16 ms, or a void, in which case it will not.
+    const tol = GROUND_JUMP_BASE_M + GROUND_JUMP_PER_MS * gs * frame;
+    if (Math.abs(raw - lastGround) <= tol) {
+      pendingValid = false;
+      return raw;
+    }
+    if (pendingValid && Math.abs(raw - pendingGround) <= GROUND_CONFIRM_M) {
+      // Two frames agree. It is real ground; take it, whatever it costs.
+      pendingValid = false;
+      return raw;
+    }
+    pendingGround = raw;
+    pendingValid = true;
+    return lastGround;
+  }
+
+  /**
+   * Estimate the unit normal of the height field at (x, z) by central
+   * differences. Four samples, once per frame — this is what turns a scalar
+   * heightmap into a surface with an orientation, and therefore what lets the
+   * model tell "descending onto a runway at 3 m/s" apart from "flying into the
+   * side of a hill at 60".
+   *
+   * @param {number} x metres
+   * @param {number} z metres
+   * @param {number} gh accepted datum height, used if a probe returns garbage
+   */
+  function sampleGroundNormal(x, z, gh) {
+    if (!hasGroundFn) {
+      normX = 0;
+      normY = 1;
+      normZ = 0;
+      state.terrainSlopeDeg = 0;
+      return;
+    }
+    const d = NORMAL_PROBE_M;
+    const hE = safeHeight(x + d, z, gh);
+    const hW = safeHeight(x - d, z, gh);
+    const hS = safeHeight(x, z + d, gh);
+    const hN = safeHeight(x, z - d, gh);
+    // Gradient of h. The surface is y = h(x, z), so its normal is
+    // (-dh/dx, 1, -dh/dz) before normalising.
+    const gx = (hE - hW) / (2 * d);
+    const gz = (hS - hN) / (2 * d);
+    const inv = 1 / Math.sqrt(gx * gx + gz * gz + 1);
+    normX = -gx * inv;
+    normY = inv;
+    normZ = -gz * inv;
+    state.terrainSlopeDeg = Math.acos(clamp(normY, -1, 1)) * RAD_TO_DEG;
+  }
+
+  /** getHeightAt with outlier and NaN rejection against a trusted reference. */
+  function safeHeight(x, z, ref) {
+    const h = groundHeightFn(x, z);
+    if (!Number.isFinite(h)) return ref;
+    if (h > ref + CONTACT_OUTLIER_M) return ref + CONTACT_OUTLIER_M;
+    if (h < ref - CONTACT_OUTLIER_M) return ref - CONTACT_OUTLIER_M;
+    return h;
+  }
+
+  /**
+   * Fill contactGround[] for the current attitude.
+   *
+   * THE CALLER STILL OWNS THE ABSOLUTE HEIGHT. `gh` — the value main.js passed
+   * to step() — sets the level; `groundHeightFn` only supplies the SHAPE, as a
+   * difference from its own reading at the datum. Where the two agree, as
+   * §1.4 requires, this is identical to sampling each wheel directly. Where
+   * they ever disagree, the wheels stay consistent with the number the rest of
+   * the sim is using instead of quietly acquiring a second opinion about where
+   * the ground is, and the disagreement shows up as an altimeter offset rather
+   * than as an aeroplane buried in the runway.
+   *
+   * @param {number} gh accepted datum height, metres MSL
+   */
+  function sampleContactGround(gh) {
+    if (!hasGroundFn) {
+      flattenContactGround(gh);
+      return;
+    }
+    const ref = groundHeightFn(state.position.x, state.position.z);
+    if (!Number.isFinite(ref)) {
+      flattenContactGround(gh);
+      return;
+    }
+    for (let i = 0; i < CONTACTS.length; i++) {
+      const cp = CONTACTS[i];
+      _rWorld.set(cp.x, cp.y - GEAR_H, cp.z).applyQuaternion(state.orientation);
+      contactGround[i] =
+        gh +
+        (safeHeight(
+          state.position.x + _rWorld.x,
+          state.position.z + _rWorld.z,
+          ref,
+        ) -
+          ref);
+    }
+  }
+
+  /** Every contact sits on the datum's height. Used when far from the ground
+   *  and when no sampler was supplied. */
+  function flattenContactGround(gh) {
+    for (let i = 0; i < CONTACTS.length; i++) contactGround[i] = gh;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Crash
+  // ---------------------------------------------------------------------------
+  /**
+   * End the flight. Idempotent — the first cause wins, so the HUD reports the
+   * thing that actually broke rather than whatever broke next.
+   *
+   * The aeroplane STOPS WHERE IT HIT. It is not moved to the surface, it is not
+   * given altitude, it does not keep its speed. The only positional liberty
+   * taken is WRECK_SETTLE_MAX_M of lift when the datum ended up buried in flat
+   * ground, which is cosmetic and bounded precisely so it can never become the
+   * teleport it replaced.
+   *
+   * @param {string} reason 'terrain' | 'gear' | 'overstress' | 'overspeed'
+   * @param {string} detail one-line human explanation
+   * @param {number} closingMs speed into the surface, m/s
+   * @param {number} gh accepted ground height at the datum
+   */
+  function triggerCrash(reason, detail, closingMs, gh) {
+    if (state.crashed) return;
+    state.crashed = true;
+    state.crashReason = reason;
+    state.crashDetail = detail;
+    state.impactSpeedMs = Math.abs(closingMs);
+    state.impactLoadFactor = state.loadFactor;
+    state.velocity.set(0, 0, 0);
+    state.angularVelocity.set(0, 0, 0);
+    state.airspeedMs = 0;
+    state.thrustN = 0;
+    state.stalled = false;
+    state.stallWarning = false;
+    state.separation = 0;
+
+    // Bounded cosmetic settle: only ever upward, only ever a small amount, and
+    // only when the wreck is genuinely underground.
+    const rest = gh + GEAR_H - STATIC_SQUAT;
+    const lift = rest - state.position.y;
+    if (lift > 0 && lift <= WRECK_SETTLE_MAX_M) state.position.y = rest;
+  }
 
   // ---------------------------------------------------------------------------
   // Lift curve
@@ -661,6 +1003,28 @@ export function createFlightModel(opts = {}) {
    */
   function integrate(h, gh) {
     clock += h;
+
+    // --- the flight is over ------------------------------------------------
+    // A wreck has no aerodynamics and no gear. It does not drift, it does not
+    // slide, and it does not quietly keep flying with the HUD showing 61 kt.
+    // The engine winds down and that is the whole of the physics.
+    if (state.crashed) {
+      engineSpool = moveToward(engineSpool, 0, 1.2 * h);
+      state.rpm = Math.max(0, state.rpm - 900 * h);
+      state.thrustN = 0;
+      state.velocity.set(0, 0, 0);
+      state.angularVelocity.set(0, 0, 0);
+      state.airspeedMs = 0;
+      state.loadFactor = 0;
+      state.onGround = true;
+      return;
+    }
+
+    // --- where the ground is, under each wheel -----------------------------
+    // Sampling is skipped outright when nothing can reach: the datum's own
+    // sample bounds how far below it any contact can be.
+    if (state.position.y - gh < CONTACT_SAMPLE_AGL_M) sampleContactGround(gh);
+    else flattenContactGround(gh);
 
     // --- control surfaces lag the stick -----------------------------------
     surfPitch = moveToward(surfPitch, inPitch, SURFACE_RATE * h);
@@ -837,6 +1201,7 @@ export function createFlightModel(opts = {}) {
     _tGround.set(0, 0, 0);
     let normalTotal = 0;
     let compressionTotal = 0;
+    let strokeMax = 0;
 
     // Steering: the nosewheel follows the pedals, fading out as the rudder
     // takes over. Rotating a heading vector about +Y by +phi turns it LEFT
@@ -871,27 +1236,66 @@ export function createFlightModel(opts = {}) {
 
     const brake = clamp(inBrakes, 0, 1);
 
+    // Worst offender this substep, for the crash test after the loop.
+    let deepest = 0;
+    let worstClosing = 0;
+    let bottomedAny = false;
+
     for (let i = 0; i < CONTACTS.length; i++) {
       const cp = CONTACTS[i];
       _rWorld.set(cp.x, cp.y - GEAR_H, cp.z).applyQuaternion(state.orientation);
       const py = state.position.y + _rWorld.y;
-      const pen = gh - py;
+      // THE GROUND UNDER THIS WHEEL, not under the aeroplane. On a 6 deg slope
+      // the nose and the mains differ by 15 cm, which is the entire difference
+      // between an aircraft that sits level everywhere and one that parks
+      // nose-down on a hill.
+      const pen = contactGround[i] - py;
       if (pen <= 0) continue;
 
       _cross.crossVectors(_omegaWorld, _rWorld);
       _vPoint.copy(state.velocity).add(_cross);
 
-      // Spring + damper along world up. Damping only resists compression, so
+      // THE CONTACT WORKS IN THE SURFACE FRAME, NOT THE WORLD FRAME.
+      //
+      // `pen` is a VERTICAL depth; the leg is compressed by the PERPENDICULAR
+      // depth, which is pen * cos(slope) = pen * normY. The normal force acts
+      // along the surface normal and the tyre forces act in the tangent plane.
+      // On level ground normY is 1 and the normal is +Y, so every line below
+      // reduces exactly to the world-frame version this replaces — which is why
+      // none of the measured flat-ground numbers move. On a hill it is the
+      // difference between an aeroplane parked on the hill and an aeroplane
+      // being shoved sideways by a spring that thinks the world is flat.
+      const penPerp = pen * normY;
+      const vN = _vPoint.x * normX + _vPoint.y * normY + _vPoint.z * normZ;
+
+      // A LEG IS A SPRING WITH A STOP. Past GEAR_STROKE_M there is no more
+      // spring: clamping the compression here is what stops the model turning
+      // a 500 m wall into a 500 m spring and firing the aeroplane up the face
+      // of it. The excess penetration is recorded, not resolved — resolving it
+      // is the crash test's job.
+      let penEff = penPerp;
+      if (penPerp > GEAR_STROKE_M) {
+        penEff = GEAR_STROKE_M;
+        bottomedAny = true;
+        if (penPerp > deepest) deepest = penPerp;
+        // Closing speed along the LOCAL SURFACE NORMAL. On a runway that is
+        // sink rate. On a cliff face it is most of the airspeed — which is the
+        // whole reason the normal is computed at all.
+        if (-vN > worstClosing) worstClosing = -vN;
+      }
+
+      // Spring + damper along the normal. Damping only resists compression, so
       // the gear never sucks the aircraft back down on rebound.
-      let damp2 = -cp.c * _vPoint.y;
-      if (_vPoint.y > 0) damp2 *= REBOUND_DAMP;
+      let damp2 = -cp.c * vN;
+      if (vN > 0) damp2 *= REBOUND_DAMP;
       if (damp2 > maxDamp) damp2 = maxDamp;
       else if (damp2 < -maxDamp) damp2 = -maxDamp;
-      let fn = cp.k * pen + damp2;
+      let fn = cp.k * penEff + damp2;
       if (fn < 0) fn = 0;
       if (fn > MAX_N) fn = MAX_N;
-      normalTotal += fn;
-      compressionTotal += pen;
+      normalTotal += fn * normY; // vertical share — what holds the weight up
+      compressionTotal += penEff;
+      if (penEff > strokeMax) strokeMax = penEff;
 
       // Wheel-plane axes. Only the nosewheel steers.
       let wfx = fx;
@@ -900,11 +1304,26 @@ export function createFlightModel(opts = {}) {
         wfx = fx * cosS - fz * sinS;
         wfz = fx * sinS + fz * cosS;
       }
-      const wrx = -wfz; // right = fwd rotated -90 deg about +Y
-      const wrz = wfx;
+      // Project the rolling direction into the tangent plane, then take
+      // right = forward x normal. Level ground gives (-wfz, 0, wfx), the same
+      // vector the world-frame code used.
+      let wfy = 0;
+      const dotFN = wfx * normX + wfz * normZ;
+      wfx -= normX * dotFN;
+      wfy = -normY * dotFN;
+      wfz -= normZ * dotFN;
+      const wfLen = Math.sqrt(wfx * wfx + wfy * wfy + wfz * wfz);
+      if (wfLen > 1e-6) {
+        wfx /= wfLen;
+        wfy /= wfLen;
+        wfz /= wfLen;
+      }
+      const wrx = wfy * normZ - wfz * normY;
+      const wry = wfz * normX - wfx * normZ;
+      const wrz = wfx * normY - wfy * normX;
 
-      const vLong = _vPoint.x * wfx + _vPoint.z * wfz;
-      const vLat = _vPoint.x * wrx + _vPoint.z * wrz;
+      const vLong = _vPoint.x * wfx + _vPoint.y * wfy + _vPoint.z * wfz;
+      const vLat = _vPoint.x * wrx + _vPoint.y * wry + _vPoint.z * wrz;
 
       const muLong = cp.brake ? cp.muRoll + (MU_BRAKE - cp.muRoll) * brake : cp.muRoll;
       // tanh, not sign(): a discontinuity at zero slip velocity chatters at
@@ -913,13 +1332,19 @@ export function createFlightModel(opts = {}) {
       const fLong = -muLong * fn * Math.tanh(vLong / cp.vRefLong);
       const fLat = -cp.muSide * fn * Math.tanh(vLat / cp.vRefSide);
 
-      _fContact.set(wfx * fLong + wrx * fLat, fn, wfz * fLong + wrz * fLat);
+      _fContact.set(
+        normX * fn + wfx * fLong + wrx * fLat,
+        normY * fn + wfy * fLong + wry * fLat,
+        normZ * fn + wfz * fLong + wrz * fLat,
+      );
       _fGround.add(_fContact);
       _cross.crossVectors(_rWorld, _fContact);
       _tGround.add(_cross);
     }
 
     state.gearCompressionM = compressionTotal;
+    state.gearStrokeMaxM = strokeMax;
+    state.gearBottomed = bottomedAny;
     const onGround = normalTotal > 0.02 * WEIGHT;
     state.onGround = onGround;
 
@@ -936,6 +1361,39 @@ export function createFlightModel(opts = {}) {
     _accel.copy(_fWorld).multiplyScalar(1 / MASS);
     _bodyUp.set(0, 1, 0).applyQuaternion(state.orientation);
     state.loadFactor = _accel.dot(_bodyUp) / GRAVITY;
+
+    // --- did any of that break the aeroplane? ------------------------------
+    if (CRASH_ON) {
+      // 1. The gear. A bottomed leg on its own is NOT a crash: an LOD
+      //    refinement can raise the ground under a PARKED aeroplane, and the
+      //    honest answer to that is to let the stop take the load, not to write
+      //    the aircraft off. What decides it is the speed INTO THE SURFACE at
+      //    the moment the stop is reached — which is sink rate on a runway and
+      //    almost all of the airspeed on a cliff face.
+      if (bottomedAny && worstClosing > CRASH_CLOSING_MS) {
+        triggerCrash(
+          'gear',
+          `gear collapsed — ${worstClosing.toFixed(1)} m/s into ` +
+            `${state.terrainSlopeDeg.toFixed(0)}° terrain`,
+          worstClosing,
+          gh,
+        );
+        return;
+      }
+      // 2. The airframe. Ultimate load, either sign. Backstop for every impact
+      //    the gear test does not catch: a wingtip-first arrival, a wall taken
+      //    at an angle where no single leg bottoms but the aeroplane stops.
+      if (Math.abs(state.loadFactor) > CRASH_LOAD_G) {
+        triggerCrash(
+          'overstress',
+          `airframe overload — ${state.loadFactor.toFixed(1)} g` +
+            (deepest > 0 ? ' on impact' : ''),
+          worstClosing,
+          gh,
+        );
+        return;
+      }
+    }
 
     // --- gravity, then linear integration ---------------------------------
     _fWorld.y -= WEIGHT;
@@ -967,12 +1425,56 @@ export function createFlightModel(opts = {}) {
     state.orientation.multiply(_dq).normalize();
 
     // --- last-resort containment ------------------------------------------
-    // A terrain LOD pop or a teleport can put the datum below the surface. Do
-    // not try to solve that with springs; just place it back on the wheels.
+    // The datum has ended up well below the surface. There are exactly two
+    // ways that happens and they deserve opposite answers.
+    //
+    // This block used to give one answer to both: set y to the surface and
+    // clear the sink rate. Measured consequence — level at 119 kt into a 500 m
+    // wall lifted the aeroplane 498 m in a single frame, kept all 119 kt, and
+    // left onGround false. That is not containment, it is a lift to the top of
+    // the mountain, and it is why terrain was not solid.
+    //
+    //   at speed   the aeroplane got there by flying into something. It is a
+    //              crash. It stops where it is. No altitude is granted.
+    //   at rest    the GROUND moved (an LOD refinement, a bake reload). The
+    //              aeroplane did nothing wrong; put it on its wheels. Bounded
+    //              by WRECK_SETTLE_MAX_M's sibling logic: at < 3 m/s there is
+    //              no energy to gift.
     const floor = gh - GEAR_H - 4;
     if (state.position.y < floor) {
+      const speed = state.velocity.length();
+      if (CRASH_ON && speed > CONTAINMENT_SAFE_MS) {
+        triggerCrash(
+          'terrain',
+          `terrain impact — ${(floor - state.position.y).toFixed(0)} m below the surface at ` +
+            `${(speed * MS_TO_KTS).toFixed(0)} kt`,
+          speed,
+          gh,
+        );
+        return;
+      }
       state.position.y = gh + GEAR_H - STATIC_SQUAT;
       if (state.velocity.y < 0) state.velocity.y = 0;
+    }
+
+    // --- Vne is not decorative --------------------------------------------
+    // Advisory below the break so the HUD can shout; structural above it.
+    const iasMs = V * Math.sqrt(sigma);
+    state.overspeed = iasMs > VNE_MS;
+    if (iasMs > VNE_MS * OVERSPEED_BREAK) {
+      overspeedTime += h;
+      if (CRASH_ON && overspeedTime > 0.5) {
+        triggerCrash(
+          'overspeed',
+          `structural failure — ${(iasMs * MS_TO_KTS).toFixed(0)} KIAS past a ` +
+            `${(VNE_MS * MS_TO_KTS).toFixed(0)} kt Vne`,
+          iasMs,
+          gh,
+        );
+        return;
+      }
+    } else {
+      overspeedTime = 0;
     }
 
     // --- stall, from angle of attack, with hysteresis ----------------------
@@ -1109,6 +1611,19 @@ export function createFlightModel(opts = {}) {
     state.separation = 0;
     state.loadFactor = 1;
     state.onGround = agl <= 0;
+    // reset() is the ONLY thing that clears a crash. Nothing in step() ever
+    // un-crashes the aeroplane, which is what makes `crashed` a latch rather
+    // than a flicker the HUD has to debounce.
+    state.crashed = false;
+    state.crashReason = '';
+    state.crashDetail = '';
+    state.impactSpeedMs = 0;
+    state.impactLoadFactor = 0;
+    state.overspeed = false;
+    state.gearBottomed = false;
+    state.gearStrokeMaxM = 0;
+    overspeedTime = 0;
+    pendingValid = false;
     state.rpm = cfg.idleRpm;
     state.thrustN = 0;
     state.gearCompressionM = 0;
@@ -1127,6 +1642,8 @@ export function createFlightModel(opts = {}) {
     state.brakes = 0;
     accumulator = 0;
     lastGround = ground;
+    flattenContactGround(ground);
+    sampleGroundNormal(_local.x, _local.z, ground);
     refreshDisplay(ground);
   }
 
@@ -1138,13 +1655,23 @@ export function createFlightModel(opts = {}) {
    * @param {{pitch:number, roll:number, yaw:number, throttle:number, flaps:number, brakes:number}} inputs
    *                    pitch/roll/yaw are -1..+1, throttle/flaps/brakes are 0..1.
    * @param {number} groundHeight Terrain elevation in METRES at the aircraft's
-   *                    current (x, z). Pass terrain.getHeightAt(x, z).
+   *                    current (x, z). Pass terrain.getHeightAt(x, z). This is
+   *                    the REFERENCE sample; the model takes further samples of
+   *                    its own through `groundHeightFn` (which must be the same
+   *                    sampler) for the four wheels and the surface normal.
+   *                    A one-frame spike here is filtered out — see
+   *                    acceptGround() — so a DEM void cannot teleport anything.
    * @returns {Object} The same `state` object, for convenience.
    */
   function step(dt, inputs, groundHeight = 0) {
     const frame = clamp(Number.isFinite(dt) ? dt : 0, 0, 0.1);
-    const gh = Number.isFinite(groundHeight) ? groundHeight : lastGround;
+    // The caller's sample, filtered. A cliff survives this; a one-frame DEM
+    // void does not. See acceptGround().
+    const gh = acceptGround(groundHeight, frame);
     lastGround = gh;
+    // The surface has an ORIENTATION, and everything downstream that has to
+    // tell a landing from a collision needs it. Four extra samples per frame.
+    sampleGroundNormal(state.position.x, state.position.z, gh);
 
     // Read inputs field by field — spreading into a fresh object would
     // allocate every frame (MODULES.md §1.8).
