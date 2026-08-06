@@ -9,14 +9,16 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "node scripts/check-contract.mjs",
-    "check:all": "npm run check && npm run check:aircraft && npm run check:instruments && npm run envelope",
+    "check:all": "npm run check && npm run check:landcover && npm run check:aircraft && npm run check:instruments && npm run envelope",
     "check:aircraft": "node scripts/check-aircraft.mjs",
     "check:instruments": "node scripts/check-instruments.mjs",
     "envelope": "node scripts/flight-envelope.mjs",
-    "bake":"npm run bake:dem && npm run bake:airports && npm run bake:landmarks",
+    "bake": "npm run bake:dem && npm run bake:airports && npm run bake:landmarks && npm run bake:landcover",
     "bake:dem": "node scripts/bake-dem.mjs",
     "bake:airports": "node scripts/bake-airports.mjs",
-    "bake:landmarks": "node scripts/bake-landmarks.mjs"
+    "bake:landmarks": "node scripts/bake-landmarks.mjs",
+    "check:landcover": "node scripts/check-landcover.mjs",
+    "bake:landcover": "node scripts/bake-landcover.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"

@@ -1185,6 +1185,116 @@ const BLOCK_SIZE_M = 71;
  * @returns {THREE.InstancedMesh|null} One draw call for the whole skyline, or
  *   null if nothing could be placed (no DEM, or every cell was water).
  */
+/**
+ * The city-mass material: one Lambert, one draw call, and a procedural facade.
+ *
+ * WHY A SHADER AND NOT THE WINDOW TEXTURE. The named towers each get their own
+ * material so `repeat` can be set from their real metres (see glassMaterial).
+ * The filler blocks cannot: they are ONE InstancedMesh with one material and
+ * ~600 different sizes, so a single UV repeat would stretch a 4 m storey into a
+ * 30 m one on the tall blocks. Deriving the storey line from WORLD Y instead
+ * makes every block agree about where the floors are — which is also true of a
+ * real city, where the floor lines of adjacent buildings roughly line up.
+ *
+ * The three parts that matter, in order of how much they change the picture:
+ *   1. Roofs are dark. Untextured white boxes lit from above are lightest
+ *      exactly where a real city is darkest (tar, gravel, plant rooms), and
+ *      that inversion is most of why a box city reads as sugar cubes.
+ *   2. Storey banding at 3.6 m, with vertical bays at 2.4 m. This is what
+ *      gives the mass a scale reference; without it a 40 m block and a 140 m
+ *      block look the same from any distance.
+ *   3. A parapet line and a darkened ground floor, so the top and bottom of
+ *      each block are not the same as its middle.
+ *
+ * All of it fades out past ~2.5 km, where a 2.4 m bay is sub-pixel and would
+ * only alias into moiré.
+ */
+function makeCityFacadeMaterial() {
+  const m = lambert(0xffffff);
+  m.name = 'downtown-facade';
+
+  m.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        /* glsl */ `
+        #include <common>
+        varying vec3 vCityWorld;
+        varying vec3 vCityNormal;
+        varying vec3 vCityLocal;
+        `,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        /* glsl */ `
+        #include <begin_vertex>
+        #ifdef USE_INSTANCING
+          vCityWorld = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+          vCityNormal = normalize(mat3(modelMatrix) * mat3(instanceMatrix) * objectNormal);
+          // The box is a unit cube, so position.y is exactly -0.5..0.5 of this
+          // block's own height whatever it was scaled to. That is the only way
+          // to find a parapet or a ground floor without a per-instance uniform.
+          vCityLocal = position;
+        #else
+          vCityWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          vCityNormal = normalize(mat3(modelMatrix) * objectNormal);
+          vCityLocal = position;
+        #endif
+        `,
+      );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        /* glsl */ `
+        #include <common>
+        varying vec3 vCityWorld;
+        varying vec3 vCityNormal;
+        varying vec3 vCityLocal;
+        `,
+      )
+      .replace('#include <map_fragment>', CITY_FACADE_GLSL);
+  };
+
+  // Otherwise three may hand this material a program compiled for some other
+  // MeshLambertMaterial with the same defines.
+  m.customProgramCacheKey = () => 'ken-downtown-facade';
+  return m;
+}
+
+const CITY_FACADE_GLSL = /* glsl */ `
+{
+  vec3 n = normalize(vCityNormal);
+  float roof = smoothstep(0.62, 0.86, abs(n.y));
+  float fade = 1.0 - smoothstep(700.0, 2600.0, distance(vCityWorld, cameraPosition));
+
+  // Which horizontal axis runs across this face.
+  float across = mix(vCityWorld.x, vCityWorld.z, step(abs(n.z), abs(n.x)));
+
+  // 3.6 m storeys, 2.4 m structural bays. Windows occupy the upper part of
+  // each storey and most of each bay; the rest is spandrel and mullion.
+  float storey = fract(vCityWorld.y * (1.0 / 3.6));
+  float bay = fract(across * (1.0 / 2.4));
+  float glazed = smoothstep(0.20, 0.30, storey) * (1.0 - smoothstep(0.80, 0.90, storey))
+               * smoothstep(0.14, 0.24, bay) * (1.0 - smoothstep(0.80, 0.90, bay));
+  float win = glazed * (1.0 - roof) * fade;
+
+  // Parapet: the top ~1.5% of the block, and the ground floor, read differently
+  // from the shaft on any real building.
+  float parapet = smoothstep(0.470, 0.492, vCityLocal.y) * (1.0 - roof) * fade;
+  float plinth = (1.0 - smoothstep(-0.470, -0.435, vCityLocal.y)) * (1.0 - roof) * fade;
+
+  vec3 c = diffuseColor.rgb;
+  // Glass: darker and bluer than its spandrel.
+  c = mix(c, c * vec3(0.56, 0.66, 0.83), win * 0.55);
+  // Roofs: tar, gravel and plant. Never the brightest face on the building.
+  c = mix(c, c * vec3(0.40, 0.41, 0.43), roof);
+  c = mix(c, c * 1.14, parapet);
+  c = mix(c, c * 0.70, plinth);
+  diffuseColor.rgb = c;
+}
+`;
+
 export function buildDowntownMass(opts = {}) {
   const exclude = opts.exclude ?? [];
   const rand = mulberry32(opts.seed ?? 0x5ea77e);
@@ -1255,7 +1365,7 @@ export function buildDowntownMass(opts = {}) {
 
   const mesh = new THREE.InstancedMesh(
     new THREE.BoxGeometry(1, 1, 1),
-    mat('cityMass', () => lambert(0xffffff)),
+    mat('cityMass', makeCityFacadeMaterial),
     placements.length,
   );
   mesh.name = 'downtown-mass';
@@ -1281,10 +1391,22 @@ export function buildDowntownMass(opts = {}) {
     t3.updateMatrix();
     mesh.setMatrixAt(i, t3.matrix);
 
-    // Concrete through glass, biased darker with height, so tall ones read as
-    // towers and short ones as warehouses.
-    const v = 0.52 + 0.3 * p.r - Math.min(0.22, p.h / 900);
-    col.setRGB(v * 0.97, v * 0.99, v * 1.05);
+    // Three material families, not one grey ramp. A real downtown block is
+    // green-tinted curtain wall next to warm precast next to dark 1970s glass,
+    // and the fastest way to make a city read as a set of identical sugar
+    // cubes — which is exactly what an A/B picks out — is to give every block
+    // the same hue and vary only its brightness. Tall blocks lean toward glass
+    // and short ones toward masonry, which is how the real stock sorts itself.
+    const v = 0.50 + 0.30 * p.r - Math.min(0.20, p.h / 900);
+    const glassBias = Math.min(1, p.h / 120);
+    const fam = (p.r * 3.7 + glassBias) % 1;
+    if (fam < 0.42) {
+      col.setRGB(v * 0.80, v * 0.93, v * 1.00); // green-blue curtain wall
+    } else if (fam < 0.74) {
+      col.setRGB(v * 1.06, v * 1.01, v * 0.92); // warm precast concrete
+    } else {
+      col.setRGB(v * 0.72, v * 0.74, v * 0.82); // dark glass / dark stone
+    }
     mesh.setColorAt(i, col);
   }
   mesh.instanceMatrix.needsUpdate = true;

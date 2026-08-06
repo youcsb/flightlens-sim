@@ -93,6 +93,7 @@ import {
   WATER_LEVEL_M,
 } from '../geo/elevation.js';
 import { REGION_BBOX, llToLocal } from '../geo/coords.js';
+import { loadLandcover } from '../geo/landcover.js';
 import { clamp } from '../core/units.js';
 
 /**
@@ -112,6 +113,10 @@ import { clamp } from '../core/units.js';
  *           the terrain a lie. Exposed only for debugging.
  * @property {number} [seaLevelM]    Water plane height. Default SEA_LEVEL_M (0).
  * @property {boolean} [water]       Build the sea + lake surfaces. Default true.
+ * @property {boolean} [landcover]   Load the baked NLCD land-cover rasters and
+ *           let them drive surface albedo. Default true. With it off (or with
+ *           nothing baked) the surface falls back to the elevation-and-slope
+ *           palette, which paints every lowland the same green.
  * @property {number} [lodQuality]   Multiplies LOD_K. >1 = more triangles, sharper
  *           silhouettes, more draw calls. Default 1.
  * @property {number} [originX] @property {number} [originY] @property {number} [originZ]
@@ -131,6 +136,7 @@ const DEFAULTS = {
   exaggeration: 1,
   seaLevelM: SEA_LEVEL_M,
   water: true,
+  landcover: true,
   lodQuality: 1,
   originX: 0,
   originY: 400,
@@ -376,6 +382,17 @@ export async function createTerrain(scene, opts = {}) {
   // -------------------------------------------------------------------------
   // 1. DEM
   // -------------------------------------------------------------------------
+  // The land-cover rasters are two independent HTTP fetches with no dependency
+  // on the DEM, so they stream alongside it rather than after it. §1.6: a
+  // failure here resolves to null and the surface falls back to elevation
+  // bands — it must never stop the ground from existing.
+  const landcoverPromise = cfg.landcover
+    ? loadLandcover().catch((err) => {
+        console.warn('[terrain] land cover failed to load:', err);
+        return null;
+      })
+    : Promise.resolve(null);
+
   if (cfg.loadDem) {
     await loadRegion(cfg.bbox, cfg.zoom);
     if (cfg.detail) {
@@ -384,6 +401,7 @@ export async function createTerrain(scene, opts = {}) {
       await loadRegion(DETAIL_BBOX, DETAIL_ZOOM);
     }
   }
+  const landcover = await landcoverPromise;
   const tDem = performance.now();
 
   const group = new THREE.Group();
@@ -399,7 +417,7 @@ export async function createTerrain(scene, opts = {}) {
   // 2. Region height + shore-distance field
   // -------------------------------------------------------------------------
   const regionRect = computeRegionRect(cfg.bbox);
-  const field = buildRegionField(regionRect, cfg.seaLevelM);
+  const field = buildRegionField(regionRect, cfg.seaLevelM, landcover);
   const tField = performance.now();
 
   // Where the DEM actually has something to say. Outside it every layer misses
@@ -425,7 +443,7 @@ export async function createTerrain(scene, opts = {}) {
   // -------------------------------------------------------------------------
   // 4. Materials
   // -------------------------------------------------------------------------
-  const terrainMat = makeTerrainMaterial(lodK, exag);
+  const terrainMat = makeTerrainMaterial(lodK, exag, landcover, fieldTexture, regionRect);
   const seaMat = cfg.water
     ? makeWaterMaterial(fieldTexture, regionRect, cfg.seaLevelM, false)
     : null;
@@ -634,6 +652,7 @@ export async function createTerrain(scene, opts = {}) {
     seaGeo?.dispose();
     lakeGeo?.dispose();
     fieldTexture?.dispose();
+    landcover?.dispose();
     group.clear();
     group.removeFromParent();
   }
@@ -1056,12 +1075,40 @@ function buildNodeGeometry(node, sharedIndex, exag) {
  * its tone mapping working without this module reimplementing any of it. The
  * cost is that the injection points must match three's chunk names exactly.
  */
-function makeTerrainMaterial(lodK, exag) {
+function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
+  const lcRegion = landcover?.region ?? null;
+  const lcDetail = landcover?.detail ?? null;
+  // A land-cover layer with no texture bound is not a "disabled" uniform, it is
+  // a sampler reading unit 0. So presence is a COMPILE-TIME fact: the branches
+  // below are generated, not switched, and customProgramCacheKey carries the
+  // shape so three cannot hand us a program built for a different one.
+  const lcShape = `${lcRegion ? 'r' : ''}${lcDetail ? 'd' : ''}` || 'none';
+
   const uniforms = {
     uMorphK: { value: lodK },
     uNoiseOrigin: { value: new THREE.Vector2() },
     uExag: { value: exag },
+    uField: { value: fieldTexture },
+    uFieldRect: {
+      value: new THREE.Vector4(
+        rect.xMin,
+        rect.zMin,
+        1 / (rect.xMax - rect.xMin),
+        1 / (rect.zMax - rect.zMin),
+      ),
+    },
   };
+  if (lcRegion) {
+    uniforms.uLcRegion = { value: lcRegion.texture };
+    uniforms.uLcRegionRect = { value: lcRegion.rect };
+    uniforms.uLcRegionTexel = { value: lcRegion.texelM };
+  }
+  if (lcDetail) {
+    uniforms.uLcDetail = { value: lcDetail.texture };
+    uniforms.uLcDetailRect = { value: lcDetail.rect };
+    uniforms.uLcDetailTexel = { value: lcDetail.texelM };
+  }
+  if (landcover) uniforms.uLcPalette = { value: landcover.palette };
 
   const mat = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -1122,14 +1169,20 @@ function makeTerrainMaterial(lodK, exag) {
         /* glsl */ `
         #include <common>
         uniform vec2 uNoiseOrigin;
+        uniform sampler2D uField;
+        uniform vec4 uFieldRect;
+        ${lcRegion ? 'uniform sampler2D uLcRegion; uniform vec4 uLcRegionRect; uniform vec2 uLcRegionTexel;' : ''}
+        ${lcDetail ? 'uniform sampler2D uLcDetail; uniform vec4 uLcDetailRect; uniform vec2 uLcDetailTexel;' : ''}
+        ${landcover ? 'uniform sampler2D uLcPalette;' : ''}
         varying vec3 vTerrWorld;
         varying vec3 vTerrNormal;
         varying float vTerrSurfaceY;
         float tRoughOut;
         ${GLSL_NOISE}
+        ${landcoverFetchGlsl(lcRegion, lcDetail)}
         `,
       )
-      .replace('#include <map_fragment>', TERRAIN_COLOUR_GLSL)
+      .replace('#include <map_fragment>', terrainColourGlsl(lcRegion, lcDetail))
       .replace(
         '#include <roughnessmap_fragment>',
         'float roughnessFactor = tRoughOut;',
@@ -1139,28 +1192,270 @@ function makeTerrainMaterial(lodK, exag) {
   // Without this three can hand us the program it compiled for some other
   // MeshStandardMaterial with the same defines — the cache key is built from
   // parameters, not from shader source.
-  mat.customProgramCacheKey = () => 'ken-terrain-surface';
+  mat.customProgramCacheKey = () => `ken-terrain-surface-${lcShape}`;
 
   return mat;
 }
 
 /**
- * The surface itself. Bands are real Cascade elevations; everything else is
- * plausible-looking noise.
+ * The surface itself: real land cover where we have it, real elevation and
+ * slope everywhere, procedural detail on top of both.
  *
- * Two things here are load-bearing rather than decorative:
+ * ---------------------------------------------------------------------------
+ * THREE THINGS HERE ARE LOAD-BEARING RATHER THAN DECORATIVE
+ * ---------------------------------------------------------------------------
  *
- *  - The high-frequency octaves fade IN as the camera approaches (700 m and
- *    12 km cutoffs). That is the whole answer to GeoFS going mushy on short
- *    final: there is always another octave, and it costs nothing at altitude
- *    because it is switched off there and would only alias anyway.
+ *  1. LAND COVER DECIDES THE ALBEDO BELOW THE TREELINE. Height and slope cannot
+ *     tell downtown Seattle from the Kent Valley farms from Discovery Park —
+ *     all three are flat and near sea level — so before geo/landcover.js every
+ *     lowland in the region came out the same green. That single fact is what
+ *     made the world read as a toy from 600 m. NLCD 2021 at 30 m says which is
+ *     which, and this shader paints what it is told.
  *
- *  - The slope a snowfield tolerates RISES with elevation. A fixed slope cutoff
- *    either strips Rainier bare (its flanks average 30 degrees) or paints
- *    vertical rock white. The ramp from 0.85 at 1,700 m to 2.3 above 4,000 m is
- *    what produces a glaciated cone with rock ribs through it.
+ *     Above the treeline it is the other way round: land cover at 30 m has
+ *     nothing useful to say about a 45-degree rock rib, so slope and elevation
+ *     keep the last word up there. The one exception is NLCD's perennial
+ *     ice/snow class, which is a survey of where the glaciers actually are and
+ *     therefore beats any snowline guess — it is OR-ed into `snowy`.
+ *
+ *  2. THE HIGH-FREQUENCY LAYERS FADE IN AS THE CAMERA APPROACHES. That is the
+ *     whole answer to a photo drape going mushy on short final: a 1 m/px
+ *     satellite image has no information left at 50 m AGL, whereas there is
+ *     always another octave here and it costs nothing at altitude because it is
+ *     switched off there and would only alias anyway. The near-field STRUCTURE
+ *     (street grid, field parcels, canopy mottle) is the same idea one level up
+ *     — its spacing is taken from the real thing, ~96 x 128 m for a city block
+ *     and ~300 m for a valley field, so the frequency the eye reads is right
+ *     even though no individual house is.
+ *
+ *  3. THE CLASS LOOKUP IS JITTERED, NOT FILTERED. An index map cannot be
+ *     linearly filtered — halfway between class 6 and class 9 is class 7, which
+ *     would draw a texel of barren rock along every urban/forest edge. So the
+ *     fetch is nearest, and the SAMPLE POINT is displaced by about one texel of
+ *     two-octave noise first. The boundary then follows the noise instead of
+ *     the texel grid, which is both cheaper than a four-tap blend and closer to
+ *     what a real forest edge looks like from the air.
+ *
+ * And the snow rule that was already here and still matters: the slope a
+ * snowfield tolerates RISES with elevation. A fixed cutoff either strips
+ * Rainier bare (its flanks average 30 degrees) or paints vertical rock white.
+ *
+ * @param {Object|null} lcRegion  present when the region raster loaded
+ * @param {Object|null} lcDetail  present when the Seattle inset loaded
  */
-const TERRAIN_COLOUR_GLSL = /* glsl */ `
+/**
+ * `tLcFetch(p, seed)` — one jittered nearest sample of the land-cover rasters,
+ * returned as the raw texel (r = NLCD code/255, g = index/255, b = road/255).
+ *
+ * A function rather than inline code because the colour block calls it TWICE
+ * with different seeds and blends the two albedos. One tap alone gives a
+ * correct but hard-edged mosaic — real class boundaries are gradual, a forest
+ * thins into scrub over a hundred metres — and two decorrelated taps produce
+ * that gradient for the cost of one extra fetch.
+ *
+ * The jitter is computed in TEXEL space (`base / texel`), which is what makes
+ * it scale-invariant: the same expression gives ~1 texel of wobble on the 81 m
+ * region raster and on the 20 m Seattle inset, instead of scrambling one and
+ * barely touching the other.
+ *
+ * With both rasters present the choice between them is DITHERED, not blended:
+ * two class indices cannot be averaged into a third meaningful one, so a
+ * per-fragment hash decides which side of the ~400 m transition band this pixel
+ * takes and the seam dissolves into noise instead of drawing a rectangle around
+ * Seattle.
+ */
+function landcoverFetchGlsl(lcRegion, lcDetail) {
+  if (!lcRegion && !lcDetail) return '';
+
+  const jitter = /* glsl */ `
+    vec2 tp = base / texel + seed;
+    vec2 jit = vec2(tNoise(tp * 0.34) - 0.5, tNoise(tp * 0.34 + vec2(31.7, 12.9)) - 0.5) * 2.2
+             + vec2(tNoise(tp * 1.30) - 0.5, tNoise(tp * 1.30 + vec2(5.3, 47.1)) - 0.5) * 0.9;
+    vec2 p = base + jit * texel;
+  `;
+
+  if (lcRegion && lcDetail) {
+    return /* glsl */ `
+      vec3 tLcFetch(vec2 base, float seed) {
+        vec2 dUv = (base - uLcDetailRect.xy) * uLcDetailRect.zw;
+        float edge = min(min(dUv.x, dUv.y), min(1.0 - dUv.x, 1.0 - dUv.y));
+        float useD = step(tHash21(floor(base * 0.5)) * 0.012, edge);
+        vec2 texel = mix(uLcRegionTexel, uLcDetailTexel, useD);
+        ${jitter}
+        return mix(
+          texture2D(uLcRegion, clamp((p - uLcRegionRect.xy) * uLcRegionRect.zw, 0.0, 1.0)).rgb,
+          texture2D(uLcDetail, clamp((p - uLcDetailRect.xy) * uLcDetailRect.zw, 0.0, 1.0)).rgb,
+          useD);
+      }
+    `;
+  }
+
+  const T = lcRegion ? 'uLcRegion' : 'uLcDetail';
+  return /* glsl */ `
+    vec3 tLcFetch(vec2 base, float seed) {
+      vec2 texel = ${T}Texel;
+      ${jitter}
+      return texture2D(${T}, clamp((p - ${T}Rect.xy) * ${T}Rect.zw, 0.0, 1.0)).rgb;
+    }
+  `;
+}
+
+function terrainColourGlsl(lcRegion, lcDetail) {
+  const hasLc = !!(lcRegion || lcDetail);
+  // Outside the covering raster there is no data, whatever the clamp returns.
+  const coverRect = lcRegion ? 'uLcRegionRect' : 'uLcDetailRect';
+
+  const landcoverBlock = !hasLc
+    ? ''
+    : /* glsl */ `
+  // =======================================================================
+  // Land cover — NLCD 2021, 30 m, baked by scripts/bake-landcover.mjs
+  // =======================================================================
+  vec3 lcRaw = tLcFetch(wp, 0.0);
+  vec3 lcRawB = tLcFetch(wp, 61.7);
+  vec2 lcCoverUv = (wp - ${coverRect}.xy) * ${coverRect}.zw;
+  float lcInside = step(0.0, min(min(lcCoverUv.x, lcCoverUv.y),
+                                 min(1.0 - lcCoverUv.x, 1.0 - lcCoverUv.y)));
+
+  float lcIdx  = floor(lcRaw.g * 255.0 + 0.5);
+  float lcRoad = lcRaw.b;
+  // Index 0 is nodata: open ocean and anything outside the CONUS raster.
+  float lcOn = lcInside * step(0.5, lcIdx);
+
+  float lcU = (lcIdx + 0.5) * (1.0 / 16.0);
+  vec3 lcAlbedo = tSrgb(texture2D(uLcPalette, vec2(lcU, 0.25)).rgb);
+  vec4 lcParam  = texture2D(uLcPalette, vec2(lcU, 0.75));
+  float lcRough  = lcParam.r;
+  float lcAmt    = lcParam.g;
+  float lcForm   = lcParam.b * 2.0;   // 0 organic, 1 parcel, 2 street
+  float lcCanopy = lcParam.a;         // how much of a developed class is trees
+
+  float lcIsWater = step(0.5, lcIdx) * (1.0 - step(1.5, lcIdx));
+  float lcIsIce   = step(1.5, lcIdx) * (1.0 - step(2.5, lcIdx));
+  float lcIsDev   = step(2.5, lcIdx) * (1.0 - step(6.5, lcIdx));
+  float lcIsTree  = step(7.5, lcIdx) * (1.0 - step(10.5, lcIdx));
+
+  // --- near-field structure ----------------------------------------------
+  // All three patterns are built from wp, not lp: lp is quantised to 32 m and
+  // a grid evaluated against it would jump a third of a block every time the
+  // camera crossed a quantum. Only the noise octaves may use lp (see
+  // GLSL_NOISE), and the canopy octaves below use frequencies that divide 32
+  // exactly for that reason.
+  float lcAng = (tNoise(wp * (1.0 / 6000.0)) - 0.5) * 0.5;
+  float lcCa = cos(lcAng), lcSa = sin(lcAng);
+  vec2 rp = vec2(lcCa * wp.x - lcSa * wp.y, lcSa * wp.x + lcCa * wp.y);
+
+  // Street grid. A Seattle block is roughly 73 x 98 m of lots inside a 96 x
+  // 128 m street-centre pitch, which is what these numbers are.
+  float fadeBlock = 1.0 - smoothstep(2200.0, 7000.0, camDist);
+  vec2 bc = rp * vec2(1.0 / 96.0, 1.0 / 128.0);
+  vec2 bf = abs(fract(bc) - 0.5);
+  float street = smoothstep(0.452, 0.492, max(bf.x, bf.y)) * fadeBlock;
+  float blockId = tHash21(floor(bc) + 0.13);
+  vec2 lc2 = rp * vec2(1.0 / 24.0, 1.0 / 26.0);
+  float lotId = tHash21(floor(lc2) + 3.1);
+  float fadeLot = 1.0 - smoothstep(600.0, 2000.0, camDist);
+  // Lot boundaries: fences, driveways, the gap between two roofs. Only inside
+  // 250 m, where they are several pixels across and are the thing that keeps
+  // the ground from going smooth as you descend.
+  // Masked per cell, so only some boundaries draw. An unmasked lattice reads
+  // as a tiled floor — the regularity is the tell, not the spacing.
+  vec2 lf = abs(fract(lc2) - 0.5);
+  float lotEdge = smoothstep(0.42, 0.495, max(lf.x, lf.y))
+                * step(0.42, tHash21(floor(lc2) * 2.7 + 11.3))
+                * (1.0 - smoothstep(150.0, 500.0, camDist));
+  // Block-scale variation is deliberately weak and lot-scale strong: the other
+  // way round turns a city into a chessboard of 96 m squares, which is exactly
+  // what the eye picks out as procedural.
+  float urbanV = ((blockId - 0.5) * 0.14 + (lotId - 0.5) * 0.52 * fadeLot
+                  - lotEdge * 0.14) * fadeBlock;
+
+  // Field parcels. Kent/Snoqualmie valley fields run 250-400 m on a side.
+  vec2 fc = rp * vec2(1.0 / 300.0, 1.0 / 380.0);
+  float fieldId = tHash21(floor(fc) + 1.7);
+  float fieldEdge = smoothstep(0.455, 0.497, max(abs(fract(fc.x) - 0.5), abs(fract(fc.y) - 0.5)));
+  float fadeRow = 1.0 - smoothstep(250.0, 900.0, camDist);
+  float rowPhase = mix(rp.x, rp.y, step(0.5, fieldId)) * (1.0 / 7.5);
+  float rows = abs(fract(rowPhase) - 0.5) * 2.0;
+  float parcelV = (fieldId - 0.5) * 0.62 + (rows - 0.5) * 0.34 * fadeRow - fieldEdge * 0.16;
+
+  // Canopy. 1/16 and 1/4 divide the 32 m noise quantum exactly.
+  float standId = tNoise(wp * (1.0 / 220.0));
+  float fadeCanopy = 1.0 - smoothstep(350.0, 1800.0, camDist);
+  float canopy = tNoise(lp * (1.0 / 16.0)) * 0.6 + tNoise(lp * 0.25) * 0.4;
+  float organicV = (standId - 0.5) * 0.55 + (canopy - 0.5) * 0.9 * fadeCanopy;
+
+  float wStreet  = smoothstep(1.25, 1.75, lcForm);
+  float wParcel  = smoothstep(0.25, 0.75, lcForm) * (1.0 - wStreet);
+  float wOrganic = 1.0 - smoothstep(0.25, 0.75, lcForm);
+
+  float lcVar = (wOrganic * organicV + wParcel * parcelV + wStreet * urbanV) * lcAmt;
+
+  // The second tap only softens the ALBEDO. Structure, roughness and the
+  // canopy fraction all follow tap A, so a boundary blends in colour without
+  // half-drawing two different street grids on top of each other.
+  float lcU2 = (floor(lcRawB.g * 255.0 + 0.5) + 0.5) * (1.0 / 16.0);
+  vec3 lcAlbedoB = tSrgb(texture2D(uLcPalette, vec2(lcU2, 0.25)).rgb);
+  vec3 lcBase = mix(lcAlbedo, lcAlbedoB, 0.34);
+
+  // grain carries the octaves that only exist near the camera (32 m, 8 m and
+  // 4 m). Weighting it this hard is the point of the whole file: below ~500 m
+  // this is the term that keeps producing new detail, where a 1 m/px photo
+  // drape has already run out of source.
+  vec3 lcCol = lcBase * (1.0 + lcVar * 0.58 + grain * 0.60 * lcAmt);
+  // Stand-age hue drift: some conifer stands read yellow-brown, and a forest
+  // that is one flat hue is the other half of why procedural ground looks fake.
+  lcCol *= mix(vec3(1.0), vec3(1.09, 1.0, 0.84),
+               wOrganic * lcIsTree * clamp((standId - 0.52) * 2.0, 0.0, 1.0) * 0.55);
+
+  // Street trees and back gardens. Without this, everything NLCD calls
+  // developed comes out pavement-coloured, and Wallingford from 300 m looks
+  // like a car park instead of the tree canopy with roofs in it that it is.
+  vec3 cUrbanTree = tSrgb(vec3(0.145, 0.215, 0.125));
+  float treeFrac = lcCanopy * smoothstep(0.30, 0.82, canopy * 0.5 + lotId * 0.5) * (1.0 - street * 0.8);
+  lcCol = mix(lcCol, cUrbanTree * (0.85 + 0.35 * standId), treeFrac);
+
+  vec3 asphalt = tSrgb(vec3(0.118, 0.118, 0.124));
+  lcCol = mix(lcCol, asphalt * (0.95 + 0.6 * blockId), wStreet * street * 0.38);
+
+  // Real centrelines: TIGER/Line primary (Interstates, 255) and secondary
+  // (US and state highways, 160). The mask is one texel wide by construction —
+  // 20 m on the Seattle inset, which is about a carriageway — so it is
+  // darkened rather than drawn as a hairline that would alias into dashes.
+  float road = smoothstep(0.25, 0.80, lcRoad);
+  lcCol = mix(lcCol, asphalt * 1.5, road * 0.55);
+
+  col = mix(col, lcCol, lcOn);
+  `;
+
+  const lcOverrides = !hasLc
+    ? ''
+    : /* glsl */ `
+  // A wooded bluff and a city hillside are steep but not bare, and the survey
+  // knows they are wooded; only trust the slope test where nothing is growing.
+  rocky *= 1.0 - lcOn * (lcIsDev + lcIsTree) * 0.75;
+  rocky *= 1.0 - lcOn * lcIsWater;
+  `;
+
+  const lcSnow = !hasLc
+    ? ''
+    : /* glsl */ `
+  // NLCD's perennial ice/snow class is a survey of where the glaciers are, so
+  // it beats the snowline estimate; and nothing is ever snow on open water.
+  snowy = max(snowy, lcOn * lcIsIce);
+  snowy *= 1.0 - lcOn * lcIsWater;
+  `;
+
+  const lcRough = !hasLc
+    ? 'tRoughOut = 0.95;'
+    : 'tRoughOut = mix(0.95, lcRough, lcOn);';
+
+  const lcFinalTint = !hasLc
+    ? 'col *= 0.90 + 0.20 * nMacro + grain * 0.10;'
+    : // With real classes doing the work, the old macro wash only muddies them.
+      'col *= mix(0.90 + 0.20 * nMacro + grain * 0.10, 0.955 + 0.09 * nMacro + grain * 0.06, lcOn);';
+
+  return /* glsl */ `
 {
   float h = vTerrSurfaceY;
   vec3 nw = normalize(vTerrNormal);
@@ -1182,8 +1477,32 @@ const TERRAIN_COLOUR_GLSL = /* glsl */ `
 
   float grain = (nPatch - 0.5) * 0.20 + (nMicro - 0.5) * 0.30 + (nUltra - 0.5) * 0.26;
 
-  vec3 cSeabed  = tSrgb(vec3(0.10, 0.16, 0.20));
-  vec3 cSilt    = tSrgb(vec3(0.28, 0.30, 0.27));
+  // Metres to the nearest land: 0 on land, > 0 over water. Same RG field the
+  // sea shader reads, and the only thing on the terrain side that knows the
+  // difference between a beach and the bed of Elliott Bay.
+  float tShore = texture2D(uField, clamp((wp - uFieldRect.xy) * uFieldRect.zw, 0.0, 1.0)).g;
+
+  // THE SEABED IN OPEN WATER IS NOT DRAWN AT ALL, and this is the fix for the
+  // hard-edged patches that used to sit in the middle of Elliott Bay.
+  //
+  // They were never a colour bug. §1.4 accepts that the drawn mesh is a
+  // DISCRETISATION of the elevation field and can deviate from it between
+  // vertices; measured here by raycast, coarse nodes over the Sound draw the
+  // bed at +2.4 to +6.8 m where the field says -1.2 to +0.9. The sea plane sits
+  // at +0.25, so those bulges came through it — as tan when the bed was painted
+  // sand, as dark once it was painted seabed. Raising the sea plane to clear
+  // them would flood every beach in the region by six metres, and clamping the
+  // vertices does nothing because the error is BETWEEN them.
+  //
+  // So the bulges are discarded instead. Only well offshore (the field's
+  // metres-to-land, so a beach, a pier and a shoal are all untouched) and only
+  // below 12 m, so an island the 165 m field missed still draws. What is behind
+  // is the sea plane, which is opaque out there by construction — see
+  // WATER_COLOUR_GLSL. getHeightAt is not involved and does not change.
+  if (tShore > 180.0 && h < 12.0) discard;
+
+  vec3 cSeabed  = tSrgb(vec3(0.075, 0.115, 0.140));
+  vec3 cSilt    = tSrgb(vec3(0.20, 0.23, 0.22));
   vec3 cSand    = tSrgb(vec3(0.66, 0.61, 0.48));
   vec3 cLowland = tSrgb(vec3(0.34, 0.43, 0.24));
   vec3 cForestD = tSrgb(vec3(0.15, 0.24, 0.14));
@@ -1197,22 +1516,37 @@ const TERRAIN_COLOUR_GLSL = /* glsl */ `
   // --- elevation bands, low to high -------------------------------------
   vec3 col = cSeabed;
   col = mix(col, cSilt, smoothstep(-24.0, -3.0, h));
-  col = mix(col, cSand, smoothstep(-2.5, 0.9, h));
+
+  // A BEACH IS A NARROW STRIP, and this is where the tan patches in the middle
+  // of Elliott Bay came from. Terrarium reads a flat exact zero right across
+  // the main basin, so an elevation test alone paints the whole bed the colour
+  // of sand — and the water above it is not fully opaque, so it showed through
+  // as hard-edged khaki blobs sitting in open water. Gate it on distance to
+  // land instead: sand within a couple of hundred metres of a coast, seabed
+  // beyond it. Land texels have tShore == 0 and are unaffected.
+  // The band that is still DRAWN under water is only 0..180 m wide (past that
+  // it is discarded below), so the beach ramp stays sandy across the whole of
+  // it. Ramping to seabed inside the visible strip drew a dark outline around
+  // every coastline.
+  float beach = 1.0 - smoothstep(130.0, 330.0, tShore);
+  col = mix(col, cSand, smoothstep(-2.5, 0.9, h) * beach);
+  col = mix(col, cSeabed, (1.0 - beach) * (1.0 - smoothstep(0.9, 6.0, h)));
 
   // Puget Sound is temperate rainforest: the lowland green is dark and
   // desaturated, not meadow green, and it goes darker with altitude.
   vec3 forest = mix(cForestD, cForestL, clamp(nPatch * 0.8 + nMeso * 0.4 + grain, 0.0, 1.0));
-  col = mix(col, cLowland, smoothstep(0.8, 7.0, h));
+  col = mix(col, cLowland, smoothstep(0.8, 7.0, h) * beach);
   col = mix(col, forest, smoothstep(15.0, 130.0, h) * (0.62 + 0.38 * nMacro));
   col = mix(col, cForestD, smoothstep(200.0, 700.0, h) * 0.55);
 
   float treeline = 1620.0 + (nMeso - 0.5) * 300.0 + (nPatch - 0.5) * 90.0;
   col = mix(col, cSubalp, smoothstep(treeline - 320.0, treeline + 140.0, h));
-
+${landcoverBlock}
   // --- slope: bare rock wherever the ground is too steep to hold anything -
   vec3 rock = mix(cRockD, cRockL, clamp(nMeso * 0.7 + nPatch * 0.4 + grain * 1.2, 0.0, 1.0));
   float rocky = smoothstep(0.62, 1.10, slope + grain * 0.30);
   rocky *= smoothstep(0.4, 5.0, h);
+${lcOverrides}
   col = mix(col, rock, rocky);
 
   // --- snow and ice ------------------------------------------------------
@@ -1224,20 +1558,22 @@ const TERRAIN_COLOUR_GLSL = /* glsl */ `
   snowy *= 1.0 - smoothstep(snowSlopeMax * 0.72, snowSlopeMax, slope + grain * 0.25);
   // Permanent ice cap: above 2,800 m only a near-vertical face stays bare.
   snowy = max(snowy, smoothstep(2750.0, 3150.0, h) * (1.0 - smoothstep(1.85, 2.60, slope)));
-
+${lcSnow}
   vec3 snowCol = mix(cSnow, cIce, smoothstep(2500.0, 3700.0, h) * 0.6);
   snowCol *= 0.93 + grain * 0.14;
   snowy = clamp(snowy, 0.0, 1.0);
   col = mix(col, snowCol, snowy);
 
-  col *= 0.90 + 0.20 * nMacro + grain * 0.10;
+  ${lcFinalTint}
 
-  tRoughOut = mix(0.95, 0.58, snowy);
+  ${lcRough}
+  tRoughOut = mix(tRoughOut, 0.58, snowy);
   tRoughOut = mix(tRoughOut, 0.86, rocky * 0.7);
 
   diffuseColor.rgb *= col;
 }
 `;
+}
 
 // ===========================================================================
 // Water
@@ -1422,15 +1758,20 @@ const WATER_COLOUR_GLSL = /* glsl */ `
   // Subtle large-scale variation so the open water is not a flat colour field.
   base *= 0.94 + 0.12 * tNoise(wp * (1.0 / 3000.0));
 
-  // Grazing-angle sky reflection, from the FLAT normal so it does not flicker
-  // with the wave noise. The perturbed normal drives the sun glint instead.
+  // Grazing-angle sky reflection. Taken from a normal that is MOSTLY flat but
+  // carries part of the wave slope: from the flat normal alone the reflection
+  // is a single uniform value across the whole basin, which is what made the
+  // Sound read as a sheet of milk rather than as water. Damping the wave
+  // contribution to 45% keeps the swell visible in the reflection without the
+  // per-pixel flicker that the full normal produces at range.
   vec3 toEye = normalize(cameraPosition - vWaterWorld);
-  float f = pow(1.0 - clamp(toEye.y, 0.0, 1.0), 5.0);
+  vec3 fresNormal = normalize(mix(vec3(0.0, 1.0, 0.0), wWaveNormal, 0.45));
+  float f = pow(1.0 - clamp(dot(toEye, fresNormal), 0.0, 1.0), 5.0);
   wFresnelOut = clamp(0.02 + 0.98 * f, 0.0, 1.0) * 0.75;
 
   // Surf. The shore field is ~165 m per texel, so the band is broad by
   // construction; heavy noise modulation keeps it from reading as a contour.
-  float surf = 1.0 - smoothstep(20.0, 340.0, shore);
+  float surf = 1.0 - smoothstep(15.0, 150.0, shore);
   float churn = tNoise(lp * (1.0 / 24.0) + vec2(uTime * 0.05, uTime * 0.03));
   churn = churn * 0.6 + tNoise(lp * (1.0 / 6.0) - vec2(uTime * 0.11, 0.0)) * 0.4;
   wFoamOut = surf * smoothstep(0.44, 0.80, churn) * (1.0 - uLake * 0.65);
@@ -1439,7 +1780,12 @@ const WATER_COLOUR_GLSL = /* glsl */ `
   diffuseColor.rgb = base;
   // Shallow water is see-through; open water is not. Grazing angles close it up.
   float clarity = 1.0 - smoothstep(0.0, 3.5, depth);
-  diffuseColor.a = clamp(mix(0.94, 0.55, clarity * (1.0 - deepness)) + f * 0.35 + wFoamOut * 0.4, 0.0, 1.0);
+  float a = clamp(mix(0.94, 0.55, clarity * (1.0 - deepness)) + f * 0.35 + wFoamOut * 0.4, 0.0, 1.0);
+  // Beyond a few hundred metres from land the Sound is flatly opaque — it is
+  // glacial-silt saltwater, you cannot see the bed through it from the air, and
+  // this is also what makes it safe for the terrain shader to discard the
+  // seabed out there rather than fight the sea plane for the depth buffer.
+  diffuseColor.a = mix(a, 1.0, smoothstep(180.0, 520.0, shore));
 }
 `;
 
@@ -1484,14 +1830,51 @@ function computeDemRect(bbox, marginM) {
   };
 }
 
-function buildRegionField(rect, seaLevelM) {
+/**
+ * Heights, a water mask and (later) distance to shore, over the whole region.
+ *
+ * THE WATER MASK IS NOT PURELY AN ELEVATION TEST, and that is the important
+ * part. Terrarium's bed under Puget Sound is nominally a flat exact zero, but
+ * void repair and source noise leave broad patches reading +1 to +5 m —
+ * measured by raycast at up to +6.8 m of drawn surface in the middle of Elliott
+ * Bay. `height <= 0.5` therefore scattered phantom islands across open water,
+ * and everything downstream inherited them: shore distance collapsed to nearly
+ * zero around each one, so the deep-water gradient painted rings of pale
+ * shallows in mid-channel, the beach band painted them sand, and the seabed
+ * discard in the surface shader could not fire. That is the whole family of
+ * "hard-edged patches sitting in Elliott Bay".
+ *
+ * NLCD's open-water class is a survey of where the water is and has no such
+ * holes, so it is OR-ed in wherever the raster covers. The elevation test stays
+ * as the fallback: outside the raster (open ocean west of the region, British
+ * Columbia) it is all we have.
+ */
+function buildRegionField(rect, seaLevelM, landcover) {
   const n = FIELD_N;
   const dx = (rect.xMax - rect.xMin) / (n - 1);
   const dz = (rect.zMax - rect.zMin) / (n - 1);
   const height = fillHeightGrid(rect.xMin, rect.zMin, dx, dz, n, n);
   const water = new Uint8Array(n * n);
-  for (let i = 0; i < n * n; i++) {
-    water[i] = height[i] <= seaLevelM + WATER_LEVEL_M ? 1 : 0;
+  const surveyed = landcover?.isOpenWaterLocal ?? null;
+  let fromSurvey = 0;
+  for (let j = 0; j < n; j++) {
+    const z = rect.zMin + j * dz;
+    for (let i = 0; i < n; i++) {
+      const k = j * n + i;
+      const byHeight = height[k] <= seaLevelM + WATER_LEVEL_M;
+      let w = byHeight;
+      if (!w && surveyed && surveyed(rect.xMin + i * dx, z)) {
+        w = true;
+        fromSurvey++;
+      }
+      water[k] = w ? 1 : 0;
+    }
+  }
+  if (fromSurvey > 0) {
+    console.info(
+      `[terrain] water mask: ${fromSurvey} of ${n * n} cells are water in the ` +
+        'land-cover survey but above sea level in the DEM (Terrarium void repair)',
+    );
   }
   return { n, dx, dz, rect, height, water, shore: new Float32Array(n * n) };
 }

@@ -103,10 +103,22 @@ sampler.
 ### 1.5 Geographic truth vs. procedural texture
 
 Real: terrain **shape**, airport **positions**, runway **headings and lengths**,
-landmark **coordinates**, the coastline (from the DEM's sea-level data).
+landmark **coordinates**, the coastline (from the DEM's sea-level data), and
+**land cover** — which square metres are water, forest, farmland or city, from
+NLCD 2021 at 30 m, plus TIGER/Line road centrelines.
 
 Procedural: **surface colour**, materials, vegetation, buildings that are not
 named landmarks.
+
+A land-cover **classification** is on the real side of that line and imagery is
+not, and the distinction is worth stating precisely: NLCD is fifteen integers
+per texel saying what kind of ground this is, from a published survey. It is not
+a picture and it carries no photographic detail — the shader still invents every
+pixel it draws. It just stops guessing. That matters because height and slope
+**cannot** separate downtown Seattle from the Kent Valley farms from Discovery
+Park: all three are flat and near sea level, so before this data every lowland
+in the region came out the same green, which is the single loudest way the world
+read as a toy from 600 m.
 
 We deliberately do not stream satellite imagery. Draped imagery is exactly what
 makes GeoFS turn to mush below ~500 ft AGL — there is no more texture detail to
@@ -391,6 +403,7 @@ opts = {
   seaLevelM = SEA_LEVEL_M,
   detail = true,         // load the z13 Seattle inset as a second layer
   water = true,          // draw the sea plane and the freshwater lake quads
+  landcover = true,      // load the baked NLCD rasters and let them drive albedo
   lodQuality = 1,        // scales the CDLOD screen-error budget
   originX = 0,           // where to build the first full chunk set, local
   originY = 400,         //   metres. The default is already correct because
@@ -408,15 +421,70 @@ ground-clearance floor reads real terrain rather than the root node.
 **`createTerrain` is `async`** — it awaits the DEM so the first rendered frame
 already has real ground under the aircraft. It returns `group`, not `mesh`.
 
-Colour is procedural, banded by real elevation and real slope, with the treeline
-and snow line at real Cascade heights. Steep faces go to rock regardless of
-elevation — that is what makes Rainier read as a mountain rather than a green
-cone.
+Colour is procedural, but it is **told what it is painting**. Below the treeline
+the albedo comes from `geo/landcover.js` (§2.14): class index in, palette colour
+plus a near-field structure out. Above it, elevation and slope keep the last
+word, because a 30 m classification has nothing useful to say about a 45° rock
+rib — with one exception, NLCD's perennial ice/snow class, which is a survey of
+where the glaciers are and beats any snowline estimate. Steep faces still go to
+rock regardless of elevation; that is what makes Rainier read as a mountain
+rather than a green cone.
+
+Where no raster covers the ground (open ocean, British Columbia) the material
+falls back to the elevation-and-slope palette it had before, so the world is
+never blank — §1.6.
 
 **Freshwater lakes** need a flat-region heuristic: Terrarium encodes lake
 surfaces as perfectly flat areas at their true elevation (Lake Washington ≈ 5 m,
 Lake Union ≈ 5 m). Detect near-zero slope over a run of samples at a plausible
 lake elevation. Do not use `isWater()` for this; it only finds sea level.
+
+**The water mask is not a pure elevation test, and this is not optional.**
+Terrarium's bed under Puget Sound is nominally a flat exact zero, but void
+repair and source noise leave broad patches reading +1 to +5 m — measured by
+raycast at up to +6.8 m of *drawn* surface in mid Elliott Bay. `height <= 0.5`
+therefore scatters phantom islands across open water, and everything downstream
+inherits them: shore distance collapses around each one, the deep/shallow
+gradient paints rings of pale shallows in mid-channel, and the seabed shows
+through the sea plane as hard-edged patches. `buildRegionField` ORs in NLCD's
+open-water class wherever the raster covers, and keeps the elevation test as the
+fallback outside it.
+
+Consequently the surface shader **discards** fragments more than 180 m offshore
+and below 12 m. This does not touch §1.4: `getHeightAt` still returns exactly
+`getElevationLocal`, and §1.4 already accepts that the drawn mesh deviates from
+the field between vertices. The sea is opaque out there by construction, so
+there is nothing to see behind it.
+
+### 2.14 `src/geo/landcover.js` — what is on the ground
+
+```js
+loadLandcover() -> Promise<{
+  region, detail,             // {texture, rect, texelM, width, height, data} | null
+  palette,                    // 16x2 RGBA DataTexture: albedo / (rough, detail, form, canopy)
+  classAtLocal(x, z) -> idx,  // -1 where no raster covers
+  isOpenWaterLocal(x, z) -> boolean,
+  manifest, dispose()
+} | null>                     // null when nothing is baked
+```
+
+Two layers, same arrangement as the DEM: `region` at ~81 m/texel over the whole
+bbox, `detail` at ~20 m/texel over the Seattle inset. Encoding is documented in
+the file header and in `public/landcover/manifest.json`; the short version is
+`R` = NLCD code (provenance), `G` = compact class index (what the shader
+indexes), `B` = road mask.
+
+Three properties of the textures are load-bearing: `colorSpace = NoColorSpace`
+(an sRGB curve applied to a class *index* turns class 9 into class 2),
+`NearestFilter` with no mipmaps (linear filtering an index map invents a texel
+of barren rock along every boundary — the shader dissolves the grid with a
+noise-jittered lookup instead), and `flipY = false` so image row 0 is north.
+
+Verified by `npm run check:landcover`, which asserts the class at places whose
+answer is known independently — Rainier's summit is ice, mid Elliott Bay is
+water, the Space Needle stands in high-intensity development. That is the only
+defence against a georeferencing error, which otherwise renders beautifully and
+puts the forest where the city is.
 
 ### 2.8 `src/world/sky.js` — atmosphere and all lighting
 
@@ -661,6 +729,7 @@ source. Summary:
 | `public/dem/{z}/{x}/{y}.png` + `manifest.json` | `bake-dem.mjs` | `geo/elevation.js` |
 | `public/data/airports.json` | `bake-airports.mjs` | `geo/airports.js` |
 | `public/data/landmarks.json` | `bake-landmarks.mjs` | `geo/landmarks.js` |
+| `public/landcover/{region,detail}.png` + `manifest.json` | `bake-landcover.mjs` | `geo/landcover.js` |
 
 `npm run bake` is **not** part of `npm run build` — baking hits the network and
 takes minutes; the build stays fast and offline.

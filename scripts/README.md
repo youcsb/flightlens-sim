@@ -6,10 +6,11 @@ and committed to `public/`. Nothing hits a third-party API at runtime.
 ```bash
 export PATH="$HOME/.local/node/bin:$PATH"   # node v24 is not on the default PATH
 
-npm run bake              # all three, in order
+npm run bake              # all four, in order
 npm run bake:dem          # elevation tiles  -> public/dem/
 npm run bake:airports     # airports+runways -> public/data/airports.json
 npm run bake:landmarks    # landmarks        -> public/data/landmarks.json
+npm run bake:landcover    # NLCD + roads     -> public/landcover/
 ```
 
 `npm run bake` is **not** wired into `npm run build`. Baking touches the network
@@ -23,7 +24,8 @@ needs refreshing, commit the output, move on.
 | AWS Terrarium DEM | **No CORS header.** The browser can display those PNGs but cannot `getImageData()` them — the canvas is tainted and throws `SecurityError`. Since we need the pixel values *as elevation*, they are unusable client-side. No workaround exists. |
 | OurAirports | CORS is fine, but the CSV is 13 MB and we use 0.3% of it. |
 | Wikidata | CORS is fine, but the query needs curated Q-IDs and careful filtering (see below); doing that per page load is slow and fragile. |
-| Overpass / OSM | **Returned 504 on probe. Treat as unreliable. Do not build a dependency on it.** |
+| Overpass / OSM | **Returned 504 on probe, twice, months apart. Treat as unreliable. Do not build a dependency on it.** Roads come from the Census Bureau's TIGERweb instead, which answered every request. |
+| NLCD via MRLC WMS | Returns the STYLED raster, not raw class values, so the baker maps each pixel back to its class by nearest legend colour. Fine — the palette is ~16 widely separated colours and the response is palette-indexed, so the match is exact. |
 
 The bake also means the sim runs offline and works as a static build.
 
@@ -50,6 +52,10 @@ public/
   data/
     airports.json          { generated, source, bbox, airports:[...] }
     landmarks.json         { generated, source, landmarks:[...] }
+  landcover/
+    manifest.json          { generated, sources, encoding, classes, layers:[...] }
+    region.png             RGB8 DATA, not a picture: R = NLCD class code,
+    detail.png               G = compact class index, B = road mask
 ```
 
 ## What was verified, so you don't re-derive it

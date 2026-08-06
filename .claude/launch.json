@@ -11,6 +11,18 @@
         "--strictPort"
       ],
       "port": 5173
+    },
+    {
+      "name": "flight-sim-preview-8931",
+      "runtimeExecutable": "/Users/KenAltmann/.local/node/bin/node",
+      "runtimeArgs": [
+        "node_modules/vite/bin/vite.js",
+        "preview",
+        "--port",
+        "8931",
+        "--strictPort"
+      ],
+      "port": 8931
     }
   ]
 }

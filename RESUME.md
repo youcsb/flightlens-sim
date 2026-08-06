@@ -6,7 +6,8 @@ Integrated and flying. Last updated **2026-08-06**.
 
 ThreeJS flight simulator over **real Puget Sound geography**, judged by blind A/B
 against **GeoFS**. Real terrain shape, real airport positions, real landmark
-coordinates — procedural surface colour, no satellite imagery.
+coordinates, **real land cover** — procedural surface colour, no satellite
+imagery.
 
 ## Reaching the bar (GeoFS)
 
@@ -19,7 +20,7 @@ coordinates — procedural surface colour, no satellite imagery.
 ```bash
 export PATH="$HOME/.local/node/bin:$PATH"   # node v24.19.0, NOT on default PATH
 npm run dev        # http://localhost:5173
-npm run check:all  # 231 assertions across four harnesses
+npm run check:all  # 279 assertions across five harnesses
 ```
 
 No Homebrew. Vite + three already installed — do **not** run `npm install`.
@@ -30,7 +31,8 @@ No Homebrew. Vite + three already installed — do **not** run `npm install`.
 |---|---|
 | `npm run build` | green |
 | `scripts/check-contract.mjs` | 36 assertions, green |
-| `scripts/flight-envelope.mjs` | 74 assertions, green |
+| `scripts/check-landcover.mjs` | 21 assertions, green |
+| `scripts/flight-envelope.mjs` | 101 assertions, green |
 | `scripts/check-instruments.mjs` | 58 assertions, green |
 | `scripts/check-aircraft.mjs` | 63 assertions, green |
 | Renders, flies, stalls, lands | verified in a browser |
@@ -52,6 +54,22 @@ No Homebrew. Vite + three already installed — do **not** run `npm install`.
   recover it; releasing the stick recovers cleanly.
 - **Landing** 54 kt, wings level, 212 m rollout, resting 11 cm into the gear
   springs — i.e. the wheels sit exactly on the drawn surface.
+- **Land cover** renders from NLCD 2021 at 81 m (region) and 20 m (Seattle
+  inset). Checked by rendering to a `WebGLRenderTarget` and reading the pixels
+  back — the browser pane serves a stale composite otherwise. Frames judged:
+  450 m over Elliott Bay, 280 m and 600 m over downtown, 300 m over Ballard,
+  120 m beside the KBFI ramp, 18 m on the 32L threshold, 1,800 m looking at
+  Rainier. The Kent Valley industrial corridor, Discovery Park, the Duwamish
+  flats and the Cascade forest are now four visibly different surfaces; before
+  this pass they were one colour. Full frame render 1–5 ms at 1000×562 with 620
+  terrain nodes drawn.
+- **Mount Rainier from 1,800 m** now reads as a white cone, not a grey nub —
+  NLCD's perennial ice/snow class is OR-ed into the snow term.
+- **The tan patches in Elliott Bay are gone**, and they were never a colour bug.
+  Raycast measurement: coarse LOD nodes draw the bed at +2.4 to +6.8 m where the
+  elevation field says −1.2 to +0.9, and the sea plane sits at +0.25. See
+  MODULES.md §2.7 for the two-part fix (survey-corrected water mask, plus a
+  discard offshore) and why neither touches §1.4.
 
 ## Known open issue — RESOLVED, and the original diagnosis was wrong
 
@@ -80,15 +98,19 @@ confused the magnetic designator for a true heading. Changing it would introduce
 
 1. **Downtown buildings are procedural blocks.** The skyline cluster, the city
    footprint and the stadiums are in the right places; individual buildings are
-   not real. Permitted by §1.5, but it is the weakest thing in a low pass over
-   the city and the most likely place to lose a blind A/B.
+   not real. Permitted by §1.5. They now carry a procedural facade — storey
+   banding at 3.6 m, structural bays at 2.4 m, dark roofs, parapet and plinth,
+   and three material families instead of one grey ramp — so they no longer read
+   as untextured sugar cubes, but the FOOTPRINTS are still invented.
 2. **KSEA 16R/34L rides a 12.9 m hump.** Its 2004–08 embankment is not in the
    DEM. The deck now bends to stay flush rather than breaking in half, but the
    ground under it is still wrong. The real fix is elevation data, not geometry.
 3. **The windscreen still reads slightly milky** from inside after the
    opacity/reflection reduction; the remainder is the clearcoat sheen.
 4. **No shadows.** A 144 km world needs cascaded shadow maps; nothing casts.
-5. **No GeoFS A/B has been run.** Out of scope for this pass.
+5. **A GeoFS A/B has been run** (see the critique this pass answered). Ours won
+   runway markings and instrument craft; it lost sky/atmosphere, aircraft model,
+   cockpit interior, shadows, and airport surroundings. Those are all still open.
 6. `elevation.js` reports `minElevationM = −497.8` — one void sitting just inside
    the −500 m plausibility band survived repair.
 7. `bake-landmarks.mjs` has Mount Si at 47.5076/−121.7400; the summit is ~2.4 km
