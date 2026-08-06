@@ -223,7 +223,8 @@ DETAIL_BBOX    // {south:47.35, north:47.75, west:-122.5, east:-122.1}
 
 loadRegion(bbox?, zoom?) -> Promise<void>   // ADDITIVE, call once per level
 isLoaded() -> boolean
-getRegionStats() -> {loaded, layers, tilesLoaded, tilesMissing, minElevationM, maxElevationM}
+getRegionStats() -> {loaded, layers, tilesLoaded, tilesMissing, voidsRepaired,
+                     minElevationM, maxElevationM}
 
 getElevation(lat, lon) -> metres MSL        // bilinear, never NaN, never throws
 getElevationLocal(x, z) -> metres MSL       // allocation-free
@@ -246,6 +247,20 @@ space, not per-tile, which is what stops the terrain showing a grid of creases.
 **`getElevation` is total.** Outside the region, before loading, on bad input:
 returns `SEA_LEVEL_M`. It is called every physics step and must never be able
 to trip over a gap in the data.
+
+**The source has voids, and they are repaired at decode.** Terrarium ships
+scattered holes: 3,652 pixels across our 378 baked tiles, including a -14,492 m
+spike near Hood Canal, a -497 m scanline in the tideflats at 47.4880/-122.3660,
+and a 78-pixel blob reading -2,437 m at 47.3828/-122.3897 — on the KSEA
+approach. Untreated, each is a kilometres-deep needle through the terrain mesh
+and a garbage `altitudeAglFt` for anything flying over it.
+
+`loadTile()` therefore screens every pixel on two independent tests — an
+absolute plausibility band, and deviation from the 8-neighbour median (150 m,
+measured to sit above the steepest real Cascade terrain at both zooms) — then
+neighbour-fills whatever fails. `voidsRepaired` reports the count. Do not add
+flood-fill propagation between pixels: it is redundant against the band test
+and it walks up steep faces. See the note in `elevation.js`.
 
 **Water.** `isWater()` finds *salt* water only. Terrarium gives freshwater lakes
 their real surface elevation — Lake Washington reads ~5 m, not 0 — so lakes need

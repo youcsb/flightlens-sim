@@ -1,10 +1,10 @@
 /**
  * bake-dem.mjs — download real elevation tiles into public/dem/.
  *
- * STATUS: SKELETON. The plumbing, argument handling and manifest writer are
- * done. The download loop is marked TODO below.
+ *   node scripts/bake-dem.mjs [--zoom=11] [--skip-detail] [--force]
  *
- *   node scripts/bake-dem.mjs [--zoom=11] [--detail] [--force]
+ * Bakes two levels by default: z=11 over the whole region and a z=13 inset over
+ * Seattle. Re-runs skip anything already on disk, so it is cheap to repeat.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS SCRIPT EXISTS AT ALL
@@ -66,7 +66,7 @@
  *     the inset, and elevation.js prefers the finer one where it exists.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   PUBLIC_DIR,
@@ -81,7 +81,31 @@ import {
 
 const SOURCE = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium';
 
-/** Base level: the whole region, coarse enough to be a sane download. */
+/**
+ * Base level: the whole region.
+ *
+ * WHY 11 AND NOT 12. The choice is a resolution budget, and the budget is
+ * better spent unevenly than uniformly.
+ *
+ *   z=10   72 tiles   104 m/px   Rainier's summit gets ~40 samples across its
+ *                                cone. It reads as a lump, not a mountain.
+ *   z=11  238 tiles    52 m/px   <- BASE. Enough to resolve Rainier's ridges and
+ *                                glacial valleys, the Duwamish valley walls, and
+ *                                a Puget Sound coastline that matches a map.
+ *   z=12  891 tiles    26 m/px   4x the bytes of z=11 for detail that is below
+ *                                one screen pixel at any altitude you would
+ *                                cruise the region at.
+ *
+ * The thing z=11 is genuinely too coarse for is the last 500 ft of an approach,
+ * where 52 m/px is a third of a runway length. But that only matters within a
+ * few km of the airports — so instead of paying z=12 over 40,000 km^2 of
+ * saltwater and Cascade foothills nobody lands on, we pay z=13 (13 m/px) over
+ * the 1,200 km^2 Seattle inset that actually contains KBFI, KSEA and downtown.
+ * ~140 tiles buys 4x the base resolution exactly where the wheels touch.
+ *
+ * elevation.js samples layers finest-first, so the two levels compose with no
+ * seam handling and no caller awareness. Total ~380 tiles.
+ */
 const BASE_ZOOM = 11;
 
 /** Optional detail level over Seattle — see the header for the tile count. */
@@ -93,8 +117,47 @@ const DETAIL_BBOX = {
   east: -122.1,
 };
 
-/** Parallel downloads. S3 tolerates this comfortably; be a good citizen. */
-const CONCURRENCY = 16;
+/**
+ * Parallel downloads. S3 would tolerate far more, but this is somebody else's
+ * free public bucket and a cold bake is only ~380 tiles; 8 sockets finishes in
+ * well under a minute and cannot be mistaken for abuse.
+ */
+const CONCURRENCY = 8;
+
+/** Transient-failure policy: 3 attempts, 400 ms / 800 ms / 1600 ms backoff. */
+const MAX_ATTEMPTS = 3;
+const BACKOFF_MS = 400;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Fetch one tile's bytes, retrying transient failures.
+ *
+ * Distinguishes three outcomes, because conflating them is how a bake quietly
+ * produces a world with holes in it:
+ *   - Buffer  the tile exists and we have it.
+ *   - null    the server says it does not exist (403/404). Terrarium answers
+ *             403 for tiles outside its coverage; that is data, not an error.
+ *   - throw   we could not find out. Never written, never silently skipped.
+ *
+ * @param {string} url
+ * @returns {Promise<Buffer|null>}
+ */
+async function fetchTile(url) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await get(url);
+      return Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      // A definitive "not here" is an answer; do not burn retries on it.
+      if (/HTTP (403|404)\b/.test(err.message)) return null;
+      lastErr = err;
+      if (attempt < MAX_ATTEMPTS) await sleep(BACKOFF_MS * 2 ** (attempt - 1));
+    }
+  }
+  throw lastErr;
+}
 
 /**
  * Download every tile covering `bbox` at `zoom` and return the manifest level.
@@ -117,36 +180,56 @@ async function bakeLevel(bbox, zoom, force) {
     for (let y = range.minY; y <= range.maxY; y++) wanted.push({ x, y });
   }
 
-  // TODO(GeoCore): implement the download loop.
-  //
-  //   await mapLimit(wanted, CONCURRENCY, async ({ x, y }) => {
-  //     const rel = `dem/${zoom}/${x}/${y}.png`;
-  //     if (!force && existsSync(resolve(PUBLIC_DIR, rel))) return rel;
-  //     const res = await get(`${SOURCE}/${zoom}/${x}/${y}.png`);
-  //     await writeBinary(rel, Buffer.from(await res.arrayBuffer()));
-  //     return rel;
-  //   });
-  //
-  // Requirements:
-  //   - Write the response bytes VERBATIM. No sharp, no canvas, no re-encode.
-  //   - A 403/404 is not fatal: some tiles genuinely do not exist. Count them,
-  //     omit them from the manifest, keep going.
-  //   - Retry transient 5xx a couple of times with a short backoff.
-  //   - Log progress every ~50 tiles; a cold z=11 bake takes a minute or two.
-  //   - Return ONLY the tiles actually written, as "x/y" strings.
-  void wanted;
-  void force;
-  void existsSync;
-  void resolve;
-  void PUBLIC_DIR;
-  void get;
-  void writeBinary;
-  void mapLimit;
+  let downloaded = 0;
+  let cached = 0;
+  let absent = 0;
+  let bytes = 0;
+  let done = 0;
 
-  throw new Error(
-    'bake-dem.mjs is a skeleton: the download loop is not implemented yet. ' +
-      'See the TODO in bakeLevel().',
+  const results = await mapLimit(wanted, CONCURRENCY, async ({ x, y }) => {
+    const rel = `dem/${zoom}/${x}/${y}.png`;
+    const abs = resolve(PUBLIC_DIR, rel);
+    const key = `${x}/${y}`;
+
+    let outcome = key;
+
+    if (!force && existsSync(abs)) {
+      // Re-runs are cheap: an existing file is trusted and never re-fetched.
+      // `--force` is the escape hatch if a bake was ever interrupted mid-write.
+      cached++;
+      bytes += statSync(abs).size;
+    } else {
+      // Bytes go to disk VERBATIM. Terrarium carries elevation in the exact
+      // 8-bit RGB triples, so any re-encode — even a "lossless" one that
+      // changes the colour type or adds an alpha channel — corrupts the data.
+      const buf = await fetchTile(`${SOURCE}/${zoom}/${x}/${y}.png`);
+      if (buf === null) {
+        absent++;
+        outcome = null; // genuinely not published; omit from the manifest
+      } else {
+        await writeBinary(rel, buf);
+        downloaded++;
+        bytes += buf.length;
+      }
+    }
+
+    done++;
+    if (done % 50 === 0 || done === wanted.length) {
+      console.log(
+        `    ${done}/${wanted.length}  ` +
+          `(${downloaded} new, ${cached} cached, ${absent} absent, ` +
+          `${(bytes / 1048576).toFixed(1)} MB)`,
+      );
+    }
+    return outcome;
+  });
+
+  const tiles = results.filter((t) => t !== null);
+  console.log(
+    `  z=${zoom}: ${tiles.length} tiles on disk, ${(bytes / 1048576).toFixed(1)} MB`,
   );
+
+  return { zoom, tileSize: 256, bbox, tiles };
 }
 
 async function main() {
@@ -157,16 +240,13 @@ async function main() {
   console.log(`Baking DEM from ${SOURCE}`);
 
   const levels = [];
-  levels.push({
-    tileSize: 256,
-    ...(await bakeLevel(REGION_BBOX, zoom, force)),
-  });
+  levels.push(await bakeLevel(REGION_BBOX, zoom, force));
 
-  if (args.detail) {
-    levels.push({
-      tileSize: 256,
-      ...(await bakeLevel(DETAIL_BBOX, DETAIL_ZOOM, force)),
-    });
+  // The inset is on by default — z=11 alone is too coarse under the wheels on
+  // short final, which is precisely where the user will be looking. Pass
+  // --skip-detail for a quick base-only bake.
+  if (!args['skip-detail']) {
+    levels.push(await bakeLevel(DETAIL_BBOX, DETAIL_ZOOM, force));
   }
 
   await writeJson('dem/manifest.json', {
