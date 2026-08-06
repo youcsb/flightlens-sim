@@ -672,13 +672,18 @@ function buildStadiumBowl(l) {
   const ribR = Math.max(0.8, H * 0.03);
   // The arch is a SHALLOW segment, not a semicircle. See arcThroughChord: a
   // semicircular truss over this span would stand taller than Smith Tower.
-  const rise = H - bowlH;
-
+  //
+  // The rise is measured to the truss's OUTER surface, not its centreline, so
+  // the tube radius comes off the top before the arc is fitted and the circle
+  // centre drops by the same amount. heightM is the top of the structure — the
+  // file's whole contract with landmarks.js — and a torus centred on H stands
+  // ribR proud of it, which is 1.8 m at Lumen Field.
   if (l.roof) {
     // Retractable roof: arches span the SHORT axis, panels roll along the long
     // one. Chord is the stadium's width.
+    const rise = Math.max(1, H - bowlH - ribR);
     const { radius: R, halfAngle: th } = arcThroughChord(B * 1.02, rise);
-    const yc = H - R; // circle centre, so the apex lands on heightM
+    const yc = H - ribR - R; // so the rib's outer surface lands on heightM
 
     // Torus lies in XY; rotate the geometry so the arc is centred on +Y, then
     // rotate the OBJECT about Y to swing the arch onto the short axis. Baking
@@ -708,9 +713,11 @@ function buildStadiumBowl(l) {
   } else {
     // Two great trusses running the LENGTH of the stadium, one over each
     // sideline. Chord is the stadium's length.
+    const archR = ribR * 1.4;
+    const rise = Math.max(1, H - bowlH - archR);
     const { radius: R, halfAngle: th } = arcThroughChord(A * 1.02, rise);
-    const yc = H - R;
-    const archGeo = new THREE.TorusGeometry(R, ribR * 1.4, 6, 32, th * 2);
+    const yc = H - archR - R;
+    const archGeo = new THREE.TorusGeometry(R, archR, 6, 32, th * 2);
     archGeo.rotateZ(Math.PI / 2 - th);
     for (const sz of [-1, 1]) {
       g.add(m(archGeo, matSteel(), 0, yc, sz * B * 0.86));
@@ -843,7 +850,12 @@ function buildSuspensionBridge(l) {
   const sag = SPAN * 0.1;
   const c = SPAN * 0.42; // cosh scale; tuned so the curve is taut, not floppy
   const denom = Math.cosh(SPAN / 2 / c) - 1;
-  const cableAt = (x) => TOWER_H - sag * (1 - (Math.cosh(x / c) - 1) / denom);
+  // The cable's CENTRELINE stops one radius below the tower top, so the top of
+  // the tube — the highest thing on the bridge — lands on heightM rather than
+  // 1.7 m above it. heightM is the tower height above the water.
+  const cableR = Math.max(0.5, TOWER_H * 0.011);
+  const cableTop = TOWER_H - cableR;
+  const cableAt = (x) => cableTop - sag * (1 - (Math.cosh(x / c) - 1) / denom);
 
   const STEPS = 40;
   const pts = [];
@@ -854,7 +866,7 @@ function buildSuspensionBridge(l) {
   const cableGeo = new THREE.TubeGeometry(
     new THREE.CatmullRomCurve3(pts),
     48,
-    Math.max(0.5, TOWER_H * 0.011),
+    cableR,
     6,
     false,
   );
@@ -865,7 +877,7 @@ function buildSuspensionBridge(l) {
     for (const sx of [-1, 1]) {
       g.add(
         strut(
-          new THREE.Vector3(sx * (SPAN / 2), TOWER_H, sz * legOffset),
+          new THREE.Vector3(sx * (SPAN / 2), cableTop, sz * legOffset),
           new THREE.Vector3(sx * (SPAN / 2 + SPAN * 0.28), DECK_Y * 0.5, sz * legOffset),
           TOWER_H * 0.01,
           matBridge(),
@@ -903,16 +915,31 @@ function buildSuspensionBridge(l) {
   return g;
 }
 
-/** West Seattle Bridge — a concrete box girder on tapered piers. */
+/**
+ * West Seattle Bridge — a concrete box girder on tapered piers.
+ *
+ * heightM is the deck height above the water, so the ROAD SURFACE goes at H and
+ * the slab hangs below it. Centring the slab on H instead puts the bridge
+ * 1.8 m over its published clearance.
+ */
 function buildGirderBridge(l) {
   const H = l.heightM || 42;
   const L = l.lengthM || 460;
   const W = l.widthM || 24;
+  const SLAB = 3.6;
   const g = new THREE.Group();
-  g.add(m(new THREE.BoxGeometry(L, 3.6, W), matConcrete(), 0, H, 0));
-  g.add(m(new THREE.BoxGeometry(L * 0.42, 5.5, W * 0.7), matConcrete(), 0, H - 4.2, 0));
+  g.add(m(new THREE.BoxGeometry(L, SLAB, W), matConcrete(), 0, H - SLAB / 2, 0));
+  g.add(m(new THREE.BoxGeometry(L * 0.42, 5.5, W * 0.7), matConcrete(), 0, H - SLAB - 2.4, 0));
   for (const sx of [-1, 1]) {
-    g.add(m(new THREE.CylinderGeometry(W * 0.16, W * 0.22, H, 10), matConcrete(), sx * L * 0.21, H / 2, 0));
+    g.add(
+      m(
+        new THREE.CylinderGeometry(W * 0.16, W * 0.22, H - SLAB, 10),
+        matConcrete(),
+        sx * L * 0.21,
+        (H - SLAB) / 2,
+        0,
+      ),
+    );
   }
   return g;
 }
@@ -925,7 +952,11 @@ function buildGirderBridge(l) {
 function buildFerrisWheel(l) {
   const H = l.heightM || 53.3;
   const R = H * 0.44;
-  const hubY = H - R;
+  const GONDOLA = R * 0.1;
+  // The topmost thing on the wheel is the gondola riding over the crown, not
+  // the rim, so the hub drops by half a gondola. heightM is the top of the
+  // structure; hubY = H - R would put the wheel 1.2 m over its published 53.3.
+  const hubY = H - R - GONDOLA / 2;
   const g = new THREE.Group();
 
   const rimGeo = new THREE.TorusGeometry(R, R * 0.022, 6, 48);
@@ -955,7 +986,7 @@ function buildFerrisWheel(l) {
 
   const NG = 42;
   const gondolas = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(R * 0.1, R * 0.1, R * 0.11),
+    new THREE.BoxGeometry(GONDOLA, GONDOLA, R * 0.11),
     mat('gondola', () => phong(0x2f5a86, 60)),
     NG,
   );

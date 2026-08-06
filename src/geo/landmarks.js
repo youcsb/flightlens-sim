@@ -49,7 +49,7 @@
 
 import * as THREE from 'three';
 import { llToLocal, inBbox, REGION_BBOX, distanceBetween } from './coords.js';
-import { getElevation } from './elevation.js';
+import { getElevation, isLoaded } from './elevation.js';
 import { fetchJsonOrNull } from '../core/assets.js';
 import { buildLandmarkModel, buildDowntownMass } from '../world/landmarkModels.js';
 
@@ -142,9 +142,97 @@ export async function loadLandmarks() {
       }
       return true;
     });
+    verifyLandmarks(landmarks);
     return landmarks;
   })();
   return loadPromise;
+}
+
+/**
+ * How far a `kind:'peak'` may sit from the nearest DEM summit before it is
+ * probably not standing on its own mountain.
+ *
+ * Generous on purpose: Wikidata pins a summit anywhere within its own map
+ * marker, and the base DEM layer is 52 m/px, so a few hundred metres is normal.
+ * 800 m is not — at that distance the label is on a different landform.
+ */
+const PEAK_SNAP_M = 800;
+
+/** Half-width of the summit search, degrees. ~2.2 km, comfortably past the tolerance. */
+const PEAK_SEARCH_DEG = 0.02;
+
+/**
+ * Second-line checks on the baked set. Reports; never mutates, never throws.
+ *
+ * The bbox filter above catches a landmark in the wrong STATE. It cannot catch
+ * a landmark in the wrong PLACE, and for peaks that failure is both easy to
+ * make and invisible: every name in the Cascades is attached to a ridge, a
+ * trailhead, a creek and a lake as well as to a summit, and any of them is
+ * inside the bbox. So peaks get the one test the runtime can actually perform —
+ * a mountain's coordinate should be on or very near a local maximum of the
+ * elevation field, because that is what a mountain is.
+ *
+ * It deliberately does NOT snap the coordinate to the DEM maximum it finds. The
+ * nearest summit is not necessarily the right summit — Mount Si's neighbour
+ * Mount Teneriffe is 136 m taller and 2.5 km away — so snapping would trade a
+ * label that is slightly wrong for one that is confidently wrong. Fix the
+ * coordinate in the baker's curated table, where it can be checked against a
+ * source.
+ *
+ * @param {Landmark[]} list
+ * @returns {{noId: string[], duplicateId: string[], offSummit: string[]}}
+ */
+export function verifyLandmarks(list) {
+  const noId = [];
+  const duplicateId = [];
+  const offSummit = [];
+  const byId = new Map();
+
+  for (const l of list) {
+    if (!l.wikidataId) {
+      noId.push(l.name);
+    } else if (byId.has(l.wikidataId)) {
+      duplicateId.push(`${l.wikidataId} = "${byId.get(l.wikidataId)}" and "${l.name}"`);
+    } else {
+      byId.set(l.wikidataId, l.name);
+    }
+
+    // The DEM is total (returns sea level everywhere before it loads), so
+    // without this guard every peak would look like it was in the ocean.
+    if (l.kind !== 'peak' || !isLoaded()) continue;
+    const here = getElevation(l.lat, l.lon);
+    let best = { h: here, lat: l.lat, lon: l.lon };
+    const step = PEAK_SEARCH_DEG / 10;
+    for (let dLat = -PEAK_SEARCH_DEG; dLat <= PEAK_SEARCH_DEG; dLat += step) {
+      for (let dLon = -PEAK_SEARCH_DEG * 1.5; dLon <= PEAK_SEARCH_DEG * 1.5; dLon += step) {
+        const h = getElevation(l.lat + dLat, l.lon + dLon);
+        if (h > best.h) best = { h, lat: l.lat + dLat, lon: l.lon + dLon };
+      }
+    }
+    const d = distanceBetween(l.lat, l.lon, best.lat, best.lon);
+    if (d > PEAK_SNAP_M) {
+      offSummit.push(
+        `"${l.name}" (${l.wikidataId}) sits at ${here.toFixed(0)} m, but the ` +
+          `nearest summit is ${best.h.toFixed(0)} m, ${(d / 1000).toFixed(2)} km away at ` +
+          `${best.lat.toFixed(4)},${best.lon.toFixed(4)}`,
+      );
+    }
+  }
+
+  if (noId.length) {
+    console.warn(
+      `[landmarks] no Wikidata Q-ID, so nothing checked the identity: ${noId.join(', ')}`,
+    );
+  }
+  if (duplicateId.length) {
+    console.warn(`[landmarks] the same Q-ID twice: ${duplicateId.join('; ')}`);
+  }
+  if (offSummit.length) {
+    console.warn(
+      `[landmarks] peak coordinate is not on a summit — check the Q-ID: ${offSummit.join('; ')}`,
+    );
+  }
+  return { noId, duplicateId, offSummit };
 }
 
 /** The landmarks loaded so far. Empty until loadLandmarks() resolves. */

@@ -45,6 +45,16 @@
  *    those with FAA survey (KSEA is 180.34 true, not 180.000 and not the 175.6
  *    the old scaffold guessed). `geometry` records how each runway was obtained;
  *    'synthesised' means inferred from the runway number and nothing more.
+ * 3. A RUNWAY NUMBER IS MAGNETIC, THE STORED HEADING IS TRUE. Reading "16" as
+ *    160 true is the single most attractive way to get this wrong: the regional
+ *    variation is 15.6 deg EAST, so 16 means 160 magnetic = 175.6 true, and
+ *    KSEA's surveyed 180.34 true (164.7 magnetic) rounds to 16 exactly as it
+ *    should. auditRunwayGeometry() below tests every runway against its own
+ *    designator through that conversion rather than against the raw number.
+ * 4. The rounding trap is NOT limited to KSEA. auditRunwayGeometry() re-tests
+ *    for it at load and DOWNGRADES the provenance tag of any runway whose two
+ *    endpoints are still exactly axis-aligned, because such a pair cannot have
+ *    come off a survey however the baker labelled it.
  *
  * ---------------------------------------------------------------------------
  * HEIGHT: WHY THE RUNWAY IS A PLANE AND NOT A DRAPE
@@ -67,10 +77,11 @@ import {
   bearingBetween,
   distanceBetween,
   headingToVector,
+  MAG_VAR_DEG,
 } from './coords.js';
 import { getElevation, getElevationLocal } from './elevation.js';
 import { fetchJsonOrNull } from '../core/assets.js';
-import { FT_TO_M, clamp } from '../core/units.js';
+import { FT_TO_M, M_TO_FT, clamp } from '../core/units.js';
 
 /**
  * @typedef {Object} Runway
@@ -178,10 +189,118 @@ export async function loadAirports() {
         '[airports] no airport data. Run `npm run bake:airports`. ' +
           'Spawning at the hardcoded KBFI fallback.',
       );
+      return airports;
     }
+    auditRunwayGeometry(airports);
     return airports;
   })();
   return loadPromise;
+}
+
+/**
+ * Endpoints exactly this equal in one axis did not come from a survey.
+ *
+ * A real threshold pair agrees to about 1e-6 deg by luck at best; agreeing to
+ * the last stored digit means the source rounded until the runway was axis
+ * aligned. That is the KSEA trap (all three runways published at exactly
+ * 180.000), and it is not confined to KSEA — 14 more runways in the regional
+ * set carry it, most of them private grass strips the FAA has no polygon for.
+ */
+const AXIS_ALIGNED_EPS_DEG = 0;
+
+/** Length disagreement, endpoints vs the published `lengthFt`, worth a warning. */
+const LENGTH_WARN = 0.02;
+
+/**
+ * How far a true heading may sit from its own designator before we say so.
+ *
+ * Compared in MAGNETIC, because that is what the number means. 5 deg is half a
+ * designator step, so anything inside it rounds to the painted number; the
+ * threshold is set at 12 to leave room for the FAA's own rounding and for
+ * strips renumbered later than the chart we sourced.
+ */
+const DESIGNATOR_WARN_DEG = 12;
+
+/**
+ * Re-check the baked geometry and make the provenance tag tell the truth.
+ *
+ * The baker is the authority on where the numbers came from, but it runs
+ * offline against services that can be down, and `geometry` is a CLAIM — code
+ * elsewhere is entitled to read 'override' as "somebody surveyed this". So the
+ * one failure the runtime can detect on its own, it detects: an exactly
+ * axis-aligned endpoint pair is demoted to 'synthesised' no matter what the
+ * file said, because whatever produced it, it was not a survey.
+ *
+ * Everything else is reported, not modified. Bad data is fixed in the baker;
+ * silently patching coordinates here would put two files out of step and hide
+ * the problem from the next bake.
+ *
+ * Mutates `geometry` in place and never throws (MODULES.md §1.6).
+ *
+ * @param {Airport[]} list
+ * @returns {{demoted:string[], lengthOff:string[], designatorOff:string[]}}
+ */
+export function auditRunwayGeometry(list) {
+  const demoted = [];
+  const lengthOff = [];
+  const designatorOff = [];
+
+  for (const airport of list || []) {
+    for (const rw of airport.runways || []) {
+      if (!Number.isFinite(rw.leLat) || !Number.isFinite(rw.heLat)) continue;
+      const key = `${airport.ident} ${rw.leIdent}/${rw.heIdent}`;
+
+      if (
+        Math.abs(rw.leLon - rw.heLon) <= AXIS_ALIGNED_EPS_DEG ||
+        Math.abs(rw.leLat - rw.heLat) <= AXIS_ALIGNED_EPS_DEG
+      ) {
+        if (rw.geometry !== 'synthesised') {
+          demoted.push(`${key} (${rw.geometry})`);
+          rw.geometry = 'synthesised';
+        }
+      }
+
+      const trueHeading = headingFromEndpoints(rw);
+      const lengthFt = distanceBetween(rw.leLat, rw.leLon, rw.heLat, rw.heLon) * M_TO_FT;
+      if (rw.lengthFt > 0 && Math.abs(lengthFt - rw.lengthFt) / rw.lengthFt > LENGTH_WARN) {
+        lengthOff.push(
+          `${key} ${lengthFt.toFixed(0)} ft between thresholds vs ${rw.lengthFt} published`,
+        );
+      }
+
+      // The designator is MAGNETIC. Water lanes (16W) and lettered ends carry no
+      // number to check against.
+      const digits = /^(\d{1,2})[LCR]?$/.exec(String(rw.leIdent || '').trim());
+      if (digits) {
+        const magnetic = (trueHeading - MAG_VAR_DEG + 360) % 360;
+        const painted = Number(digits[1]) * 10;
+        const off = Math.abs(((magnetic - painted + 540) % 360) - 180);
+        if (off > DESIGNATOR_WARN_DEG) {
+          designatorOff.push(
+            `${key} runs ${trueHeading.toFixed(1)} true = ${magnetic.toFixed(1)} magnetic, ` +
+              `but is numbered ${painted}`,
+          );
+        }
+      }
+    }
+  }
+
+  if (demoted.length) {
+    console.warn(
+      `[airports] ${demoted.length} runway(s) have exactly axis-aligned ` +
+        'endpoints and cannot be survey data; provenance demoted to ' +
+        `'synthesised': ${demoted.join(', ')}`,
+    );
+  }
+  if (lengthOff.length) {
+    console.warn(`[airports] length disagreement >2%: ${lengthOff.join('; ')}`);
+  }
+  if (designatorOff.length) {
+    console.warn(
+      `[airports] heading disagrees with the painted designator: ${designatorOff.join('; ')}`,
+    );
+  }
+  return { demoted, lengthOff, designatorOff };
 }
 
 /** The airports loaded so far. Empty until loadAirports() resolves. */
@@ -350,22 +469,42 @@ const MAX_GRADE = 0.02;
  * Fit a runway deck to the terrain under it.
  *
  * Samples the DEM along the centreline, fits `h = h0 + slope * t` by least
- * squares, clamps the gradient, then measures how far the pavement footprint
- * pokes back up through that plane so the caller knows how much to lift.
+ * squares, then measures how far the pavement footprint pokes back up through
+ * that line so the caller knows how much to lift.
  *
- * A rough fit (RMS residual over ROUGH_RMS_M) means the DEM does not know there
- * is an airport here — a grass strip on a hillside, or a field the 52 m/px base
- * layer smoothed away. In that case the slope is thrown out and the deck is
- * levelled at the median, which is the least-wrong flat answer.
+ * THE ORDER OF THE TWO TESTS MATTERS AND IT IS NOT THE OBVIOUS ONE.
+ *
+ * Straightness is judged against the RAW fit, before the gradient is clamped.
+ * Clamping first and then asking "is the residual big?" conflates two different
+ * failures: ground that is not straight, and ground that is straight but steep.
+ * The second one used to be misdiagnosed as the first, and the consequence was
+ * spectacular — a 185 m strip whose DEM drops 22 m end to end got its slope
+ * thrown away and its deck levelled at the median, so half the ribbon was
+ * buried and the other half hung 22 m in the air.
+ *
+ * So:
+ *   - not straight (raw RMS over ROUGH_RMS_M) -> the DEM has no idea there is
+ *     an airport here. Level at the median; nothing better exists.
+ *   - straight but steeper than MAX_GRADE -> the DEM disagrees with a real
+ *     runway's grade, which usually means a 52 m/px base tile has smoothed a
+ *     graded strip back into the hillside it was cut from. FOLLOW THE DEM. A
+ *     ribbon lying flush on the wrong slope beats a correctly-graded ribbon
+ *     floating 20 m over the ground the aircraft will actually touch
+ *     (MODULES.md §1.4), and the clamp is only ever relaxed by as much as the
+ *     terrain demands.
  *
  * @param {number} ax @param {number} az le end, local metres
  * @param {number} dx @param {number} dz unit vector along the runway
  * @param {number} rx @param {number} rz unit vector across the runway (right)
  * @param {number} lengthM @param {number} widthM
- * @returns {{h0:number, slope:number, lift:number, rms:number}}
+ * @returns {{h0:number, slope:number, lift:number, rms:number, graded:boolean}}
+ *          `graded` is false when the deck had to follow the terrain instead of
+ *          holding a believable runway gradient.
  */
 function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
   const ROUGH_RMS_M = 4;
+  /** End-to-end error the gradient clamp may introduce before we drop it. */
+  const CLAMP_SLACK_M = 3;
   const n = clamp(Math.round(lengthM / 40) + 1, 5, 64);
   const ts = new Array(n);
   const hs = new Array(n);
@@ -387,9 +526,36 @@ function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
     num += dt * (hs[i] - meanH);
     den += dt * dt;
   }
-  let slope = den > 0 ? num / den : 0;
-  slope = clamp(slope, -MAX_GRADE, MAX_GRADE);
-  let h0 = meanH - slope * meanT;
+  const rawSlope = den > 0 ? num / den : 0;
+
+  // Residual of the RAW line — this is the straightness test, and only this.
+  let rawSq = 0;
+  const rawH0 = meanH - rawSlope * meanT;
+  for (let i = 0; i < n; i++) {
+    const r = hs[i] - (rawH0 + rawSlope * ts[i]);
+    rawSq += r * r;
+  }
+  const rawRms = Math.sqrt(rawSq / n);
+
+  let slope;
+  let h0;
+  let graded;
+  if (rawRms > ROUGH_RMS_M) {
+    const sorted = hs.slice().sort((p, q) => p - q);
+    h0 = sorted[sorted.length >> 1];
+    slope = 0;
+    graded = false;
+  } else {
+    slope = clamp(rawSlope, -MAX_GRADE, MAX_GRADE);
+    // Straight ground the clamp would lift the deck off: follow it instead.
+    if (Math.abs(rawSlope - slope) * lengthM > CLAMP_SLACK_M) {
+      slope = rawSlope;
+      graded = false;
+    } else {
+      graded = true;
+    }
+    h0 = meanH - slope * meanT;
+  }
 
   let sq = 0;
   for (let i = 0; i < n; i++) {
@@ -397,12 +563,6 @@ function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
     sq += r * r;
   }
   const rms = Math.sqrt(sq / n);
-
-  if (rms > ROUGH_RMS_M) {
-    const sorted = hs.slice().sort((p, q) => p - q);
-    h0 = sorted[sorted.length >> 1];
-    slope = 0;
-  }
 
   // How far does the ground poke back up through the deck, anywhere under the
   // pavement? Check both edges as well as the centreline: runways on a side
@@ -421,7 +581,7 @@ function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
     }
   }
   const lift = clamp(maxAbove + MIN_LIFT_M, MIN_LIFT_M, MAX_LIFT_M);
-  return { h0, slope, lift, rms };
+  return { h0, slope, lift, rms, graded };
 }
 
 // ---------------------------------------------------------------------------
@@ -579,12 +739,22 @@ function makeLightSprite() {
  * a 256 px cell, and each number quad indexes into it, so all the numbers in
  * the region are still a single draw call. ~40 cells for our 113 runways.
  *
- * Glyphs are drawn stretched to fill their cell; the real-world proportions of a
- * runway number come from the quad it is mapped onto, not from the font.
+ * THE CELL IS NOT THE GLYPH. A "16" set in Helvetica Bold inks about 88% of its
+ * cell's width but only ~57% of its height (cap height, plus the slack left by
+ * centring on the `middle` baseline). Mapping the whole cell onto a quad sized
+ * from AC 150/5340-1 would therefore paint a 60 ft designation as a 34 ft one,
+ * with 60 ft of empty pavement around it — which is exactly what the numbers
+ * measured before this was fixed. So each cell records the glyph's INK BOX, not
+ * its extent, and the quad in paintEnd() is the marking's true size.
+ *
+ * That also lets the quad be the real FAA aspect (tall and narrow) rather than
+ * the font's: the ink is stretched to fill it, so "16" comes out with the
+ * characteristic squeezed strokes of a real runway number instead of looking
+ * like a road sign.
  *
  * @param {Set<string>} glyphs
  * @returns {{texture: THREE.CanvasTexture, cells: Map<string, number[]>}}
- *          cells maps glyph -> [u0, v0, u1, v1].
+ *          cells maps glyph -> [u0, v0, u1, v1] of the drawn ink.
  */
 function buildGlyphAtlas(glyphs) {
   const list = [...glyphs];
@@ -599,6 +769,7 @@ function buildGlyphAtlas(glyphs) {
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
+  const font = (px) => `700 ${px}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
 
   const cells = new Map();
   list.forEach((glyph, i) => {
@@ -606,25 +777,47 @@ function buildGlyphAtlas(glyphs) {
     const row = (i / cols) | 0;
     const x0 = col * CELL;
     const y0 = row * CELL;
+    const cx = x0 + CELL / 2;
+    const cy = y0 + CELL / 2;
 
     // Fit the glyph to the cell with a small margin, measuring rather than
     // guessing so "1" and "34" both fill their box.
     let size = CELL * 0.92;
-    ctx.font = `700 ${size}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+    ctx.font = font(size);
     const w = ctx.measureText(glyph).width;
     const maxW = CELL * 0.88;
     if (w > maxW) {
       size *= maxW / w;
-      ctx.font = `700 ${size}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+      ctx.font = font(size);
     }
-    ctx.fillText(glyph, x0 + CELL / 2, y0 + CELL / 2 + size * 0.02);
+    ctx.fillText(glyph, cx, cy);
+
+    // Ink box, measured from the same anchor the glyph was drawn at.
+    // actualBoundingBox* is positive OUTWARD in all four directions and has
+    // been in every browser we target for years; the fallback is the cap-height
+    // approximation for anything that reports it as undefined, and a canvas
+    // that reports nothing at all (jsdom, a headless check script) still gets a
+    // sane box rather than NaN UVs.
+    const met = ctx.measureText(glyph);
+    const ink = (v, fb) => (Number.isFinite(v) ? v : fb);
+    const left = cx - ink(met.actualBoundingBoxLeft, met.width / 2);
+    const right = cx + ink(met.actualBoundingBoxRight, met.width / 2);
+    const top = cy - ink(met.actualBoundingBoxAscent, size * 0.36);
+    const bottom = cy + ink(met.actualBoundingBoxDescent, size * 0.36);
+
+    // One pixel of bleed so alphaTest does not nibble the outer stroke, clamped
+    // inside the cell so no glyph can sample its neighbour.
+    const L = clamp(left - 1, x0, x0 + CELL);
+    const Rt = clamp(right + 1, x0, x0 + CELL);
+    const T = clamp(top - 1, y0, y0 + CELL);
+    const B = clamp(bottom + 1, y0, y0 + CELL);
 
     // CanvasTexture flips Y, so v = 0 is the BOTTOM row of the image as drawn.
     cells.set(glyph, [
-      x0 / canvas.width,
-      1 - (y0 + CELL) / canvas.height,
-      (x0 + CELL) / canvas.width,
-      1 - y0 / canvas.height,
+      L / canvas.width,
+      1 - B / canvas.height,
+      Rt / canvas.width,
+      1 - T / canvas.height,
     ]);
   });
 
@@ -662,6 +855,22 @@ function thresholdStripeCount(widthM) {
   if (ft >= 75) return 6;
   return 4;
 }
+
+/**
+ * Runway designation marking, AC 150/5340-1M figure 3: a 60 ft numeral 20 ft
+ * wide, numerals 8 ft apart. Kept as feet because that is how the standard is
+ * written and every one of these numbers is checkable against it.
+ */
+const NUMERAL_H_FT = 60;
+const NUMERAL_W_FT = 20;
+const NUMERAL_GAP_FT = 8;
+
+/**
+ * Inner edge of the aiming-point and touchdown-zone bars, feet from the
+ * centreline. The two share it, which is what makes the touchdown zone read as
+ * a ladder running up to the aiming point rather than as scattered rectangles.
+ */
+const TDZ_INNER_FT = 36;
 
 /** Below this length a runway gets a centreline and numbers and nothing else. */
 const FULL_MARKINGS_MIN_M = 900;
@@ -716,22 +925,33 @@ function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
     bar(1.5, 3.3, -half + 0.6, half - 0.6);
   }
 
-  // --- Designation numbers. 60 ft numerals on a full-size runway, with the
-  // parallel-runway letter BELOW them — and "below", for a marking whose top
-  // points down the runway, means between the numerals and the threshold. Things
-  // further from the threshold sit higher in the pilot's view.
+  // --- Designation numbers. AC 150/5340-1 sets the numeral at 60 ft high and
+  // 20 ft wide, with 8 ft between the two numerals — a 48 x 60 ft block, so it
+  // is TALLER than it is wide, which is why a runway number does not look like
+  // a road sign. The parallel-runway letter is the same height and sits BELOW
+  // the numerals; "below", for a marking whose top points down the runway,
+  // means between them and the threshold, because things further from the
+  // threshold sit higher in the pilot's view.
+  //
+  // The quad is the marking's real size and the glyph's ink box is stretched
+  // into it (see buildGlyphAtlas), so what is painted measures 60 ft on the
+  // ground rather than however much of a font cell happened to be inked.
   if (usable >= NUMBERS_MIN_M) {
     const [digits, letter] = designationGlyphs(ident);
-    const numH = clamp(usable * 0.05, 9, 20);
-    const numW = Math.min(numH * 0.62, half * 1.5);
-    let u = full ? 6 + 150 * FT_TO_M + 12 : 8;
+    const numH = clamp(usable * 0.05, 9, NUMERAL_H_FT * FT_TO_M);
+    const scale = numH / (NUMERAL_H_FT * FT_TO_M);
+    let u = full ? 6 + 170 * FT_TO_M : 8;
     if (digits) {
+      const blockW =
+        (digits.length * NUMERAL_W_FT + (digits.length - 1) * NUMERAL_GAP_FT) *
+        FT_TO_M *
+        scale;
+      const numW = Math.min(blockW, half * 1.7) / 2;
       const letterCell = letter ? cellFor(letter) : null;
       if (letterCell) {
-        const lh = numH * 0.8;
-        const lw = numW * 0.5;
-        pushGlyph(numbers, at, u, u + lh, -lw, lw, letterCell);
-        u += lh + numH * 0.18;
+        const lw = Math.min(NUMERAL_W_FT * FT_TO_M * scale, half * 1.2) / 2;
+        pushGlyph(numbers, at, u, u + numH, -lw, lw, letterCell);
+        u += numH + NUMERAL_GAP_FT * FT_TO_M * scale;
       }
       const cell = cellFor(digits);
       if (cell) pushGlyph(numbers, at, u, u + numH, -numW, numW, cell);
@@ -740,21 +960,26 @@ function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
 
   if (!full) return;
 
-  // --- Aiming point: two 150 x 30 ft bars starting 1,000 ft from the threshold.
+  // --- Aiming point: two 150 x 30 ft bars starting 1,000 ft from the threshold,
+  // their inner edges 36 ft each side of the centreline. On anything narrower
+  // than a standard 150 ft runway the pair is squeezed inboard rather than
+  // hanging off the pavement.
+  const inner = Math.min(TDZ_INNER_FT * FT_TO_M, half * 0.55);
   const aimU = 1000 * FT_TO_M;
   if (usable > aimU + 300) {
-    const inner = half * 0.42;
-    const outer = inner + Math.min(half * 0.28, 9);
-    bar(aimU, aimU + 150 * FT_TO_M, inner, outer);
-    bar(aimU, aimU + 150 * FT_TO_M, -outer, -inner);
+    const outer = Math.min(inner + 30 * FT_TO_M, half - 0.9);
+    if (outer > inner + 0.6) {
+      bar(aimU, aimU + 150 * FT_TO_M, inner, outer);
+      bar(aimU, aimU + 150 * FT_TO_M, -outer, -inner);
+    }
   }
 
-  // --- Touchdown zone. Groups of bars at 500 ft intervals, 3/2/2/1/1 per side,
-  // skipping 1,000 ft where the aiming point already is.
+  // --- Touchdown zone. Groups of 75 x 6 ft bars at 500 ft intervals, 3/2/2/1/1
+  // per side, skipping 1,000 ft where the aiming point already is. Bars run
+  // outboard from the same 36 ft inner edge as the aiming point.
   const TDZ = [
     [500, 3], [1500, 2], [2000, 2], [2500, 1], [3000, 1],
   ];
-  const tdzInner = half * 0.42;
   const barW = 6 * FT_TO_M;
   const barGap = 5 * FT_TO_M;
   const barLen = 75 * FT_TO_M;
@@ -763,7 +988,9 @@ function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
     // Never paint past the middle: the other threshold's markings live there.
     if (u + barLen > usable * 0.5) break;
     for (let i = 0; i < count; i++) {
-      const s0 = tdzInner + i * (barW + barGap);
+      const s0 = inner + i * (barW + barGap);
+      // A narrow runway gets fewer bars per group, not bars in the grass.
+      if (s0 + barW > half - 0.6) break;
       bar(u, u + barLen, s0, s0 + barW);
       bar(u, u + barLen, -s0 - barW, -s0);
     }
@@ -1093,6 +1320,18 @@ export function buildRunwayMeshes(scene, list = airports) {
       }
     }
 
+    // Where the surveyed threshold elevations exist, they are the ground truth
+    // the DEM is supposed to reproduce, so compare and keep the residual. This
+    // is a DIAGNOSTIC, not a correction: the deck has to follow the DEM because
+    // the DEM is the collision surface (MODULES.md §1.4), so forcing the
+    // pavement onto the surveyed elevation would only mean landing under it.
+    let surveyErrM = null;
+    if (Number.isFinite(rw.leElevationFt) && Number.isFinite(rw.heElevationFt)) {
+      const eLe = fit.h0 + fit.lift - rw.leElevationFt * FT_TO_M;
+      const eHe = fit.h0 + fit.slope * lengthM + fit.lift - rw.heElevationFt * FT_TO_M;
+      surveyErrM = Math.abs(eLe) > Math.abs(eHe) ? eLe : eHe;
+    }
+
     meta.push({
       airport: airport.ident,
       runway: `${rw.leIdent}/${rw.heIdent}`,
@@ -1103,6 +1342,8 @@ export function buildRunwayMeshes(scene, list = airports) {
       deckSlope: fit.slope,
       liftM: fit.lift,
       fitRmsM: fit.rms,
+      graded: fit.graded,
+      surveyErrM,
       geometry: rw.geometry,
       surfaceClass: cls,
     });
@@ -1228,8 +1469,66 @@ export function buildRunwayMeshes(scene, list = airports) {
   }
 
   group.userData = { runways: meta, count: meta.length };
+  reportDeckFit(meta);
   if (scene) scene.add(group);
   return group;
+}
+
+/**
+ * How far the drawn deck may sit from the surveyed threshold elevation before
+ * it is worth saying so. 6 m is about the point where the pavement stops
+ * looking like it belongs to the hill it is on.
+ */
+const DECK_SURVEY_WARN_M = 6;
+
+/**
+ * Say out loud where the DEM could not support a flat runway.
+ *
+ * There is exactly one thing that can go wrong here and it is not a code bug:
+ * the elevation data does not know the airport is there. The clearest case in
+ * this region is KSEA 16R/34L, which stands on the third-runway embankment —
+ * up to 50 m of fill placed in 2004-2008 over the Miller Creek valley. The
+ * DEM's west side is still the valley, so a runway whose surveyed thresholds
+ * are 430 and 363 ft is fitted to ground running 263-385 ft, and no flat deck
+ * can both cover that and stay near it.
+ *
+ * The deck follows the DEM anyway, because the DEM is the collision surface
+ * (MODULES.md §1.4) and a pavement drawn at the surveyed height would be a
+ * pavement the aircraft falls through. So the failure is reported rather than
+ * papered over — and it is fixed in the elevation data, not here.
+ *
+ * @param {object[]} meta
+ */
+function reportDeckFit(meta) {
+  const offSurvey = meta
+    .filter((r) => Number.isFinite(r.surveyErrM) && Math.abs(r.surveyErrM) > DECK_SURVEY_WARN_M)
+    .sort((a, b) => Math.abs(b.surveyErrM) - Math.abs(a.surveyErrM));
+  const throughDeck = meta.filter((r) => !r.graded);
+
+  if (offSurvey.length) {
+    console.warn(
+      `[airports] ${offSurvey.length} runway deck(s) more than ${DECK_SURVEY_WARN_M} m ` +
+        'from their surveyed threshold elevation — the DEM does not have the ' +
+        'airport\'s earthworks: ' +
+        offSurvey
+          .slice(0, 8)
+          .map((r) => `${r.airport} ${r.runway} ${r.surveyErrM > 0 ? '+' : ''}${r.surveyErrM.toFixed(1)} m`)
+          .join(', '),
+    );
+  }
+  if (throughDeck.length) {
+    console.info(
+      `[airports] ${throughDeck.length} runway(s) could not hold a believable ` +
+        'gradient over the DEM under them and follow the terrain instead: ' +
+        throughDeck
+          .map(
+            (r) =>
+              `${r.airport} ${r.runway} (${(r.deckSlope * 100).toFixed(1)}%, ` +
+              `DEM RMS ${r.fitRmsM.toFixed(1)} m)`,
+          )
+          .join(', '),
+    );
+  }
 }
 
 /**
