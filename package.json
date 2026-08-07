@@ -29,7 +29,8 @@
     "bake:landmarks": "node scripts/bake-landmarks.mjs",
     "bake:landcover": "node scripts/bake-landcover.mjs",
     "bake:buildings": "node scripts/bake-buildings.mjs",
-    "check:autopilot": "node scripts/check-autopilot.mjs"
+    "check:autopilot": "node scripts/check-autopilot.mjs",
+    "upload:tiles": "node scripts/upload-tiles-r2.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"
