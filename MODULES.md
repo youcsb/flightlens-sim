@@ -483,8 +483,12 @@ createTerrain(scene, opts?) -> Promise<{
   group,                       // THREE.Group, named 'terrain'
   getHeightAt(x, z) -> metres, // MUST delegate to getElevationLocal — see §1.4
   update(camera) -> void,      // per-frame LOD / streaming
+  converge(x, y, z) -> passes, // run LOD selection to a fixed point
+  stats() -> LodStats,         // diagnostics; not per-frame, nothing imports it
   dispose() -> void
 }>
+
+LodStats = { nodes, built, drawn, triangles, finestCellM, byLevel[], tau }
 ```
 
 ```ts
@@ -499,7 +503,7 @@ opts = {
   detail = true,         // load every finer DEM level the manifest declares
   water = true,          // draw the sea plane and the freshwater lake quads
   landcover = true,      // load the baked NLCD rasters and let them drive albedo
-  lodQuality = 1,        // scales the CDLOD screen-error budget
+  lodQuality = 1,        // scales the whole LOD error budget — see below
   originX = 0,           // where to build the first full chunk set, local
   originY = 400,         //   metres. The default is already correct because
   originZ = 0,           //   the scene origin IS the spawn (§1.3); it only
@@ -515,6 +519,59 @@ ground-clearance floor reads real terrain rather than the root node.
 
 **`createTerrain` is `async`** — it awaits the DEM so the first rendered frame
 already has real ground under the aircraft. It returns `group`, not `mesh`.
+
+**The LOD is driven by a measured error, not by fixed distance rings.** Round 1
+subdivided a node while the camera was within `2.5 * nodeSize`, which is the
+right rule when the mesh is finer than the data everywhere — as it was at
+51.8 m/px. It is the wrong rule now. Each node carries a **geometric error**
+probed off the real DEM at creation (the largest vertical gap between its own
+lattice and the finer surface under it), and subdivides while
+`cameraDistance < err / LOD_TAU`, clamped into `[0.8, 3.2] * nodeSize`. Flat
+water collapses; ridgelines hold their children out three times as far.
+
+Two consequences other modules should know about:
+
+1. **`MIN_NODE_SIZE` is 256 (4 m cells), but it is a limit, not a target.**
+   `demSpacingAt()` refuses to subdivide a node whose own cells are already at
+   or below the finest baked DEM layer covering it, so 4 m cells appear **only
+   inside `DETAIL_BBOX`** where the DEM is 6.47 m/px. Everywhere else the tree
+   stops at 8 m cells against 12.95 m/px data. `stats().finestCellM` reports
+   which you are getting. `lodQuality` deliberately does **not** scale this
+   test — no quality setting can make the mesh finer than its source.
+2. **Skirt depth is now driven by the node's error, not its cell size.** Under
+   fixed rings two neighbours at the same level always switched at the same
+   distance, so the level difference across a shared edge was at most one and
+   the geomorph closed it exactly. An error metric breaks that symmetry on
+   purpose, and the residual at such a seam is bounded by the rougher node's
+   error. Verified by readback: rendering straight down over the Cascade crest,
+   the Rainier flank, a Puget Sound bluff and KBFI onto a magenta clear colour
+   gives **0 background pixels of 540,000** in every case.
+
+The morph target is also per node now (`aMorph.y` is the distance at which the
+node's *parent* stops subdividing), because with an error metric there is no
+single distance at which a level is swapped out.
+
+Measured against the fixed rings, over four cameras, sampling the drawn surface
+against `getElevationLocal`:
+
+| | drawn nodes | mesh-vs-field RMS | worst | normal error |
+|---|---|---|---|---|
+| ring 2.5 | 586 | 0.858 m | 16.2 m | 6.3° |
+| error metric | 694 | 0.670 m | 11.9 m | 5.5° |
+
+and near-field error at KBFI halves, 0.084 m → 0.045 m, from the 4 m cells.
+Vertex normals are stored as normalised `Int16`, which pays for the extra nodes:
+the cache ceiling is ~199 MB against round 1's ~188 MB.
+
+**The fine shading term is a normal, not more albedo noise, and it is
+derivative-based.** Below the finest cell the ground is carried by a procedural
+micro-relief field whose world-space gradient is recovered from `dFdx`/`dFdy` of
+a *single* noise evaluation by inverting the screen-space Jacobian. One tap
+rather than three, no branch, and because derivatives are per 2x2 quad it
+antialiases itself — relief finer than a pixel stops contributing instead of
+boiling. The three-tap version this replaced cost up to 6.2 ms/frame of GPU on
+its own at 1000x562; this costs 0.4–1.4 ms. It must stay out of conditional
+flow: derivatives in non-uniform control flow are undefined.
 
 Colour is procedural, but it is **told what it is painting**. Below the treeline
 the albedo comes from `geo/landcover.js` (§2.14): class index in, palette colour
@@ -894,6 +951,165 @@ inside the airframe), `FAR = 300000` (Rainier at 84 km, terrain corners at
 construct the renderer with `logarithmicDepthBuffer: true`. Without it, distant
 terrain z-fights into a shimmering mess.
 
+### 2.16 `src/geo/buildings.js` — real footprints
+
+```js
+SRC_PUBLISHED, SRC_DSM, SRC_DERIVED   // 0, 1, 2
+SOURCE_NAMES                          // ['published', 'dsm', 'derived']
+
+loadBuildings()      -> Promise<BuildingSet|null>   // idempotent, null if unbaked
+getBuildings()       -> BuildingSet|null
+isBuildingsLoaded()  -> boolean
+buildingProvenance() -> {published, dsm, derived, total} | null
+srcOf(i)             -> 'published' | 'dsm' | 'derived'
+centroidLatLon(i, out?) -> {lat, lon}       // AREA centroid, not vertex 0
+nearestBuilding(lat, lon, maxDistanceM?) -> {index, distanceM, heightM, areaM2, source} | null
+coversLatLon(lat, lon)  -> boolean
+decodeBuildings(data)   -> BuildingSet       // TEST SEAM, see below
+```
+
+```ts
+BuildingSet = {
+  count, totalVertices,
+  anchorLat: Float64Array,   // ring vertex 0, degrees
+  anchorLon: Float64Array,
+  ringStart: Uint32Array,    // count+1; ring i is [ringStart[i], ringStart[i+1])
+  ringE: Float32Array,       // metres EAST of that building's anchor
+  ringN: Float32Array,       // metres NORTH of it
+  heightM: Float32Array,     // above the building's own base
+  areaM2: Float32Array,      // from the real polygon
+  src: Uint8Array,           // SRC_*
+  bbox, meta,
+}
+```
+
+**23,979 real Microsoft Building Footprints**, baked by
+`scripts/bake-buildings.mjs` over the same Seattle inset as the DEM's z=14 layer
+and the land-cover detail layer (47.35–47.75, −122.5 to −122.1). Round 1 drew
+downtown as a rotated grid of boxes, and the geographic critic went straight to
+it: *"individual buildings are not real"*. Now every polygon is — position,
+outline, orientation and area come from the source and are changed only by a
+documented simplification (0.4–1.4 m Douglas–Peucker, 7% of vertices removed).
+
+**THE HEIGHTS ARE MOSTLY NOT REAL, AND EVERY BUILDING SAYS SO.** `srcOf(i)`
+returns one of three, and the counts are asserted against the per-building tags
+by `npm run check:buildings`:
+
+| `src` | n | what it is |
+|---|---|---|
+| `published` | 32 | a published architectural height, matched to this footprint by proximity |
+| `dsm` | 13,761 | a STOREY COUNT read off Microsoft's photogrammetric surface model, trusted only below 18 m |
+| `derived` | 10,186 | footprint area and distance to a district core, through the model in the baker |
+
+**The source's `height` field is a trap and it was measured, not assumed.** The
+global-buildings release carries a DSM-derived height for every polygon. It
+saturates: the tallest value anywhere in the 44 × 30 km inset is **35.3 m**, and
+Columbia Center — 284 m — reads **25.1 m**. Above `DSM_TRUST_M` the field is
+**discarded, not rescaled**, because rescaling a saturated sensor invents exactly
+the numbers we are trying not to invent. Below it, only the storey count is
+taken, never the metres. Full table in the baker's header.
+
+**Ring vertices are metres from the building's anchor, not degrees.** The scene
+projection is an anchored equirectangular with both metres-per-degree factors
+frozen at `SCALE_LAT` (§1.3) — a uniform affine map — so a metre offset computed
+at bake time is the same offset at runtime anywhere in the region, and the
+runtime never projects a vertex. `buildings.json` records the `scaleLat` it was
+baked at and the loader **refuses the file** if `coords.js` has moved: a 1°
+drift is a 1.3% scale error on every building in the world, too small to see and
+too large to be right.
+
+**`decodeBuildings` is not a second front door.** The browser path reads the
+file through `fetch`, which Node cannot do, so without it the decoder — the one
+piece of code that can turn every footprint into the wrong shape — would be
+assertable nowhere. `scripts/check-buildings.mjs` runs the shipping decoder and
+the shipping extruder against the real baked file and the real DEM tiles.
+
+### 2.17 `world/landmarkModels.js#buildDowntownMass` — the city
+
+```js
+buildDowntownMass(opts?) -> THREE.Group        // named 'downtown-mass'
+buildProceduralCityMass(opts?) -> THREE.InstancedMesh|null   // the §1.6 fallback
+cityStats                                       // live binding, null until built
+```
+
+```ts
+opts = {
+  exclude: [{x, z, radiusM}],   // keep-out discs, normally the modelled landmarks
+  real: true,                   // false forces the procedural fallback
+  seed,                         // fallback only
+}
+```
+
+**SELF-POPULATING, like `placeLandmarks`.** It returns an EMPTY group
+immediately and fills it once the footprints resolve, starting that load itself.
+`group.children` is empty on the calling frame — do not measure it there. This
+is a change from round 1, which returned an `InstancedMesh` synchronously;
+`landmarks.js` does `const mass = buildDowntownMass(...); if (mass) group.add(mass)`
+and a Group satisfies both lines unchanged, so **nothing outside these files
+moves**.
+
+**Merged, not instanced.** Instancing needs one shape and the whole point is
+that every shape is different. One indexed `BufferGeometry` per 3 km chunk, 131
+chunks, built once in ~150 ms: 626k triangles, 29.8 MiB of buffers. Vertices are
+relative to the chunk centre so a 25 km-out chunk keeps millimetre float
+precision and a tight bounding sphere for culling.
+
+**Three distance tiers, and the boundaries are measured.** `THREE.LOD` does the
+switching, and the renderer calls `LOD.update(camera)` itself during
+`projectObject` — so there is **no new per-frame contract in main.js**.
+
+| tier | contents | cutoff | why |
+|---|---|---|---|
+| `city-tall` | ≥ 50 m | none | from Mount Rainier, 84 km out, hiding the whole city changes 292 of 562,000 pixels. That is the downtown silhouette above the haze, and it is all buildings over ~50 m. They live in 6 chunks. |
+| `city-major` | ≥ 22 m or ≥ 1,400 m² | 25 km | everything the pixel measurement says is invisible at that range. Cutting it took the city at Rainier from 125 draw calls / 275k triangles / 2.86 ms to **6 calls / 11.7k triangles / 0.00 ms**. |
+| `city-minor` | the rest | 6 km | a 9 m house at 6 km subtends 0.09°, about one and a half pixels at 1000×562. |
+
+**Winding is derived, not guessed.** For a triangle p0p1p2 the cross product's
+Y component is exactly minus the shoelace sum in (x, z), so a ring arranged to
+have NEGATIVE signed area gives an up-facing roof; with that fixed, emitting
+each side quad as (bottom-i, bottom-i+1, top-i+1, top-i) puts every wall normal
+outward. Reverse either and the city renders inside out, which back-face culling
+turns into a city of holes — visible only from some angles, and never in a
+still. `check-buildings` asserts every triangle's index winding against its
+stored normal.
+
+**46 of the 23,979 source rings pinch** — they touch themselves where a light
+well or a covered walkway was traced as a zero-width spur — and ear clipping
+correctly refuses them. Those get a **convex-hull roof**, which can only
+over-cover into the polygon's own concavities and never past its extent. A fan
+over the raw ring was tried and throws triangles well outside the building.
+
+**Facade shading is shared with the fallback.** Storey banding at 3.6 m,
+structural bays at 2.4 m, dark roofs, a parapet line and a darkened ground
+floor, three material families, all fading out past 2.6 km. Two things changed
+from round 1: the bay coordinate is now a per-vertex `aAlong` (true distance
+along each wall) rather than a world axis, because with real footprints most
+walls run at 30° to the axes and axis-aligned bays shear at every corner; and
+`aUp`/`aDown` are METRES above ground and below the roof rather than fractions
+of height, because a fraction makes a 200 m tower's parapet 3 m tall and a 9 m
+shop's 14 cm. Their sum is the building's height, which is how the shader tells
+a house from an office block without a fourth attribute.
+
+**Buildings are buried, not balanced.** The base is the DEM's minimum over
+*every* ring vertex, minus 3.5 m. Sampling every eighth vertex was tried and
+leaves 1.07 m of float on the worst building in the city: on a Queen Anne
+hillside the DEM between two sampled vertices drops further than the slack
+covers. The 3.5 m is for the pager (§2.4) — a building built while only the
+51.8 m/px base covers its cell will see its ground improve by a metre or two.
+
+**Measured cost at 1000×562, `renderer.info` and interleaved A/B with
+`gl.finish()`** (four agents share this Mac; the absolute frame time swings 3×
+with contention, so both a quiet-window and a contended figure are given):
+
+| viewpoint | frame, city on | city's share | city draw calls | city triangles |
+|---|---|---|---|---|
+| KBFI 32L, parked | 8.17 ms (122 fps) | +2.01 ms | 99 | 236k |
+| 400 m over Seattle Center, nose down the CBD | 6.54 ms (153 fps) | +0.95 ms | 129 | 674k |
+| 700 m over Elliott Bay, whole skyline | 8.02 ms (125 fps) | +2.75 ms | 107 | 414k |
+| 11,000 ft at Mount Rainier | — | **0.00 ms** | 6 | 11.7k |
+| 400 m over the CBD, machine at load 4 | 15.33 ms floor (**65 fps**) | +2.71 ms paired median | 115 | 634k |
+
+
 ---
 
 ## 3. Bootstrap order
@@ -936,7 +1152,15 @@ source. Summary:
 | `public/dem/{z}/{x}/{y}.png` + `manifest.json` | `bake-dem.mjs` | `geo/elevation.js` |
 | `public/data/airports.json` | `bake-airports.mjs` | `geo/airports.js` |
 | `public/data/landmarks.json` | `bake-landmarks.mjs` | `geo/landmarks.js` |
+| `public/data/buildings.json` | `bake-buildings.mjs` | `geo/buildings.js` |
 | `public/landcover/{region,detail}.png` + `manifest.json` | `bake-landcover.mjs` | `geo/landcover.js` |
+
+The building bake is **1.68 MB out of 927 MB in**: four Microsoft
+global-buildings shards (151 MB gzipped) filtered to the Seattle inset,
+simplified and quantised. `node scripts/bake-buildings.mjs --dry` reports the
+selection without writing. Cold run about 40 s, almost all of it download;
+the shards are cached under `node_modules/.cache/ken-buildings`. Neither state
+file is ever shipped to the browser.
 
 `npm run bake` is **not** part of `npm run build` — baking hits the network and
 takes minutes; the build stays fast and offline.

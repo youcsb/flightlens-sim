@@ -40,6 +40,7 @@
 import * as THREE from 'three';
 import { llToLocal, localToLl } from '../geo/coords.js';
 import { getElevation, isWater, isLoaded } from '../geo/elevation.js';
+import { loadBuildings } from '../geo/buildings.js';
 
 const DEG = Math.PI / 180;
 
@@ -1124,165 +1125,102 @@ export function buildLandmarkModel(l) {
 }
 
 // ---------------------------------------------------------------------------
-// The downtown building mass
+// The city — REAL footprints, extruded
 // ---------------------------------------------------------------------------
 
 /**
- * Instanced filler blocks, so the skyline has a city underneath it.
+ * Round 1 drew downtown as a rotated grid of boxes with a height falloff. It
+ * was a good fake — the street bearings were right, the blocks were Seattle
+ * blocks — and the geographic critic still went straight to it: "individual
+ * buildings are not real". They were not. Every polygon below is.
  *
- * These are NOT geographic truth and do not pretend to be — which is exactly
- * why they live here and not in the baked landmark data. The named towers are
- * surveyed and sit at their true coordinates; this is the anonymous mass
- * between them, generated from a height falloff around each core.
+ * `buildDowntownMass` now extrudes 23,979 Microsoft Building Footprints baked
+ * by `scripts/bake-buildings.mjs`: real outlines, real positions, real
+ * orientations, real areas. The block grid survives only as the fallback for a
+ * missing bake (§1.6), because a world with no city at all is worse than a
+ * world with an approximate one.
  *
- * Three things make it read as Seattle rather than as noise:
+ * WHAT IS STILL NOT REAL: the heights, except for 32 published ones. Every
+ * building carries its provenance (`geo/buildings.js#srcOf`) and the console
+ * says so at load. See that module's header before quoting a height.
  *
- *  - The GRID ANGLE is real. Downtown's core grid runs about 30 deg off north,
- *    parallel to the Elliott Bay shoreline, while everything north of Denny Way
- *    — Seattle Center, where the Needle is — sits on a true N-S grid. The seam
- *    between the two is obvious from the air, and getting it wrong is the
- *    single most visible way to make a real city look fake.
- *  - Blocks are Seattle blocks: ~73 m square on a ~91 m pitch.
- *  - Heights fall off exponentially from each core, so downtown has a peak and
- *    a skirt instead of being a uniform slab.
+ * ---------------------------------------------------------------------------
+ * THE THING THAT MAKES THIS AFFORDABLE
+ * ---------------------------------------------------------------------------
+ * 24,000 footprints cannot be 24,000 meshes and cannot be an InstancedMesh
+ * either — instancing needs one shape, and the whole point here is that every
+ * shape is different. So they are MERGED: one BufferGeometry per spatial chunk,
+ * built once, holding every prism in that chunk. 131 chunks of 3 km, split into
+ * a "major" mesh (anything tall or large enough to read at distance) and a
+ * "minor" mesh that a THREE.LOD switches off past 6 km.
  *
- * Water and ground come from the DEM, so blocks neither march into Elliott Bay
- * nor float above the hill they are standing on.
+ * THREE.LOD is used rather than a per-frame visibility pass on purpose: the
+ * renderer calls `LOD.update(camera)` itself during `projectObject`, so nothing
+ * in main.js has to know these exist. There is no new per-frame contract.
+ *
+ * Vertices are stored relative to their chunk centre, not to the scene origin,
+ * so a 25 km-out chunk still has millimetre float precision, and its bounding
+ * sphere is tight enough for frustum culling to actually reject it.
  */
-const CLUSTERS = [
-  // Downtown core: tallest, on the 30 deg shoreline grid.
-  { lat: 47.606, lon: -122.332, halfLenM: 1100, halfWidM: 760, gridDeg: 30, maxH: 175, falloffM: 700 },
-  // Denny Triangle / South Lake Union — real, and mostly built since 2010.
-  { lat: 47.6175, lon: -122.337, halfLenM: 850, halfWidM: 620, gridDeg: 30, maxH: 135, falloffM: 620 },
-  // Lower Queen Anne / Seattle Center: low-rise, and on the N-S grid.
-  { lat: 47.6235, lon: -122.352, halfLenM: 700, halfWidM: 560, gridDeg: 0, maxH: 40, falloffM: 620 },
-  // Bellevue across Lake Washington — a genuinely separate skyline, and the
-  // proof that the lake between them is the right shape.
-  { lat: 47.6145, lon: -122.1985, halfLenM: 650, halfWidM: 520, gridDeg: 0, maxH: 150, falloffM: 460 },
-];
+
+// ---------------------------------------------------------------------------
+// Facade shading — shared by the real footprints and the procedural fallback
+// ---------------------------------------------------------------------------
 
 /**
- * Height falloff from a cluster centre, normalised to 1 at the core.
- *
- * A Gaussian-ish `exp(-(d/f)^1.5)` was tried first and is wrong: it collapses
- * too fast, leaving 62% of blocks under 40 m and a downtown that reads as a
- * carpet with two spikes in it. A rational falloff has a much fatter shoulder —
- * half height at d = f rather than a fifth — which is what actually produces a
- * broad band of 60-140 m buildings around the core, the way a real downtown
- * looks from the air.
- */
-const falloff = (d, f) => 1 / (1 + (d / f) ** 2.2);
-
-const BLOCK_PITCH_M = 91;
-const BLOCK_SIZE_M = 71;
-
-/**
- * @param {object} [opts]
- * @param {{x:number,z:number,radiusM:number}[]} [opts.exclude] Keep-out discs,
- *   normally the footprints of the real modelled landmarks, so a filler block
- *   does not grow up through Columbia Center.
- * @param {number} [opts.seed]
- * @returns {THREE.InstancedMesh|null} One draw call for the whole skyline, or
- *   null if nothing could be placed (no DEM, or every cell was water).
- */
-/**
- * The city-mass material: one Lambert, one draw call, and a procedural facade.
- *
- * WHY A SHADER AND NOT THE WINDOW TEXTURE. The named towers each get their own
- * material so `repeat` can be set from their real metres (see glassMaterial).
- * The filler blocks cannot: they are ONE InstancedMesh with one material and
- * ~600 different sizes, so a single UV repeat would stretch a 4 m storey into a
- * 30 m one on the tall blocks. Deriving the storey line from WORLD Y instead
- * makes every block agree about where the floors are — which is also true of a
- * real city, where the floor lines of adjacent buildings roughly line up.
- *
  * The three parts that matter, in order of how much they change the picture:
- *   1. Roofs are dark. Untextured white boxes lit from above are lightest
+ *
+ *   1. Roofs are dark. Untextured light boxes lit from above are brightest
  *      exactly where a real city is darkest (tar, gravel, plant rooms), and
  *      that inversion is most of why a box city reads as sugar cubes.
- *   2. Storey banding at 3.6 m, with vertical bays at 2.4 m. This is what
- *      gives the mass a scale reference; without it a 40 m block and a 140 m
- *      block look the same from any distance.
- *   3. A parapet line and a darkened ground floor, so the top and bottom of
- *      each block are not the same as its middle.
+ *   2. Storey banding at 3.6 m with structural bays at 2.4 m. This is the mass's
+ *      only scale reference; without it a 40 m block and a 140 m block look
+ *      identical from any distance.
+ *   3. A parapet line and a darkened ground floor, so the top and bottom of a
+ *      building are not the same as its middle.
  *
- * All of it fades out past ~2.5 km, where a 2.4 m bay is sub-pixel and would
- * only alias into moiré.
+ * All of it fades out past ~2.6 km where a 2.4 m bay is sub-pixel and would
+ * only alias into moire.
+ *
+ * WHY THE BAY COORDINATE IS AN ATTRIBUTE NOW. Round 1 picked the horizontal
+ * axis with the larger normal component and used the world coordinate along it.
+ * With a grid of axis-aligned boxes that is exact. With real footprints most
+ * walls run at 30 deg to the axes, and the bays then march across the facade at
+ * the wrong pitch and shear at every corner. `aAlong` is the true distance
+ * along each wall from its start, measured at build time, so bays are
+ * perpendicular to the wall they are on whatever direction it faces.
+ *
+ * `aUp` / `aDown` are metres above ground and metres below the roof. Fractions
+ * of the building's height were the round-1 approach and they make a 200 m
+ * tower's parapet 3 m tall and a 9 m shop's 14 cm. Metres are what a parapet
+ * actually is. Their sum is the building's height, which is how the shader
+ * knows a house from an office block without a third attribute.
  */
-function makeCityFacadeMaterial() {
-  const m = lambert(0xffffff);
-  m.name = 'downtown-facade';
-
-  m.onBeforeCompile = (shader) => {
-    shader.vertexShader = shader.vertexShader
-      .replace(
-        '#include <common>',
-        /* glsl */ `
-        #include <common>
-        varying vec3 vCityWorld;
-        varying vec3 vCityNormal;
-        varying vec3 vCityLocal;
-        `,
-      )
-      .replace(
-        '#include <begin_vertex>',
-        /* glsl */ `
-        #include <begin_vertex>
-        #ifdef USE_INSTANCING
-          vCityWorld = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
-          vCityNormal = normalize(mat3(modelMatrix) * mat3(instanceMatrix) * objectNormal);
-          // The box is a unit cube, so position.y is exactly -0.5..0.5 of this
-          // block's own height whatever it was scaled to. That is the only way
-          // to find a parapet or a ground floor without a per-instance uniform.
-          vCityLocal = position;
-        #else
-          vCityWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
-          vCityNormal = normalize(mat3(modelMatrix) * objectNormal);
-          vCityLocal = position;
-        #endif
-        `,
-      );
-
-    shader.fragmentShader = shader.fragmentShader
-      .replace(
-        '#include <common>',
-        /* glsl */ `
-        #include <common>
-        varying vec3 vCityWorld;
-        varying vec3 vCityNormal;
-        varying vec3 vCityLocal;
-        `,
-      )
-      .replace('#include <map_fragment>', CITY_FACADE_GLSL);
-  };
-
-  // Otherwise three may hand this material a program compiled for some other
-  // MeshLambertMaterial with the same defines.
-  m.customProgramCacheKey = () => 'ken-downtown-facade';
-  return m;
-}
-
-const CITY_FACADE_GLSL = /* glsl */ `
+const CITY_FACADE_FRAG = /* glsl */ `
 {
   vec3 n = normalize(vCityNormal);
   float roof = smoothstep(0.62, 0.86, abs(n.y));
   float fade = 1.0 - smoothstep(700.0, 2600.0, distance(vCityWorld, cameraPosition));
+  float bldgH = vUp + vDown;
 
-  // Which horizontal axis runs across this face.
-  float across = mix(vCityWorld.x, vCityWorld.z, step(abs(n.z), abs(n.x)));
-
-  // 3.6 m storeys, 2.4 m structural bays. Windows occupy the upper part of
-  // each storey and most of each bay; the rest is spandrel and mullion.
-  float storey = fract(vCityWorld.y * (1.0 / 3.6));
-  float bay = fract(across * (1.0 / 2.4));
+  // 3.6 m storeys, 2.4 m structural bays. Windows occupy the upper part of each
+  // storey and most of each bay; the rest is spandrel and mullion.
+  float storey = fract(vUp * (1.0 / 3.6));
+  float bay = fract(vAlong * (1.0 / 2.4));
   float glazed = smoothstep(0.20, 0.30, storey) * (1.0 - smoothstep(0.80, 0.90, storey))
                * smoothstep(0.14, 0.24, bay) * (1.0 - smoothstep(0.80, 0.90, bay));
-  float win = glazed * (1.0 - roof) * fade;
 
-  // Parapet: the top ~1.5% of the block, and the ground floor, read differently
-  // from the shaft on any real building.
-  float parapet = smoothstep(0.470, 0.492, vCityLocal.y) * (1.0 - roof) * fade;
-  float plinth = (1.0 - smoothstep(-0.470, -0.435, vCityLocal.y)) * (1.0 - roof) * fade;
+  // A two-storey house does not have a curtain wall. Below ~9 m the glazing
+  // collapses to a punched-window rhythm at half strength; above ~20 m it is a
+  // commercial facade. Without this the residential fabric — 14,000 of the
+  // 24,000 buildings — reads as a carpet of tiny office towers.
+  float commercial = smoothstep(9.0, 20.0, bldgH);
+  float win = glazed * (1.0 - roof) * fade * (0.45 + 0.55 * commercial);
+
+  // A real parapet is about 1.1 m of upstand and a real ground floor is one
+  // storey. Both in metres, both independent of how tall the building is.
+  float parapet = (1.0 - smoothstep(0.4, 1.4, vDown)) * (1.0 - roof) * fade;
+  float plinth  = (1.0 - smoothstep(3.2, 4.4, vUp)) * step(0.0, vUp) * (1.0 - roof) * fade;
 
   vec3 c = diffuseColor.rgb;
   // Glass: darker and bluer than its spandrel.
@@ -1295,7 +1233,728 @@ const CITY_FACADE_GLSL = /* glsl */ `
 }
 `;
 
+const FACADE_VARYINGS = /* glsl */ `
+varying vec3 vCityWorld;
+varying vec3 vCityNormal;
+varying float vUp;
+varying float vDown;
+varying float vAlong;
+`;
+
+/** The merged path's three custom attributes. `attribute` is a macro for `in`
+ *  in three's non-GLSL3 prefix, the same one its own `attribute vec3 position`
+ *  goes through, so this is the supported spelling and not a workaround. */
+const MERGED_ATTRS = /* glsl */ `
+attribute float aUp;
+attribute float aDown;
+attribute float aAlong;
+`;
+
+/**
+ * @param {string} vertexBody GLSL that assigns the five varyings. Two variants
+ *   exist: merged geometry reads them from attributes, the fallback's
+ *   InstancedMesh derives them from the unit cube and its instance matrix.
+ * @param {string} cacheKey Distinct per variant, or three hands one variant the
+ *   other's compiled program.
+ * @param {object} [params] Extra MeshLambertMaterial parameters.
+ */
+function makeFacadeMaterial(vertexBody, cacheKey, params = {}, attrs = '') {
+  const m = lambert(0xffffff, params);
+  m.name = cacheKey;
+  m.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${FACADE_VARYINGS}${attrs}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n${vertexBody}`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${FACADE_VARYINGS}`)
+      .replace('#include <map_fragment>', CITY_FACADE_FRAG);
+  };
+  m.customProgramCacheKey = () => cacheKey;
+  return m;
+}
+
+/**
+ * Merged path. `aUp` and `aDown` are Int16 decimetres, `aAlong` Uint16
+ * decimetres — 6 bytes a vertex instead of 12, over 1.1 M vertices.
+ */
+const MERGED_VERTEX = /* glsl */ `
+  vCityWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
+  vCityNormal = normalize(mat3(modelMatrix) * objectNormal);
+  vUp = aUp * 0.1;
+  vDown = aDown * 0.1;
+  vAlong = aAlong * 0.1;
+`;
+
+/**
+ * Fallback path: a unit cube scaled by the instance matrix. The building's
+ * height is the length of the matrix's second column, which is the only place
+ * a per-instance scalar can be read from without a second attribute buffer.
+ */
+const INSTANCED_VERTEX = /* glsl */ `
+  #ifdef USE_INSTANCING
+    vCityWorld = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+    vCityNormal = normalize(mat3(modelMatrix) * mat3(instanceMatrix) * objectNormal);
+    float instH = length(instanceMatrix[1].xyz);
+  #else
+    vCityWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
+    vCityNormal = normalize(mat3(modelMatrix) * objectNormal);
+    float instH = 1.0;
+  #endif
+  vUp = (position.y + 0.5) * instH;
+  vDown = instH - vUp;
+  vAlong = mix(vCityWorld.x, vCityWorld.z, step(abs(vCityNormal.z), abs(vCityNormal.x)));
+`;
+
+const matCityMerged = () =>
+  mat('cityMerged', () =>
+    makeFacadeMaterial(MERGED_VERTEX, 'ken-city-merged', { vertexColors: true }, MERGED_ATTRS),
+  );
+const matCityInstanced = () =>
+  mat('cityInstanced', () => makeFacadeMaterial(INSTANCED_VERTEX, 'ken-city-instanced'));
+
+// ---------------------------------------------------------------------------
+// Colour families
+// ---------------------------------------------------------------------------
+
+/**
+ * Three material families, not one grey ramp.
+ *
+ * A real downtown block is green-tinted curtain wall next to warm precast next
+ * to dark 1970s glass, and the fastest way to make a city read as a set of
+ * identical sugar cubes — which is exactly what a blind A/B picks out — is to
+ * give every block the same hue and vary only its brightness. Tall buildings
+ * lean toward glass and short ones toward masonry, which is how the real stock
+ * sorts itself.
+ *
+ * @param {number} h building height, metres
+ * @param {number} r deterministic 0..1
+ * @param {Uint8Array} out RGB bytes
+ * @param {number} o offset into `out`
+ */
+function cityFamilyRGB(h, r, out, o) {
+  const v = 0.5 + 0.3 * r - Math.min(0.2, h / 900);
+  const glassBias = Math.min(1, h / 120);
+  const fam = (r * 3.7 + glassBias) % 1;
+  let cr;
+  let cg;
+  let cb;
+  if (fam < 0.42) {
+    cr = v * 0.8;
+    cg = v * 0.93;
+    cb = v * 1.0; // green-blue curtain wall
+  } else if (fam < 0.74) {
+    cr = v * 1.06;
+    cg = v * 1.01;
+    cb = v * 0.92; // warm precast concrete
+  } else {
+    cr = v * 0.72;
+    cg = v * 0.74;
+    cb = v * 0.82; // dark glass / dark stone
+  }
+  // LINEAR bytes. three does not colour-manage a vertex-colour attribute — it
+  // multiplies diffuseColor by it raw, in the working (linear) space — and
+  // InstancedMesh.setColorAt stores linear too, so both paths agree. Encoding
+  // sRGB here would wash the whole city out by about a stop.
+  out[o] = Math.min(255, Math.round(255 * cr));
+  out[o + 1] = Math.min(255, Math.round(255 * cg));
+  out[o + 2] = Math.min(255, Math.round(255 * cb));
+}
+
+/** Deterministic 0..1 from a building's index and position. */
+function hash01(a, b) {
+  let h = (Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul(b | 0, 0x165667b1)) >>> 0;
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x2545f491) >>> 0;
+  h ^= h >>> 13;
+  return h / 4294967296;
+}
+
+// ---------------------------------------------------------------------------
+// Build parameters
+// ---------------------------------------------------------------------------
+
+/** Chunk edge, metres. Matches the baker's emit order so a chunk is a
+ *  contiguous slice of the file and the build touches memory in order. */
+const CITY_CHUNK_M = 3000;
+
+/**
+ * THREE TIERS, and the boundaries are measured rather than picked.
+ *
+ * `tall` — anything over TALL_H_M. Drawn at every distance, no cutoff. From
+ *   Mount Rainier, 84 km away, hiding the entire city changes 292 of 562,000
+ *   pixels: 0.05%. That is not nothing — it is the downtown silhouette above
+ *   the haze, and Columbia Center's dark shaft moves a pixel by 179 of 765.
+ *   Those pixels come from buildings above ~50 m, so those are the ones that
+ *   keep their draw call all the way out. It costs almost nothing to be
+ *   generous with the threshold: everything over 50 m lives in eight chunks,
+ *   because that is what a downtown IS.
+ *
+ * `major` — tall enough or large enough to read from a few kilometres, cut at
+ *   MAJOR_CUTOFF_M. Everything the 0.05% measurement says is invisible from
+ *   Rainier, so cutting it there costs nothing and saves the 2.86 ms the whole
+ *   city was costing at a viewpoint that cannot see it.
+ *
+ * `minor` — the residential fabric, more than half the buildings, cut at
+ *   MINOR_CUTOFF_M. A 9 m house at 6 km subtends 0.09 deg, about one and a
+ *   half pixels at our FOV and resolution.
+ */
+const TALL_H_M = 50;
+const MAJOR_H_M = 22;
+const MAJOR_AREA_M2 = 1400;
+const MAJOR_CUTOFF_M = 25000;
+const MINOR_CUTOFF_M = 6000;
+
+/**
+ * SHADOW CASTING AT DISTANCE IS NOT THIS MODULE'S TO DECIDE — measured.
+ *
+ * Parked at KBFI, 12 km from downtown, the whole city was still being submitted
+ * to all four shadow cascades: 1.12 ms of a 9.09 ms frame, more than half the
+ * city's entire cost, spent on shadows falling on ground the camera cannot
+ * resolve. The obvious fix — a second LOD level holding the same geometry in a
+ * Mesh with `castShadow = false` — was built, and it does not work.
+ *
+ * `world/shadows.js#tagObject` traverses the whole scene from
+ * `scene.onBeforeRender` every frame and sets `castShadow = true` on everything
+ * that is not sky or water ("whatever the buildings agent adds. Cast and
+ * receive."). Verified at runtime: all 125 far-level meshes came back with
+ * `castShadow === true` on the frame after they were created false. So the
+ * levels cost 125 extra Object3Ds and buy nothing, and they are gone.
+ *
+ * The fix belongs in shadows.js, as an opt-out its tagger honours — something
+ * like `if (obj.userData.csmNoCast) obj.castShadow = false`. Written up in the
+ * hand-off; do not re-add a caster policy here until that exists, because it
+ * will be silently overwritten and only a profiler will tell you.
+ */
+
+/**
+ * How far below its own ground a building is buried.
+ *
+ * Two things need covering. Downtown Seattle climbs ~70 m off the waterfront,
+ * so a 60 m footprint on a 12% street is 7 m out of level corner to corner —
+ * that is the `relief` term, measured from the DEM at the footprint's own
+ * corners. And the DEM is PAGED (§2.4): a building built while only the 51.8
+ * m/px base layer covers its cell will see its ground move by a metre or two
+ * when z13 arrives underneath it. `CITY_EMBED_SLACK_M` is that, and it is why
+ * the number is not simply `relief`.
+ */
+const CITY_EMBED_SLACK_M = 3.5;
+
+// ---------------------------------------------------------------------------
+// The build
+// ---------------------------------------------------------------------------
+
+/** Scratch, module scope: the build pass runs 24,000 times. */
+const _v2pool = [];
+const _v2view = [];
+const _bLL = { lat: 0, lon: 0 };
+const _bXZ = { x: 0, z: 0 };
+const _rgb = new Uint8Array(3);
+
+function v2view(n) {
+  while (_v2pool.length < n) _v2pool.push(new THREE.Vector2());
+  _v2view.length = n;
+  for (let i = 0; i < n; i++) _v2view[i] = _v2pool[i];
+  return _v2view;
+}
+
+/**
+ * Indices of the convex hull of a ring, monotone chain, counter-clockwise in
+ * the same (x, z) sense the extruder uses. Only reached by the 0.19% of rings
+ * that ear clipping cannot close.
+ *
+ * @returns {number[]} indices into rx/rz, at least 3 long for a non-degenerate
+ *   ring; falls back to [0, 1, 2] if every point is collinear.
+ */
+function convexHullIdx(rx, rz, n) {
+  const ord = [];
+  for (let i = 0; i < n; i++) ord.push(i);
+  ord.sort((a, b) => rx[a] - rx[b] || rz[a] - rz[b]);
+  const cross = (o, a, b) =>
+    (rx[a] - rx[o]) * (rz[b] - rz[o]) - (rz[a] - rz[o]) * (rx[b] - rx[o]);
+  const build = (seq) => {
+    const st = [];
+    for (const i of seq) {
+      while (st.length >= 2 && cross(st[st.length - 2], st[st.length - 1], i) <= 0) st.pop();
+      st.push(i);
+    }
+    st.pop();
+    return st;
+  };
+  const hull = build(ord).concat(build(ord.slice().reverse()));
+  return hull.length >= 3 ? hull : [0, 1 % n, 2 % n];
+}
+
+/**
+ * Extrude one chunk's buildings into a single indexed BufferGeometry.
+ *
+ * Winding is derived, not guessed. A ring is arranged so its signed area in
+ * (x, z) is NEGATIVE, because for a triangle p0p1p2 the cross product's Y
+ * component is exactly minus the shoelace sum — so negative area is the
+ * up-facing roof. With that fixed, walking the ring in order and emitting each
+ * side quad as (bottom-i, bottom-i+1, top-i+1, top-i) puts every wall normal
+ * outward. Reverse either and the city renders inside out, which back-face
+ * culling turns into a city of holes.
+ *
+ * @param {object} set BuildingSet from geo/buildings.js
+ * @param {number[]} idx indices into `set` for this chunk
+ * @param {Float32Array} baseY per-building bottom, scene metres
+ * @param {Float32Array} topY per-building top, scene metres
+ * @param {Float32Array} lx per-building anchor local x
+ * @param {Float32Array} lz per-building anchor local z
+ * @param {number} ox chunk centre x
+ * @param {number} oz chunk centre z
+ * @returns {THREE.BufferGeometry|null}
+ */
+function extrudeChunk(set, idx, baseY, topY, lx, lz, ox, oz) {
+  let nVerts = 0;
+  let nIdx = 0;
+  for (const i of idx) {
+    const n = set.ringStart[i + 1] - set.ringStart[i];
+    nVerts += 5 * n; // 4 per side quad + 1 per roof vertex
+    nIdx += 9 * n - 6; // 6 per side quad + 3 per roof triangle
+  }
+  if (!nVerts) return null;
+
+  const pos = new Float32Array(nVerts * 3);
+  const nor = new Int8Array(nVerts * 3);
+  const col = new Uint8Array(nVerts * 3);
+  const up = new Int16Array(nVerts);
+  const down = new Int16Array(nVerts);
+  const along = new Uint16Array(nVerts);
+  const ind = nVerts > 65535 ? new Uint32Array(nIdx) : new Uint16Array(nIdx);
+
+  let vp = 0;
+  let ip = 0;
+  const rx = [];
+  const rz = [];
+
+  for (const bi of idx) {
+    const s = set.ringStart[bi];
+    const e = set.ringStart[bi + 1];
+    const n = e - s;
+    const ax = lx[bi];
+    const az = lz[bi];
+    const y0 = baseY[bi];
+    const y1 = topY[bi];
+    const h = y1 - y0;
+
+    rx.length = n;
+    rz.length = n;
+    let shoelace = 0;
+    for (let k = 0; k < n; k++) {
+      // +Z is SOUTH (§1.2), so the ring's northing subtracts.
+      rx[k] = ax + set.ringE[s + k] - ox;
+      rz[k] = az - set.ringN[s + k] - oz;
+    }
+    for (let k = 0; k < n; k++) {
+      const j = k + 1 < n ? k + 1 : 0;
+      shoelace += rx[k] * rz[j] - rx[j] * rz[k];
+    }
+    if (shoelace > 0) {
+      rx.reverse();
+      rz.reverse();
+    }
+
+    const r = hash01(bi * 2654435761, Math.round(ax * 8) ^ Math.round(az * 8));
+    cityFamilyRGB(set.heightM[bi], r, _rgb, 0);
+
+    // Height above ground at the roof, in decimetres, and the embed below it.
+    // A building's OWN height is what the shader wants, not the drawn extent.
+    const roofUp = Math.round(set.heightM[bi] * 10);
+    const baseUp = Math.round((y0 - (y1 - set.heightM[bi])) * 10); // negative
+
+    const v0 = vp;
+
+    // --- sides -----------------------------------------------------------
+    let run = 0;
+    for (let k = 0; k < n; k++) {
+      const j = k + 1 < n ? k + 1 : 0;
+      const dx = rx[j] - rx[k];
+      const dz = rz[j] - rz[k];
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-4) {
+        // Degenerate edge: emit a collapsed quad rather than re-deriving the
+        // buffer sizes. It has zero area and never rasterises.
+        for (let q = 0; q < 4; q++) {
+          writeVert(rx[k], q < 2 ? y0 : y1, rz[k], 0, 1, 0, roofUp, 0, 0);
+        }
+        ind[ip++] = vp - 4;
+        ind[ip++] = vp - 3;
+        ind[ip++] = vp - 2;
+        ind[ip++] = vp - 4;
+        ind[ip++] = vp - 2;
+        ind[ip++] = vp - 1;
+        continue;
+      }
+      const nx = -dz / len;
+      const nz = dx / len;
+      const a0 = Math.min(6553, Math.round(run * 10));
+      const a1 = Math.min(6553, Math.round((run + len) * 10));
+      const b = vp;
+      const dLo = roofUp - baseUp;
+      writeVert(rx[k], y0, rz[k], nx, 0, nz, baseUp, dLo, a0);
+      writeVert(rx[j], y0, rz[j], nx, 0, nz, baseUp, dLo, a1);
+      writeVert(rx[j], y1, rz[j], nx, 0, nz, roofUp, 0, a1);
+      writeVert(rx[k], y1, rz[k], nx, 0, nz, roofUp, 0, a0);
+      ind[ip++] = b;
+      ind[ip++] = b + 1;
+      ind[ip++] = b + 2;
+      ind[ip++] = b;
+      ind[ip++] = b + 2;
+      ind[ip++] = b + 3;
+      run += len;
+    }
+
+    // --- roof ------------------------------------------------------------
+    const roofBase = vp;
+    for (let k = 0; k < n; k++) writeVert(rx[k], y1, rz[k], 0, 1, 0, roofUp, 0, 0);
+
+    const pts = v2view(n);
+    for (let k = 0; k < n; k++) pts[k].set(rx[k], rz[k]);
+    let faces;
+    try {
+      faces = THREE.ShapeUtils.triangulateShape(pts, []);
+    } catch {
+      faces = null;
+    }
+    if (!faces || faces.length !== n - 2) {
+      // 46 of the 23,979 source rings PINCH — they touch themselves, usually
+      // where a light well or a covered walkway was traced as a zero-width
+      // spur. Ear clipping correctly refuses those ears and comes back with
+      // fewer triangles than the polygon has, which would leave a hole in the
+      // roof that you look straight through to the terrain.
+      //
+      // A fan over the raw ring is the obvious repair and it is the wrong one:
+      // on a 25-vertex concave outline it throws triangles well outside the
+      // building. The convex hull is bounded — it can only over-cover into the
+      // polygon's own concavities, never past its extent — and it always
+      // triangulates, because a hull is convex by construction. Its m-2
+      // triangles fit inside the n-2 budget with room to spare; the unused
+      // index slots stay zero, which is the triangle (0,0,0) and never
+      // rasterises.
+      degenerateRoofs++;
+      const hull = convexHullIdx(rx, rz, n);
+      faces = [];
+      for (let k = 1; k < hull.length - 1; k++) faces.push([hull[0], hull[k], hull[k + 1]]);
+    }
+    for (const f of faces) {
+      // Emit the winding that faces up. The ring is already arranged for it,
+      // but triangulateShape can hand back either orientation.
+      const a = f[0];
+      const b = f[1];
+      const c = f[2];
+      const cross = (rz[b] - rz[a]) * (rx[c] - rx[a]) - (rx[b] - rx[a]) * (rz[c] - rz[a]);
+      ind[ip++] = roofBase + a;
+      if (cross > 0) {
+        ind[ip++] = roofBase + b;
+        ind[ip++] = roofBase + c;
+      } else {
+        ind[ip++] = roofBase + c;
+        ind[ip++] = roofBase + b;
+      }
+    }
+
+    // Colour is per building, so paint the whole span in one go.
+    for (let k = v0; k < vp; k++) {
+      col[k * 3] = _rgb[0];
+      col[k * 3 + 1] = _rgb[1];
+      col[k * 3 + 2] = _rgb[2];
+    }
+  }
+
+  // `aDown` is metres below the roof, passed explicitly rather than derived
+  // from a shared scratch: at the roof it is 0 and at the base it is the
+  // building's OWN height, so vUp + vDown is the building height at every
+  // fragment — which is how the fragment shader tells a house from an office
+  // block without a fourth attribute.
+  function writeVert(x, y, z, nx, ny, nz, upDm, downDm, alongDm) {
+    const p3 = vp * 3;
+    pos[p3] = x;
+    pos[p3 + 1] = y;
+    pos[p3 + 2] = z;
+    nor[p3] = Math.round(nx * 127);
+    nor[p3 + 1] = Math.round(ny * 127);
+    nor[p3 + 2] = Math.round(nz * 127);
+    up[vp] = upDm;
+    down[vp] = downDm;
+    along[vp] = alongDm;
+    vp++;
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nor, 3, true));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
+  g.setAttribute('aUp', new THREE.BufferAttribute(up, 1));
+  g.setAttribute('aDown', new THREE.BufferAttribute(down, 1));
+  g.setAttribute('aAlong', new THREE.BufferAttribute(along, 1));
+  g.setIndex(new THREE.BufferAttribute(ind, 1));
+  g.computeBoundingSphere();
+  return g;
+}
+
+let degenerateRoofs = 0;
+
+/**
+ * Stats from the last real-footprint build, for the check script and for
+ * `window.sim`.
+ * @type {object|null}
+ */
+export let cityStats = null;
+
+/**
+ * Build the city and hang it under `group`.
+ *
+ * @param {THREE.Group} group
+ * @param {object} set BuildingSet
+ * @param {{x:number,z:number,radiusM:number}[]} exclude
+ */
+function buildRealCity(group, set, exclude) {
+  const t0 = now();
+  degenerateRoofs = 0;
+
+  const count = set.count;
+  const lx = new Float32Array(count);
+  const lz = new Float32Array(count);
+  const baseY = new Float32Array(count);
+  const topY = new Float32Array(count);
+  const chunks = new Map();
+
+  let excluded = 0;
+  let tris = 0;
+
+  for (let i = 0; i < count; i++) {
+    llToLocal(set.anchorLat[i], set.anchorLon[i], _bXZ);
+    const ax = _bXZ.x;
+    const az = _bXZ.z;
+    lx[i] = ax;
+    lz[i] = az;
+
+    // Centroid, and the footprint's own bounding box, in one pass.
+    const s = set.ringStart[i];
+    const e = set.ringStart[i + 1];
+    let a = 0;
+    let ce = 0;
+    let cn = 0;
+    for (let k = s; k < e; k++) {
+      const ee = set.ringE[k];
+      const nn = set.ringN[k];
+      const j = k + 1 < e ? k + 1 : s;
+      const cr = ee * set.ringN[j] - set.ringE[j] * nn;
+      a += cr;
+      ce += (ee + set.ringE[j]) * cr;
+      cn += (nn + set.ringN[j]) * cr;
+    }
+    if (Math.abs(a) < 1e-6) continue;
+    const cx = ax + ce / (3 * a);
+    const cz = az - cn / (3 * a);
+
+    // Keep-out discs: the named towers keep their real modelled geometry, so a
+    // generic extrusion must not grow up through the Space Needle.
+    let blocked = false;
+    for (const ex of exclude) {
+      if ((cx - ex.x) ** 2 + (cz - ex.z) ** 2 < ex.radiusM * ex.radiusM) {
+        blocked = true;
+        break;
+      }
+    }
+    if (blocked) {
+      excluded++;
+      continue;
+    }
+
+    // Ground: the DEM at the centroid sets the roof, the DEM at the footprint's
+    // four corners sets how deep to bury it. Five samples per building; at the
+    // measured 115 ns per warm sample that is 14 ms for the whole city.
+    localToLl(cx, cz, _bLL);
+    const ground = getElevation(_bLL.lat, _bLL.lon);
+    if (!Number.isFinite(ground)) continue;
+    // The DEM at up to eight of the footprint's OWN vertices, not at its
+    // bounding box, sets how deep to bury it. The bbox was tried first and
+    // leaks: an L-shaped building on Queen Anne has vertices over ground lower
+    // than any of its four bbox corners, and those corners then float. Real
+    // vertices cannot, because they are the points the walls actually stand on.
+    // EVERY vertex, not a sample of them. Sampling every eighth was tried and
+    // leaves 1.07 m of float on the worst building in the city: on a Queen Anne
+    // hillside the DEM between two sampled vertices drops further than the
+    // embed slack covers. 224,796 lookups at the measured 115 ns is 26 ms, once.
+    let lo = ground;
+    for (let k = s; k < e; k++) {
+      localToLl(ax + set.ringE[k], az - set.ringN[k], _bLL);
+      const gg = getElevation(_bLL.lat, _bLL.lon);
+      if (gg < lo) lo = gg;
+    }
+
+    topY[i] = ground + set.heightM[i];
+    baseY[i] = Math.min(lo, ground) - CITY_EMBED_SLACK_M;
+
+    const key = `${Math.floor(cx / CITY_CHUNK_M)},${Math.floor(cz / CITY_CHUNK_M)}`;
+    let c = chunks.get(key);
+    if (!c) {
+      c = {
+        ox: (Math.floor(cx / CITY_CHUNK_M) + 0.5) * CITY_CHUNK_M,
+        oz: (Math.floor(cz / CITY_CHUNK_M) + 0.5) * CITY_CHUNK_M,
+        tall: [],
+        major: [],
+        minor: [],
+      };
+      chunks.set(key, c);
+    }
+    if (set.heightM[i] >= TALL_H_M) c.tall.push(i);
+    else if (set.heightM[i] >= MAJOR_H_M || set.areaM2[i] >= MAJOR_AREA_M2) c.major.push(i);
+    else c.minor.push(i);
+    tris += 3 * (e - s) - 2;
+  }
+
+  let meshes = 0;
+  let bytes = 0;
+  for (const c of chunks.values()) {
+    const cg = new THREE.Group();
+    cg.name = 'city-chunk';
+
+    // THREE.LOD.update() is called by the renderer itself during projectObject,
+    // so a cutoff needs no per-frame contract in main.js. Level 1 is an empty
+    // Object3D, which is how a LOD says "draw nothing from here out".
+    const tier = (list, name, cutoffM) => {
+      if (!list.length) return;
+      const g = extrudeChunk(set, list, baseY, topY, lx, lz, c.ox, c.oz);
+      if (!g) return;
+      const mesh = new THREE.Mesh(g, matCityMerged());
+      mesh.name = name;
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      if (cutoffM === Infinity) {
+        mesh.position.set(c.ox, 0, c.oz);
+        cg.add(mesh);
+      } else {
+        const lod = new THREE.LOD();
+        lod.position.set(c.ox, 0, c.oz);
+        lod.addLevel(mesh, 0);
+        lod.addLevel(new THREE.Object3D(), cutoffM);
+        cg.add(lod);
+      }
+      meshes++;
+      bytes += geometryBytes(g);
+    };
+    tier(c.tall, 'city-tall', Infinity);
+    tier(c.major, 'city-major', MAJOR_CUTOFF_M);
+    tier(c.minor, 'city-minor', MINOR_CUTOFF_M);
+    group.add(cg);
+  }
+
+  const ms = now() - t0;
+  cityStats = {
+    buildings: count - excluded,
+    excludedByLandmarks: excluded,
+    chunks: chunks.size,
+    meshes,
+    triangles: tris,
+    gpuBytes: bytes,
+    degenerateRoofs,
+    buildMs: ms,
+    provenance: set.meta.provenance,
+    source: set.meta.source,
+  };
+  console.info(
+    `[city] ${cityStats.buildings.toLocaleString()} real footprints extruded, ` +
+      `${(tris / 1000).toFixed(0)}k triangles in ${meshes} meshes across ${chunks.size} chunks, ` +
+      `${(bytes / 1048576).toFixed(1)} MiB of buffers, built in ${ms.toFixed(0)} ms` +
+      (excluded ? ` (${excluded} inside a modelled landmark's keep-out)` : '') +
+      (degenerateRoofs ? ` — ${degenerateRoofs} self-touching rings got a convex-hull roof` : ''),
+  );
+}
+
+function geometryBytes(g) {
+  let b = 0;
+  for (const name of Object.keys(g.attributes)) {
+    const a = g.attributes[name];
+    b += a.array.byteLength;
+  }
+  if (g.index) b += g.index.array.byteLength;
+  return b;
+}
+
+const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/**
+ * The city under the skyline.
+ *
+ * SELF-POPULATING, like `landmarks.placeLandmarks`: this returns an EMPTY group
+ * immediately and fills it once the footprint bake resolves, starting that load
+ * itself. Callers hold the group and never re-attach anything. `group.children`
+ * is empty on the calling frame — do not measure it there.
+ *
+ * That is a change from round 1, which returned an InstancedMesh synchronously.
+ * `landmarks.js` does `const mass = buildDowntownMass(...); if (mass) group.add(mass)`
+ * and a Group satisfies both lines unchanged, so nothing outside this file moves.
+ *
+ * @param {object} [opts]
+ * @param {{x:number,z:number,radiusM:number}[]} [opts.exclude] Keep-out discs,
+ *   normally the footprints of the modelled landmarks.
+ * @param {number} [opts.seed] Fallback path only.
+ * @param {boolean} [opts.real=true] Set false to force the procedural fallback.
+ * @returns {THREE.Group} Named 'downtown-mass'.
+ */
 export function buildDowntownMass(opts = {}) {
+  const group = new THREE.Group();
+  group.name = 'downtown-mass';
+  const exclude = opts.exclude ?? [];
+
+  const start = opts.real === false ? Promise.resolve(null) : loadBuildings();
+  start.then((set) => {
+    // The landmarks group may have been disposed while the fetch was in flight;
+    // building into an orphan would allocate buffers nobody can free.
+    if (group.parent === null) return;
+    if (set && set.count) {
+      buildRealCity(group, set, exclude);
+      return;
+    }
+    const mass = buildProceduralCityMass({ exclude, seed: opts.seed });
+    if (mass) group.add(mass);
+  });
+
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// The procedural fallback — round 1's block grid, kept for §1.6
+// ---------------------------------------------------------------------------
+
+/**
+ * Instanced filler blocks, used ONLY when `public/data/buildings.json` is
+ * absent. These are not geographic truth and never were; they exist so that a
+ * checkout without the bake still shows a city rather than bare hills.
+ *
+ * Three things make it read as Seattle rather than as noise:
+ *
+ *  - The GRID ANGLE is real. Downtown's core grid runs about 30 deg off north,
+ *    parallel to the Elliott Bay shoreline, while everything north of Denny Way
+ *    — Seattle Center, where the Needle is — sits on a true N-S grid.
+ *  - Blocks are Seattle blocks: ~73 m square on a ~91 m pitch.
+ *  - Heights fall off from each core, so downtown has a peak and a skirt.
+ *
+ * Water and ground come from the DEM, so blocks neither march into Elliott Bay
+ * nor float above the hill they are standing on.
+ */
+const CLUSTERS = [
+  { lat: 47.606, lon: -122.332, halfLenM: 1100, halfWidM: 760, gridDeg: 30, maxH: 175, falloffM: 700 },
+  { lat: 47.6175, lon: -122.337, halfLenM: 850, halfWidM: 620, gridDeg: 30, maxH: 135, falloffM: 620 },
+  { lat: 47.6235, lon: -122.352, halfLenM: 700, halfWidM: 560, gridDeg: 0, maxH: 40, falloffM: 620 },
+  { lat: 47.6145, lon: -122.1985, halfLenM: 650, halfWidM: 520, gridDeg: 0, maxH: 150, falloffM: 460 },
+];
+
+const BLOCK_PITCH_M = 91;
+const BLOCK_SIZE_M = 71;
+
+/**
+ * @param {object} [opts]
+ * @returns {THREE.InstancedMesh|null}
+ */
+export function buildProceduralCityMass(opts = {}) {
   const exclude = opts.exclude ?? [];
   const rand = mulberry32(opts.seed ?? 0x5ea77e);
 
@@ -1308,8 +1967,6 @@ export function buildDowntownMass(opts = {}) {
     llToLocal(c.lat, c.lon, ll);
     const cx = ll.x;
     const cz = ll.z;
-    // Rotate the block grid onto the cluster's street bearing, with the same
-    // mapping landmarks.js uses: local +X onto heading `gridDeg`.
     const th = (90 - c.gridDeg) * DEG;
     const cos = Math.cos(th);
     const sin = Math.sin(th);
@@ -1324,9 +1981,8 @@ export function buildDowntownMass(opts = {}) {
         const x = cx + (gu * cos - gv * sin);
         const z = cz + (-gu * sin - gv * cos);
 
-        // Streets, parks, parking lots, the freeway trench. Draw first so the
-        // sequence of rand() calls does not depend on the rejections below —
-        // otherwise adding a landmark reshuffles the entire skyline.
+        // Draw first so the sequence of rand() calls does not depend on the
+        // rejections below — otherwise adding a landmark reshuffles the skyline.
         const skip = rand() < 0.17;
         const jitterH = rand();
         const jitterW = rand();
@@ -1343,10 +1999,8 @@ export function buildDowntownMass(opts = {}) {
 
         localToLl(x, z, geo3);
         // isWater() is getElevation() <= 0.5 m, and getElevation() is TOTAL:
-        // with no DEM loaded it returns sea level for every query, so every
-        // cell would test as water and the entire city would silently vanish.
-        // Skipping the test when the DEM is absent degrades to "a city on a
-        // flat world" rather than "no city", per MODULES.md §1.6.
+        // with no DEM loaded it returns sea level everywhere, so every cell
+        // would test as water and the city would silently vanish (§1.6).
         if (demLoaded && isWater(geo3.lat, geo3.lon)) continue;
         const ground = getElevation(geo3.lat, geo3.lon);
         if (!Number.isFinite(ground)) continue;
@@ -1365,18 +2019,16 @@ export function buildDowntownMass(opts = {}) {
 
   const mesh = new THREE.InstancedMesh(
     new THREE.BoxGeometry(1, 1, 1),
-    mat('cityMass', makeCityFacadeMaterial),
+    matCityInstanced(),
     placements.length,
   );
-  mesh.name = 'downtown-mass';
+  mesh.name = 'downtown-mass-procedural';
   mesh.castShadow = true;
   mesh.receiveShadow = true;
 
   const t3 = new THREE.Object3D();
   const col = new THREE.Color();
-  // Sink each block so a sloping street does not show daylight under the
-  // uphill corner. Downtown Seattle climbs ~70 m off the waterfront, so this
-  // is not hypothetical.
+  const rgb = new Uint8Array(3);
   const EMBED_M = 7;
 
   for (let i = 0; i < placements.length; i++) {
@@ -1391,22 +2043,8 @@ export function buildDowntownMass(opts = {}) {
     t3.updateMatrix();
     mesh.setMatrixAt(i, t3.matrix);
 
-    // Three material families, not one grey ramp. A real downtown block is
-    // green-tinted curtain wall next to warm precast next to dark 1970s glass,
-    // and the fastest way to make a city read as a set of identical sugar
-    // cubes — which is exactly what an A/B picks out — is to give every block
-    // the same hue and vary only its brightness. Tall blocks lean toward glass
-    // and short ones toward masonry, which is how the real stock sorts itself.
-    const v = 0.50 + 0.30 * p.r - Math.min(0.20, p.h / 900);
-    const glassBias = Math.min(1, p.h / 120);
-    const fam = (p.r * 3.7 + glassBias) % 1;
-    if (fam < 0.42) {
-      col.setRGB(v * 0.80, v * 0.93, v * 1.00); // green-blue curtain wall
-    } else if (fam < 0.74) {
-      col.setRGB(v * 1.06, v * 1.01, v * 0.92); // warm precast concrete
-    } else {
-      col.setRGB(v * 0.72, v * 0.74, v * 0.82); // dark glass / dark stone
-    }
+    cityFamilyRGB(p.h, p.r, rgb, 0);
+    col.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, THREE.LinearSRGBColorSpace);
     mesh.setColorAt(i, col);
   }
   mesh.instanceMatrix.needsUpdate = true;

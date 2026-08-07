@@ -11,6 +11,7 @@ npm run bake:dem          # elevation tiles  -> public/dem/
 npm run bake:airports     # airports+runways -> public/data/airports.json
 npm run bake:landmarks    # landmarks        -> public/data/landmarks.json
 npm run bake:landcover    # NLCD + roads     -> public/landcover/
+node scripts/bake-buildings.mjs   # real footprints  -> public/data/buildings.json
 ```
 
 `npm run bake` is **not** wired into `npm run build`. Baking touches the network
@@ -24,6 +25,7 @@ needs refreshing, commit the output, move on.
 | AWS Terrarium DEM | **No CORS header.** The browser can display those PNGs but cannot `getImageData()` them — the canvas is tainted and throws `SecurityError`. Since we need the pixel values *as elevation*, they are unusable client-side. No workaround exists. |
 | OurAirports | CORS is fine, but the CSV is 13 MB and we use 0.3% of it. |
 | Wikidata | CORS is fine, but the query needs curated Q-IDs and careful filtering (see below); doing that per page load is slow and fragile. |
+| Microsoft Building Footprints | The Washington extract is **118 MB zipped, 927 MB inflated** and we use 0.18% of it. And the release that carries a height field carries a **useless** one: the DSM it comes from saturates near 35 m, so Columbia Center (284 m) reads 25.1 m. That has to be measured once and written down, not rediscovered per page load. |
 | Overpass / OSM | **Returned 504 on probe, twice, months apart. Treat as unreliable. Do not build a dependency on it.** Roads come from the Census Bureau's TIGERweb instead, which answered every request. |
 | NLCD via MRLC WMS | Returns the STYLED raster, not raw class values, so the baker maps each pixel back to its class by nearest legend colour. Fine — the palette is ~16 widely separated colours and the response is palette-indexed, so the match is exact. |
 
@@ -57,6 +59,17 @@ public/
   data/
     airports.json          { generated, source, bbox, airports:[...] }
     landmarks.json         { generated, source, landmarks:[...] }
+    buildings.json         { generated, source, bbox, quantM, quantDeg, scaleLat,
+                             count, provenance, districts, anchors:[...],
+                             rings:[...], heights:[...], src:"pdm..." }
+                           Parallel flat integer arrays, delta-encoded. Ring
+                           vertices are METRES from each building's anchor,
+                           quantised to 0.25 m. `scaleLat` MUST match coords.js
+                           or every footprint is the wrong size, and the loader
+                           refuses the file rather than draw it. `src` is one
+                           char per building: p = published height, m = DSM
+                           storey count, d = derived. THE HEIGHTS ARE NOT
+                           SURVEYED except for the 32 tagged 'p'.
   landcover/
     manifest.json          { generated, sources, encoding, classes, layers:[...] }
     region.png             RGB8 DATA, not a picture: R = NLCD class code,
