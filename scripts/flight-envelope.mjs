@@ -997,6 +997,59 @@ head('16. solidity — the terrain is not a suggestion');
 }
 
 // ---------------------------------------------------------------------------
+// Airframe overload: a HELD load breaks it, a TRANSIENT does not.
+//
+// Reported symptom: "airframe overload — -6.0 g" firing repeatedly in ordinary
+// flight. -6.0 was the threshold value itself showing through. The test read an
+// instantaneous specific-force sample once per 1/240 s substep and wrote the
+// aeroplane off on a single reading, so any numerical transient — a gear leg
+// releasing, a DEM tile paging in, an LOD refinement moving the ground — was a
+// fatal crash. The gear test one line above already guarded against exactly
+// this; the airframe test did not.
+// ---------------------------------------------------------------------------
+console.log('\nairframe overload — held vs transient');
+{
+  const m = makeModel();
+  m.reset(47.53, -122.30, 0, { altitudeMslM: 3000 * 0.3048, airspeedMs: 110 * 0.514444 });
+  const cruise = { pitch: 0, roll: 0, yaw: 0, throttle: 0.65, flaps: 0, brakes: 0, gear: 1 };
+  for (let i = 0; i < 30; i += 1) m.step(1 / 60, cruise, FIELD_M);
+
+  let peak = 0;
+  for (let i = 0; i < 600; i += 1) {
+    // A violent one-frame slam every ~1.6 s: the shape of a transient.
+    const c = { ...cruise, pitch: i % 97 === 0 ? -1 : 0 };
+    m.step(1 / 60, c, FIELD_M);
+    peak = Math.max(peak, Math.abs(m.state.loadFactor));
+  }
+  assert(
+    'transient spikes do NOT break the airframe',
+    !m.state.crashed,
+    `peak |g| ${peak.toFixed(1)} over 10 s of stick slams`,
+  );
+}
+{
+  const m = makeModel();
+  m.reset(47.53, -122.30, 0, { altitudeMslM: 3000 * 0.3048, airspeedMs: 150 * 0.514444 });
+  const cruise = { pitch: 0, roll: 0, yaw: 0, throttle: 1, flaps: 0, brakes: 0, gear: 1 };
+  for (let i = 0; i < 30; i += 1) m.step(1 / 60, cruise, FIELD_M);
+
+  let brokeAt = null;
+  for (let i = 0; i < 900 && brokeAt === null; i += 1) {
+    m.step(1 / 60, { ...cruise, pitch: 1 }, FIELD_M);
+    if (m.state.crashed) brokeAt = i / 60;
+  }
+  assert(
+    'a HELD full-back pull still breaks it',
+    brokeAt !== null,
+    brokeAt !== null ? `${m.state.crashDetail} at ${brokeAt.toFixed(2)} s` : 'survived 15 s',
+  );
+  assert(
+    'and the reason names the duration, not just the number',
+    /held for \d+ ms/.test(m.state.crashDetail || ''),
+    m.state.crashDetail,
+  );
+}
+
 function fmtV(v) {
   return `${v.x.toFixed(0)}, ${v.y.toFixed(0)}, ${v.z.toFixed(0)}`;
 }

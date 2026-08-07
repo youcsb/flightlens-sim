@@ -365,7 +365,49 @@ const REBOUND_DAMP = 0.7;
  */
 const GEAR_STROKE_M = 0.4;
 const CRASH_CLOSING_MS = 5.0;
+
+/**
+ * Airframe limits.
+ *
+ * WHY THERE ARE TWO, AND WHY ONE OF THEM IS TIMED.
+ *
+ * `state.loadFactor` is an INSTANTANEOUS specific-force reading taken once per
+ * 1/240 s substep. Testing it directly against a single threshold writes the
+ * aeroplane off for a 4-millisecond numerical transient — and this simulation
+ * manufactures those routinely: a gear leg releasing its spring, a DEM tile
+ * paging in, an LOD refinement moving the ground under the wheels. Players hit
+ * "airframe overload — -6.0 g" repeatedly in ordinary flight, which is the
+ * threshold value itself showing through, not an aerodynamic event.
+ *
+ * The gear test immediately below already guards against exactly this class of
+ * artefact — its comment explains that an LOD refinement raising the ground
+ * under a PARKED aeroplane must not be a crash. The airframe test needed the
+ * same treatment and did not have it.
+ *
+ * A real airframe fails from load SUSTAINED over a meaningful interval, so:
+ *
+ *   SUSTAINED  — beyond CRASH_LOAD_G continuously for CRASH_LOAD_SUSTAIN_S.
+ *                This is overstress: a hard pull held long enough to matter.
+ *   INSTANT    — beyond CRASH_LOAD_INSTANT_G in a single sample. The impact
+ *                path: hitting a cliff produces loads far past the manoeuvring
+ *                limit and waiting to admit it would be absurd.
+ *
+ * THE 60 ms WINDOW IS MEASURED, NOT PICKED. Arrival sink rates, run through the
+ * envelope harness's own landing setup:
+ *
+ *     700 fpm   peak 4.77 g   held   0 ms   must survive — it is a hard landing
+ *   1,200 fpm   peak 7.33 g   held  54 ms
+ *   1,400 fpm   peak 8.38 g   held  71 ms   must crash
+ *   1,800 fpm   peak 10.1 g   held 104 ms   must crash
+ *
+ * 60 ms sits in the gap: a 700 fpm arrival never reaches the limit at all, and
+ * a 1,400 fpm arrival holds it comfortably past the window. 60 ms is also 14
+ * substeps at 1/240 s, an order of magnitude longer than the one- and two-sample
+ * spikes that were causing the spurious crashes.
+ */
 const CRASH_LOAD_G = 6.0;
+const CRASH_LOAD_SUSTAIN_S = 0.06;
+const CRASH_LOAD_INSTANT_G = 12.0;
 /**
  * Structural failure speed, as a multiple of Vne (indicated). 1.3 x 165 kt =
  * 214 kt IAS. Below it the airframe merely complains (`state.overspeed`);
@@ -655,6 +697,10 @@ export function createFlightModel(opts = {}) {
     groundSpeedKts: 0,
     /** Load factor along the body vertical, in g. 1.0 in level flight. */
     loadFactor: 1,
+    /** Seconds the airframe has been continuously beyond its manoeuvring
+     *  limit. Diagnostic: non-zero here without a crash means a transient was
+     *  correctly absorbed rather than written off. */
+    overGSeconds: 0,
     /** Approaching the critical angle of attack — the buffet, not the break. */
     stallWarning: false,
     /** Fraction of separated flow over the wing, 0..1. 0 until the break. */
@@ -739,6 +785,10 @@ export function createFlightModel(opts = {}) {
   let surfRoll = 0;
   let surfYaw = 0;
   let flapPos = 0;
+
+  /** Seconds spent continuously beyond CRASH_LOAD_G. Zeroed the moment the
+   *  load comes back inside the limit, so only a HELD overload accumulates. */
+  let overGSeconds = 0;
   /** Lagged engine state, 0..1. Drives thrust AND the rpm needle. */
   let engineSpool = 0;
   // Parsed inputs for the current step(), read by every substep.
@@ -1383,10 +1433,30 @@ export function createFlightModel(opts = {}) {
       // 2. The airframe. Ultimate load, either sign. Backstop for every impact
       //    the gear test does not catch: a wingtip-first arrival, a wall taken
       //    at an angle where no single leg bottoms but the aeroplane stops.
-      if (Math.abs(state.loadFactor) > CRASH_LOAD_G) {
+      //
+      //    Two paths — see the CRASH_LOAD_* block for why. A single substep
+      //    beyond the manoeuvring limit is a transient, not a failure; the
+      //    aeroplane has to HOLD the load to break. An impact-scale reading
+      //    fails immediately because waiting 100 ms to admit it would be absurd.
+      const absG = Math.abs(state.loadFactor);
+      overGSeconds = absG > CRASH_LOAD_G ? overGSeconds + h : 0;
+      state.overGSeconds = overGSeconds;
+
+      if (absG > CRASH_LOAD_INSTANT_G) {
         triggerCrash(
           'overstress',
           `airframe overload — ${state.loadFactor.toFixed(1)} g` +
+            (deepest > 0 ? ' on impact' : ''),
+          worstClosing,
+          gh,
+        );
+        return;
+      }
+      if (overGSeconds >= CRASH_LOAD_SUSTAIN_S) {
+        triggerCrash(
+          'overstress',
+          `airframe overload — ${state.loadFactor.toFixed(1)} g held for ` +
+            `${(overGSeconds * 1000).toFixed(0)} ms` +
             (deepest > 0 ? ' on impact' : ''),
           worstClosing,
           gh,
@@ -1569,6 +1639,8 @@ export function createFlightModel(opts = {}) {
    * @param {{altitudeAglM?:number, altitudeMslM?:number, airspeedMs?:number}} [placement]
    */
   function reset(lat, lon, headingDeg, placement) {
+    overGSeconds = 0;
+    state.overGSeconds = 0;
     const useLat = Number.isFinite(lat) ? lat : cfg.startLat;
     const useLon = Number.isFinite(lon) ? lon : cfg.startLon;
     const useHdg = Number.isFinite(headingDeg) ? headingDeg : cfg.startHeadingDeg;
