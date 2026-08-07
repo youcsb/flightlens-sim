@@ -189,6 +189,7 @@ export function createOverlay(container, o = {}) {
   const stCam = row(status, 'VIEW');
   const stTime = row(status, 'TIME');
   const stAudio = row(status, 'SOUND');
+  const stAp = row(status, 'A/P');
   root.appendChild(status);
 
   // --- key legend ---------------------------------------------------------
@@ -286,6 +287,23 @@ export function createOverlay(container, o = {}) {
       stAudio.textContent = label;
       stAudio.classList.toggle('warn', !!warn);
     },
+    /**
+     * Autopilot annunciator. Called every frame, so it writes the DOM only
+     * when the text actually changes — `textContent` assignment on an unchanged
+     * string still dirties layout in some engines.
+     *
+     * Engaged reads "HDG 040  ALT 3500" so the bugs are visible without opening
+     * anything; disengaged it shows the armed bugs in grey, because the numbers
+     * you are about to fly to matter before you press the button.
+     */
+    setAutopilot(ap) {
+      const txt = ap.engaged
+        ? `HDG ${String(Math.round(ap.headingBug)).padStart(3, '0')} · ALT ${Math.round(ap.altitudeBug)}`
+        : 'off';
+      if (stAp.textContent !== txt) stAp.textContent = txt;
+      stAp.classList.toggle('v', true);
+      stAp.classList.toggle('warn', !!ap.engaged);
+    },
     setPaused(p) {
       pausedEl.classList.toggle('show', !!p);
     },
@@ -331,6 +349,10 @@ const KEYMAP = [
   ['R · P', 'reset · pause'],
   ['T · N', 'time of day · mute'],
   ['M', 'mouse yoke'],
+  ['L', 'autopilot on / off'],
+  ['[ · ]', 'heading bug −/+ (hold)'],
+  ['Y', 'bug to present heading'],
+  ['U · J', 'altitude bug +/− 100'],
 ];
 
 function esc(s) {

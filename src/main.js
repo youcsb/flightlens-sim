@@ -55,10 +55,14 @@ import { createOverlay } from './ui/overlay.js';
 import { createInput } from './controls/input.js';
 import { createCameras } from './camera/cameras.js';
 import { createSoundscape } from './audio/soundscape.js';
+import { createAutopilot } from './systems/autopilot.js';
 import { eventCode } from './core/keycode.js';
 
 const appEl = document.getElementById('app');
 const hudEl = document.getElementById('hud');
+
+/** Consecutive auto-repeats of the heading-bug key, for the acceleration ramp. */
+let hdgRepeat = 0;
 
 // ---------------------------------------------------------------------------
 // Places you can start from.
@@ -278,6 +282,7 @@ async function boot() {
   const input = createInput(renderer.domElement);
   const cameras = createCameras(aircraft.group, renderer);
   const sound = createSoundscape();
+  const autopilot = createAutopilot();
 
   // Seed the aircraft transform so the first frame is already correct.
   aircraft.group.position.copy(flight.state.position);
@@ -440,6 +445,45 @@ async function boot() {
       case 'KeyH':
         overlay.toggleKeys();
         break;
+
+      // --- autopilot -------------------------------------------------------
+      // The bug keys work whether or not it is engaged: you dial the heading
+      // you want, then press L. That is the order a real pilot works in, and it
+      // means engaging never produces a surprise turn.
+      case 'KeyL': {
+        // NB: `state` is a frame-loop local (see the render loop below); the
+        // key handler must go through flight.state or it throws.
+        const r = autopilot.toggle(flight.state);
+        if (!r.ok) overlay.toast(`autopilot unavailable — ${r.reason}`);
+        else if (autopilot.engaged) {
+          overlay.toast(
+            `autopilot on · HDG ${String(autopilot.headingBug).padStart(3, '0')} · ALT ${autopilot.altitudeBug}`,
+          );
+        } else overlay.toast('autopilot off');
+        break;
+      }
+      case 'BracketLeft':
+      case 'BracketRight': {
+        // Held keys repeat, and the repeat accelerates: a tap is 1 degree for
+        // fine work, a hold swings round the compass without 180 keypresses.
+        const dir = code === 'BracketRight' ? 1 : -1;
+        hdgRepeat = e.repeat ? Math.min(hdgRepeat + 1, 60) : 0;
+        const step = hdgRepeat > 30 ? 5 : hdgRepeat > 12 ? 2 : 1;
+        const bug = autopilot.nudgeHeading(dir * step);
+        overlay.toast(`HDG bug ${String(bug).padStart(3, '0')}`);
+        break;
+      }
+      case 'KeyY': {
+        const bug = autopilot.syncHeading(flight.state);
+        overlay.toast(`HDG bug ${String(bug).padStart(3, '0')} — present heading`);
+        break;
+      }
+      case 'KeyU':
+      case 'KeyJ': {
+        const bug = autopilot.nudgeAltitude(code === 'KeyU' ? 100 : -100);
+        overlay.toast(`ALT bug ${bug} ft`);
+        break;
+      }
       case 'Digit1':
       case 'Digit2':
       case 'Digit3':
@@ -496,6 +540,12 @@ async function boot() {
     const inputs = input.get();
 
     if (!paused) {
+      // 1b. autopilot. It writes into the SAME inputs object the keyboard just
+      //     produced, before the model sees it — so the aeroplane cannot tell
+      //     the difference and the autopilot is bound by the same aerodynamics
+      //     the pilot is. No-op when disengaged. See systems/autopilot.js.
+      autopilot.update(dt, state, inputs);
+
       // 2. ground under the aircraft, in metres. ONE surface: §1.4.
       const groundHeight = terrain.getHeightAt(state.position.x, state.position.z);
 
@@ -519,6 +569,7 @@ async function boot() {
     // 6. hud + sound. The crash card is driven off the model's latched flag,
     //    not off an event, so it survives a paused frame and a camera change.
     instruments.update(state, inputs);
+    overlay.setAutopilot(autopilot);
     overlay.setCrashed(state.crashed, state.crashDetail);
     if (state.crashed !== crashLogged) {
       crashLogged = state.crashed;
@@ -578,6 +629,7 @@ async function boot() {
     aircraft,
     input,
     sound,
+    autopilot,
     gotoPlace,
     /**
      * DEM paging diagnostics — acceptance check 9. The tiles on disk total
