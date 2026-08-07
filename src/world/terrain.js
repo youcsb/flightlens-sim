@@ -1046,6 +1046,15 @@ export async function createTerrain(scene, opts = {}) {
     const nz = Math.floor(_camPos.z / 32) * 32;
     terrainMat.userData.uniforms.uNoiseOrigin.value.set(nx, nz);
 
+    // What inland water reflects. Read here as well as in the water block below
+    // because the terrain draws standing water that no water MESH covers — see
+    // the inland-water block in makeTerrainMaterial. sky.js rewrites this every
+    // frame, so a stale copy would leave every river reflecting noon at dusk.
+    {
+      const sky = scene.fog?.color ?? null;
+      if (sky) terrainMat.userData.uniforms.uSkyColor.value.copy(sky);
+    }
+
     if (cfg.water) {
       const time = performance.now() * 0.001;
       const wx = Math.floor(_camPos.x / 256) * 256;
@@ -1755,6 +1764,12 @@ function makeTerrainMaterial(exag, landcover, fieldTexture, rect) {
   const uniforms = {
     uNoiseOrigin: { value: new THREE.Vector2() },
     uExag: { value: exag },
+    // The horizon airlight, i.e. what water reflects at a grazing angle. Same
+    // value and same source as the sea and lake shaders get (scene.fog.color,
+    // published by sky.js) — see the inland-water block in the fragment shader
+    // for why the TERRAIN needs it too.
+    uSkyColor: { value: new THREE.Color(0.55, 0.63, 0.72) },
+    uSeaLevel: { value: SEA_LEVEL_M },
     uField: { value: fieldTexture },
     uFieldRect: {
       value: new THREE.Vector4(
@@ -1848,6 +1863,8 @@ function makeTerrainMaterial(exag, landcover, fieldTexture, rect) {
         uniform vec2 uNoiseOrigin;
         uniform sampler2D uField;
         uniform vec4 uFieldRect;
+        uniform vec3 uSkyColor;
+        uniform float uSeaLevel;
         ${lcRegion ? 'uniform sampler2D uLcRegion; uniform vec4 uLcRegionRect; uniform vec2 uLcRegionTexel;' : ''}
         ${lcDetail ? 'uniform sampler2D uLcDetail; uniform vec4 uLcDetailRect; uniform vec2 uLcDetailTexel;' : ''}
         ${landcover ? 'uniform sampler2D uLcPalette;' : ''}
@@ -2140,9 +2157,64 @@ function terrainColourGlsl(lcRegion, lcDetail) {
   snowy *= 1.0 - lcOn * lcIsWater;
   `;
 
+  // -------------------------------------------------------------------------
+  // INLAND WATER — the channels and ponds no water SURFACE ever covers
+  // -------------------------------------------------------------------------
+  /*
+   * NLCD's "Open Water" class covers every tidal channel, river, pond and
+   * reservoir in the region. Two things then draw water: the sea plane, which
+   * is flat at sea level, and the lake meshes, which come from a detector that
+   * only accepts a flat, closed, local minimum above a quarter of a square
+   * kilometre. Everything in between belongs to neither.
+   *
+   * The Duwamish Waterway is the clearest case: land cover says Open Water, the
+   * DEM puts its surface at 4.84 m — well above the 0.25 m sea plane — and it is
+   * a river, so the lake detector correctly refuses it. Nothing covered it, and
+   * the terrain painted it with the palette's flat, unlit open-water albedo. The
+   * result was a hard black gash running from Elliott Bay down through Georgetown
+   * in every view of the city, and the same along every inlet and creek mouth in
+   * the region. Two of round 2's builders reported it independently — "hard black
+   * terrain patches along the Elliott Bay shoreline" — and neither owned the file
+   * it was in.
+   *
+   * It was never an albedo bug either. Water IS almost black in its own albedo;
+   * what makes it read as water rather than as a hole is that it REFLECTS THE
+   * SKY, and the two shaders that do draw water both do that (see
+   * WATER_COLOUR_GLSL). This gives water-classed ground standing above the sea
+   * plane the same treatment, cheaply: a Fresnel blend from a deep-water base
+   * toward the horizon airlight, from the same `scene.fog.color` the sea reads.
+   *
+   * GATED ON HEIGHT, so it cannot touch the seabed. Below the sea plane the
+   * existing seabed/beach ramp is correct and the water above it is drawn by the
+   * sea mesh; this only applies where the ground is 0.4 m or more ABOVE sea
+   * level, which is exactly the stranded case. Where a lake mesh does cover the
+   * ground, this draws underneath it and is never seen — harmless, and cheaper
+   * than telling the shader which texels the lake detector claimed.
+   *
+   * NO BRANCH, and no derivative here. It multiplies in after every dFdx/dFdy in
+   * the block above has been consumed, because a derivative inside flow that is
+   * not uniform across a 2x2 quad is undefined and this test straddles quads.
+   */
+  const lcInlandWater = !hasLc
+    ? ''
+    : /* glsl */ `
+  vec3 vDirW = normalize(vTerrWorld - cameraPosition);
+  float fres = pow(1.0 - clamp(dot(-vDirW, nw), 0.0, 1.0), 4.0);
+  vec3 cDeepFresh = tSrgb(vec3(0.030, 0.052, 0.062));
+  vec3 wCol = mix(cDeepFresh, uSkyColor, 0.12 + 0.78 * fres);
+  // Sun glitter comes free from the GGX lobe once roughness drops; the albedo
+  // only has to stop being a hole.
+  float inland = lcOn * lcIsWater * smoothstep(uSeaLevel + 0.4, uSeaLevel + 1.2, h);
+  col = mix(col, wCol, inland);
+`;
+
   const lcRough = !hasLc
     ? 'tRoughOut = 0.95;'
-    : 'tRoughOut = mix(0.95, lcRough, lcOn);';
+    : // `inland` comes from the block above. Dropping roughness on standing
+      // water is what turns the Fresnel term into a surface rather than a
+      // flat tint — the GGX lobe then puts the sun on it, which is the single
+      // strongest cue that a dark shape is water and not a hole.
+      'tRoughOut = mix(mix(0.95, lcRough, lcOn), 0.16, inland);';
 
   // What the ground is made of decides how much sub-metre relief it has, and
   // the survey knows. NOT lcAmt: that is the ALBEDO modulation strength, and it
@@ -2340,7 +2412,7 @@ ${lcReliefBlock}
   col *= 1.0 + (r0 - 0.5) * 0.26 * reliefAmp;
 
   ${lcFinalTint}
-
+${lcInlandWater}
   ${lcRough}
   tRoughOut = mix(tRoughOut, 0.58, snowy);
   tRoughOut = mix(tRoughOut, 0.86, rocky * 0.7);

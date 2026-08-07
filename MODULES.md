@@ -258,10 +258,11 @@ setViewer(x, z, vx?, vz?, dtMs?) -> void      // PER FRAME. Drives paging.
 warmAt(lat, lon)  -> Promise<void>            // page in around a point, then wait
 flushPaging()     -> Promise<void>            // drain everything. NOT per-frame.
 isLoaded() -> boolean
+getFieldEpoch() -> number                     // bumps when the ANSWER can have moved
 getRegionStats() -> {loaded, layers, tilesLoaded, tilesMissing, voidsRepaired,
                      minElevationM, maxElevationM, residentBytes,
                      peakResidentBytes, residentCapBytes, residentTiles,
-                     pageIns, evictions, capViolations, pendingLoads}
+                     pageIns, evictions, capViolations, fieldEpoch, pendingLoads}
 
 getElevation(lat, lon) -> metres MSL        // bilinear, never NaN, never throws
 getElevationLocal(x, z) -> metres MSL       // allocation-free
@@ -361,6 +362,35 @@ the flat-region heuristic described in §2.6, not this function.
 **Use `fillHeightGrid` for terrain geometry.** It is the same sampler as
 `getElevationLocal`, so the mesh and the collision surface cannot drift apart,
 and it avoids a few hundred thousand redundant allocations.
+
+**THE FIELD EPOCH — anything that CACHES a sample must watch it.**
+`getFieldEpoch()` is a monotonic counter, bumped whenever a tile decodes, a
+resident tile is evicted, or an arrival ramp reaches 1. It exists because paging
+turned a constant into a moving target, and the failure that causes is silent.
+
+Before paging, a consumer could sample the field once and keep the answer
+forever. `world/terrain.js` did exactly that in two places — each LOD node
+measures its geometric error once when it is created, and samples its vertices
+once when it is built. The bootstrap `converge()` runs at the scene origin while
+only the 51.8 m/px pinned base is resident, and the quadtree root is 262 km
+across, so the coarse nodes it creates cover the whole region — Mount Rainier
+included. Every one of them was measured, and drawn, against a surface four
+times coarser than the data that would later be resident under it:
+
+| at 3,000 m over the summit | before | after |
+|---|---|---|
+| drawn surface vs the field | 26.6 m worst, 23.3 m RMS | 0.005 m worst, 0.283 m RMS |
+| finest cell selected | 64 m | 8 m |
+
+`getHeightAt` was right the whole time, which is what made it invisible — the
+wheels were correct and the picture was wrong. Guarded by
+`scripts/check-terrain.mjs` §5 and §8.
+
+**The rule:** if you cache anything derived from the field, stamp it with the
+epoch and re-derive when the epoch has moved. Compare the re-derived value
+against the SAME measurement you cached, not against a different one taken at a
+different sample spacing — see `probeLo`/`probeHi` in terrain.js for the bug
+that costs you when you do not.
 
 ### 2.5 `src/geo/airports.js` — real fields, real runways
 
@@ -607,6 +637,31 @@ and below 12 m. This does not touch §1.4: `getHeightAt` still returns exactly
 `getElevationLocal`, and §1.4 already accepts that the drawn mesh deviates from
 the field between vertices. The sea is opaque out there by construction, so
 there is nothing to see behind it.
+
+**Inland water is drawn by the TERRAIN, not by a water mesh, and it has to
+reflect the sky.** Three things can be open water here and only two of them get
+a surface: the sea plane, which is flat at sea level, and the lake meshes, which
+come from a detector that only accepts a flat closed local minimum above
+0.25 km². Every tidal channel, river and creek mouth falls between them — the
+Duwamish Waterway is class "Open Water" with its surface at 4.84 m, well above
+the 0.25 m sea plane, and it is a river, so the lake detector correctly refuses
+it. Nothing covered it and the terrain painted it with the palette's flat, unlit
+open-water albedo: a hard black gash from Elliott Bay down through Georgetown in
+every view of the city, and the same along every inlet in the region.
+
+The fix is not a brighter albedo — water really is almost black in albedo. What
+makes it read as water rather than as a hole is that it reflects the sky, which
+is what the two real water shaders do. The terrain now does the cheap version of
+the same thing for water-classed ground standing **above** the sea plane: a
+Fresnel blend from a deep-water base toward `uSkyColor`, which is
+`scene.fog.color`, the same value the sea reads, republished every frame. Measured
+over the Duwamish at 300 m: 5th-percentile luminance 50.0 → 88.1, with the
+median unmoved (103.9 → 102.5) — the dark tail filled in, nothing else brightened.
+
+**If you add a uniform to the terrain material that sky.js owns, publish it from
+`update()`.** `uSkyColor` is rewritten every frame for the same reason the sea's
+copy is: sky.js moves it whenever the sun moves, and a stale copy leaves every
+river reflecting noon at dusk.
 
 ### 2.14 `src/geo/landcover.js` — what is on the ground
 

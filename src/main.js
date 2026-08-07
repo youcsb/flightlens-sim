@@ -108,15 +108,34 @@ const PLACES = [
   },
 ];
 
-/** Time-of-day presets for the T key. `t` is sky.js's 0..1 clock. */
+/**
+ * Time-of-day presets for the T key. `t` is sky.js's 0..1 clock.
+ *
+ * THESE ARE SOLVED, NOT GUESSED, and two of them were wrong. sky.js turns `t`
+ * into a sun elevation through a real solar-position formula at latitude 47.5
+ * with declination 0 (its shipped default — equinox), so what a preset is
+ * called has to match what the sun actually does:
+ *
+ *     alt(t) = asin( cos(47.5 deg) * cos((t - 0.5) * 2pi) )
+ *
+ * Round 1's 'golden hour' at 0.76 puts the sun 2.43 degrees BELOW the horizon
+ * and its 'sunset' at 0.795 puts it 10.86 degrees below — that is nautical
+ * twilight, which is to say night with a glow. Both rendered as a dark sky with
+ * no sun in it, and neither name described what you saw.
+ *
+ * Golden hour is conventionally the sun between the horizon and about 6
+ * degrees, so 0.725 (6.07 deg) sits at the top of that band with the light
+ * still warm and long. Sunset is the disc on the horizon: 0.748 is 0.49 deg,
+ * a half-degree up, which is the sun's own angular radius — it is touching.
+ */
 const TIMES = [
-  { t: 0.42, label: 'mid-morning' },
-  { t: 0.5, label: 'noon' },
-  { t: 0.68, label: 'afternoon' },
-  { t: 0.76, label: 'golden hour' },
-  { t: 0.795, label: 'sunset' },
-  { t: 0.95, label: 'night' },
-  { t: 0.255, label: 'sunrise' },
+  { t: 0.42, label: 'mid-morning' }, // 36.3 deg
+  { t: 0.5, label: 'noon' }, // 42.5 deg
+  { t: 0.68, label: 'afternoon' }, // 16.7 deg
+  { t: 0.725, label: 'golden hour' }, // 6.07 deg
+  { t: 0.748, label: 'sunset' }, // 0.49 deg — the disc on the horizon
+  { t: 0.95, label: 'night' }, // -39.98 deg
+  { t: 0.255, label: 'sunrise' }, // 1.22 deg
 ];
 
 // ---------------------------------------------------------------------------
@@ -192,12 +211,36 @@ async function boot() {
   // horizon), scattered cumulus, and the deck lifted to 1,500 m — 4,900 ft,
   // above circuit height and above every hill in the region except Rainier
   // itself, which now comes through the gaps rather than sitting behind them.
+  //
+  // CLOUD COVERAGE AND DECK ALTITUDE, and the two have to be chosen together.
+  //
+  // Round 1 asked for 0.33 at 1,500-2,050 m. 0.33 does not render as the
+  // "scattered cumulus" the comment claims — sky.js's coverage is a threshold
+  // on a noise field and 0.33 is below the knee, so it draws a few wisps at the
+  // horizon and clear sky everywhere else. 0.55 is where a real broken deck
+  // appears.
+  //
+  // But raising the coverage at 1,500 m made the sim worse, and the readback is
+  // what caught it: 1,500-2,050 m is 4,900-6,700 ft, which is exactly where a
+  // light aircraft cruises. At 0.33 you flew through the gaps; at 0.55
+  // `sky.isInCloud()` returned true at the Mount Rainier viewpoint and the
+  // frame was a white rectangle.
+  //
+  // So the deck goes up rather than the coverage back down. 2,600-3,200 m is
+  // 8,500-10,500 ft: above everything a Skyhawk does on a normal day, below
+  // Rainier's 4,392 m summit — so the mountain now stands THROUGH the deck
+  // instead of behind it, which is the shot this sim exists to show.
   const sky = createSky(scene, renderer, {
     timeOfDay: TIMES[0].t,
     turbidity: 3.2,
-    cloudCoverage: 0.33,
-    cloudBaseM: 1500,
-    cloudTopM: 2050,
+    cloudCoverage: 0.55,
+    cloudBaseM: 2600,
+    cloudTopM: 3200,
+    // Cascaded shadow maps, owned by sky.js because a shadow-casting cascade
+    // IS a light and §1.7 gives every light to that module. It fits the
+    // cascades from `scene.onBeforeRender`, so there is no per-frame call here.
+    shadows: true,
+    shadowQuality: 'high',
   });
 
   // 3-4. Real airports at real coordinates, sitting on the real terrain.
@@ -543,6 +586,43 @@ async function boot() {
      * and `capViolations` (must be 0).
      */
     demStats: () => getRegionStats(),
+    /**
+     * LOD diagnostics: what the error-metric selector actually chose. `drawn`
+     * is the selected set — the renderer frustum-culls it further, so
+     * `renderer.info.render.triangles` is a fraction of `triangles` here.
+     */
+    terrainStats: () => terrain.stats?.() ?? null,
+    /** Cascade fitting, texel sizes and per-cascade render cadence. */
+    shadowStats: () => sky.shadows?.getStats?.() ?? null,
+    /**
+     * ONE LEVER FOR THE WHOLE PICTURE.
+     *
+     * Everything expensive in this scene is either shadow map rendering or
+     * terrain draw calls, and both already had a tier control — they just had
+     * no single owner, so there was no way to answer "make it faster" without
+     * knowing which module to ask. This is the composition root, so it is the
+     * place that knows both.
+     *
+     * 'high'   everything on. The default, and what the frame budget was
+     *          measured against.
+     * 'medium' shadows drop to 1024-px cascades. Terrain is untouched: it is
+     *          the geometry the whole sim exists to show.
+     * 'low'    shadows off entirely. This is the tier for a machine where the
+     *          shadow pass alone is not affordable — it costs draw calls, not
+     *          fill, so shrinking the maps further buys nothing.
+     *
+     * Returns the tier actually applied.
+     */
+    setQuality(tier) {
+      const t = String(tier);
+      if (t === 'low') sky.shadows?.setEnabled?.(false);
+      else {
+        sky.shadows?.setEnabled?.(true);
+        sky.shadows?.setQuality?.(t === 'medium' ? 'medium' : 'high');
+      }
+      overlay.toast(`quality · ${t}`);
+      return t;
+    },
     /** Run n frames of exactly dt seconds each, through the real loop. */
     tick(dt = 1 / 60, n = 1) {
       const h = Math.min(Math.max(dt, 0), 0.1);
