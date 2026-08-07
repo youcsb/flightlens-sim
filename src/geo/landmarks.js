@@ -302,6 +302,25 @@ export function placeLandmarks(scene, opts = {}) {
   group.name = 'landmarks';
   if (scene) scene.add(group);
 
+  /**
+   * DISTANCE CULLING, and why it is by distance rather than by pixels.
+   *
+   * A pixel test says keep everything: the Space Needle is 184 m, and one phone
+   * pixel is about 2.684e-3 rad, so it stays over a pixel tall out to 68 km.
+   * By that rule the Tacoma Narrows Bridge and the Boeing Everett factory are
+   * both "visible" from downtown at 50 and 40 km.
+   *
+   * But cost is not measured in pixels, it is measured in DRAW CALLS, and those
+   * two are 19 and 11 meshes. Twenty or thirty calls — a quarter of a phone's
+   * entire budget — for a smudge on the horizon is the wrong trade. So the
+   * limit is what is worth SPENDING on, not what is technically resolvable.
+   *
+   * Desktop keeps everything, because it has the calls to spare and the
+   * far-horizon skyline is part of why the world reads as real.
+   */
+  const modelled = [];
+  let cullDistanceM = Infinity;
+
   loadLandmarks().then((list) => {
     const keepOut = [];
     let placed = 0;
@@ -322,6 +341,7 @@ export function placeLandmarks(scene, opts = {}) {
       obj.name = `landmark-${l.name}`;
       obj.userData = { ...l, baseElevationM: baseY };
       group.add(obj);
+      modelled.push(obj);
       keepOut.push({ x: _p.x, z: _p.z, radiusM: footprintRadius(l) });
       placed++;
     }
@@ -336,6 +356,38 @@ export function placeLandmarks(scene, opts = {}) {
         `of ${list.length} loaded`,
     );
   });
+
+  /**
+   * Set the cull radius. Called once at boot from the device tier; Infinity
+   * (the default) disables culling entirely.
+   * @param {number} m metres, or Infinity
+   */
+  group.setCullDistance = (m) => {
+    cullDistanceM = Number.isFinite(m) && m > 0 ? m : Infinity;
+  };
+
+  /**
+   * Show or hide each modelled landmark by range. Cheap enough to call every
+   * frame — it is a squared-distance compare per landmark over about twenty of
+   * them — and it writes `visible` only on change so an unchanged frame costs
+   * nothing downstream.
+   *
+   * The city mass is NOT touched: it is already chunked and frustum-culled, and
+   * hiding it wholesale by range would pop the skyline in and out.
+   *
+   * @param {THREE.Vector3} cameraPos
+   */
+  group.updateVisibility = (cameraPos) => {
+    if (!cameraPos || cullDistanceM === Infinity) return;
+    const r2 = cullDistanceM * cullDistanceM;
+    for (let i = 0; i < modelled.length; i += 1) {
+      const o = modelled[i];
+      const dx = o.position.x - cameraPos.x;
+      const dz = o.position.z - cameraPos.z;
+      const want = dx * dx + dz * dz <= r2;
+      if (o.visible !== want) o.visible = want;
+    }
+  };
 
   return group;
 }

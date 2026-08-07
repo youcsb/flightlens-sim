@@ -364,6 +364,9 @@ async function boot() {
 
   // 5. Landmarks fill themselves in once their data resolves.
   const landmarks = placeLandmarks(scene);
+  // Range-cull the modelled landmarks on the small tiers. Boot-time only, like
+  // the other budgets; Infinity on desktop leaves them all drawn.
+  landmarks.setCullDistance?.(budgets.landmarkCullM ?? Infinity);
 
   overlay.setLoadingText('building the aeroplane…');
   await nextFrame();
@@ -727,6 +730,7 @@ async function boot() {
     //    camera ended up, not around where it was last frame.
     cameras.update(paused ? 0 : dt, state);
     terrain.update(cameras.active);
+    landmarks.updateVisibility?.(cameras.active.position);
     sky.update(paused ? 0 : dt);
 
     // 6. hud + sound. The crash card is driven off the model's latched flag,

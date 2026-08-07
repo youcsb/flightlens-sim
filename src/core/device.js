@@ -410,6 +410,24 @@ export const PHONE_BUILDING_MINOR_CUTOFF_M = 0;
 export const PHONE_CITY_CHUNK_M = 3000;
 
 /**
+ * LANDMARK CULL RADIUS — 15 km on a phone.
+ *
+ * The twenty hand-built landmarks are ~120 meshes between them, and even
+ * flattened to one mesh per material they are the largest remaining draw-call
+ * cost on a phone. From downtown, the two most expensive are the ones you can
+ * least see: the Tacoma Narrows Bridge at 50 km (19 meshes) and the Boeing
+ * Everett factory at 40 km (11).
+ *
+ * 15 km keeps everything in and around Seattle — the Needle, Columbia Center,
+ * Smith Tower, both stadiums, the Great Wheel, MoPOP, Climate Pledge — and
+ * drops the ones that are a smudge on the horizon.
+ *
+ * Desktop keeps everything (Infinity): it has the calls to spare, and the
+ * far-horizon skyline is part of why the world reads as real.
+ */
+export const PHONE_LANDMARK_CULL_M = 15000;
+
+/**
  * PROCEDURAL TEXTURE SCALE — 0.5 linear, so a quarter of the texels.
  *
  * MEASURED IN CHROME AT THE PHONE TIER, production build, by walking the scene
@@ -524,6 +542,7 @@ const PHONE_BUDGETS = freeze({
     minorCutoffM: PHONE_BUILDING_MINOR_CUTOFF_M,
     cityChunkM: PHONE_CITY_CHUNK_M,
   },
+  landmarkCullM: PHONE_LANDMARK_CULL_M,
   // NEVER false, on any tier. The far plane is 300 km and the near plane 0.35 m
   // (MODULES §2.13); without it the distant terrain z-fights and sky.js's cloud
   // slabs lose the depth test against terrain twelve times farther away.
@@ -586,6 +605,7 @@ const TABLET_BUDGETS = freeze({
     // than a phone and less than a desktop.
     cityChunkM: 5000,
   },
+  landmarkCullM: 35000,
   logarithmicDepthBuffer: true,
 });
 
