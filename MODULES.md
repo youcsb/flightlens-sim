@@ -424,12 +424,63 @@ Runway = {
 }
 ```
 
-**The deck bends where — and only where — the DEM demands it.** A runway is
-drawn on a fitted plane, but that plane is capped at a small lift, so anywhere
-the DEM lacks an airport's earthworks the ground poked through and the runway
-rendered in pieces. `buildDeckProfile` raises the deck locally to
-`max(plane, terrain + 0.25 m)`. A runway whose plane already clears the ground
-is left bit-identical (median bend across the region: **9 cm**; KBFI: 2.4 cm).
+**THE NUMBER THAT MATTERS IS THE FLOAT: how far the drawn asphalt stands above
+`getElevationLocal` underneath it.** Not the deck *bend*, which is how far the
+deck departs from its own fitted plane. Round 2 advertised the bend here
+("KBFI: 2.4 cm") and shipped a **0.83 m float at the spawn point** — with
+`gearHeightM` at 1.20 m, most of the main gear was inside the pavement on frame
+0, with every gate green. Two statistics, two different things, and quoting the
+flattering one is how a metre of float hid through two rounds.
+
+The deck is now, per 25 m station and across the width,
+
+```
+deck(t, s) = max( plane(t), cross(t, s) ) + 0.25 m
+```
+
+where `cross` is the lowest line through that cross-section that still clears
+every DEM sample on the pavement, lightly smoothed along the runway to take out
+the quarter-metre storage stairs (§2.4). Its tilt is **one cross-fall for the
+whole runway**, the median of the per-station fits, capped at the FAA's 2%
+transverse limit. One number rather than one per station is a geometric
+requirement, not a simplification: a cross-fall that changes between stations
+makes every pavement quad a twisted bilinear patch, which is not the surface
+`deck()` reports, and the paint drawn on it sank up to 0.53 m into its own
+asphalt. With a constant cross-fall every quad is planar. `plane` is the fitted line, and it is a floor for exactly
+one case: **paved** ground whose DEM is too rough to be a runway at all, which
+is the missing-earthworks case below. Everywhere else the ground under a runway
+*is* the runway, and the deck lies on it. Unpaved strips whose DEM fit fails
+drape: nothing was ever levelled on a mown field, and levelling one gave WA45
+16/34 a deck standing 27.8 m over its own hillside.
+
+Measured on the shipping meshes against the shipping collision surface by
+`npm run check:airports` — per drawn *triangle*, barycentrically, so it answers
+between the vertices too:
+
+| | round 2 | now |
+|---|---|---|
+| the spawn, KBFI 32L threshold | 0.83 m (69% of a gear leg) | **0.32 m** (26%) |
+| KBFI 14R/32L, landing band | 0.88 m mean | **0.30 m** mean, 0.51 worst |
+| KSEA 16C/34C, landing band | 1.14 m mean, 2.93 worst | **0.27 m** mean, 0.43 worst |
+| KSEA 16L/34R, landing band | 2.60 m mean, 9.92 worst | **0.34 m** mean, 1.19 worst |
+| paved runways over 0.5 m on the centreline | 17 of 47 | **2 of 47** |
+| pavement vertices below the surface | 74 at KSEA | **0** |
+
+Two things follow the deck that did not before. The **shoulder** is drawn at
+station resolution and its outer edge sits on the terrain, so it covers the step
+instead of floating over it (0 buried vertices region-wide, against 74 at KSEA).
+And every **marking** is broken at the deck's own stations rather than at its
+own equal spans: a stripe is a chord between its vertices, the deck bends
+between stations, and an edge stripe used to run the full length of the runway
+as ONE quad. Measured over 19,306 marking triangles, the worst paint-below-
+pavement was 0.53 m and is now 0.13 m — and every triangle left is inside KW28
+Sequim Valley, where two runways 35 m apart genuinely overlap and each deck is
+fitted to its own ground.
+
+Cost, measured: the airports group goes from 15,952 to 45,578 triangles and 1.1
+to 3.2 MiB of buffers, in the same 10 draw calls, and `buildRunwayMeshes` from
+21 to 52 ms — once, at boot, off the frame path.
+
 Flush beats flat — the DEM is the collision surface (§1.4).
 
 **KSEA 16R/34L IS NOT AN ELEVATION BUG, and raising the DEM resolution proved
@@ -451,13 +502,21 @@ earthwork, so the finer the DEM gets, the better it resolves the *natural
 ravine* the wall spans and the larger the gap to the deck becomes. 12.9 m was a
 51.8 m/px smoothing of a real 55.7 m ravine.
 
-**This is now airports.js's problem, not elevation.js's.** Faking the fill in
-the DEM would be inventing geography (§1.5). The embankment is airport
-*infrastructure* and belongs in the runway deck: `buildDeckProfile` currently
-lifts the deck where terrain pokes *through* it and does nothing where the
-terrain falls *away*, so 16R/34L will render on a plane with a 55 m canyon
-under it. Skirting the deck down to the terrain would draw the retaining wall
-that is actually there.
+**This is airports.js's problem, not elevation.js's, and it is now DRAWN rather
+than implied.** Faking the fill in the DEM would be inventing geography (§1.5).
+The embankment is airport *infrastructure*, so it belongs in the runway deck:
+16R/34L holds its reconstructed plane, and the **paved shoulder skirts down to
+the terrain**, which draws the retaining wall that is actually there instead of
+leaving a ribbon in the sky. `check:airports` asserts the skirt reaches the
+ground at every 50 m station on both sides (worst +0.06 m over 104
+station-sides) and that its tallest section spans the whole embankment (30.3 m).
+
+16R/34L is the only deck in the region that stands more than 3 m above its own
+ground, and `buildRunwayMeshes` publishes the list as
+`group.userData.standingDecks` and warns about it on the console. That is the
+honest shape of the trade: on that one runway the wheels will meet the DEM's
+ravine and not the paint, because both are real and only one of them is in the
+data we have.
 
 **`headingDeg` is TRUE, not magnetic.** The upstream `le_heading_degT` column
 frequently is not: KBFI publishes 140 where its own endpoints give 150.13 and
@@ -734,12 +793,6 @@ Three properties of the textures are load-bearing: `colorSpace = NoColorSpace`
 of barren rock along every boundary — the shader dissolves the grid with a
 noise-jittered lookup instead), and `flipY = false` so image row 0 is north.
 
-Three properties of the textures are load-bearing: `colorSpace = NoColorSpace`
-(an sRGB curve applied to a class *index* turns class 9 into class 2),
-`NearestFilter` with no mipmaps (linear filtering an index map invents a texel
-of barren rock along every boundary — the shader dissolves the grid with a
-noise-jittered lookup instead), and `flipY = false` so image row 0 is north.
-
 Verified by `npm run check:landcover`, which asserts the class at places whose
 answer is known independently — Rainier's summit is ice, mid Elliott Bay is
 water, the Space Needle stands in high-intensity development. That is the only
@@ -924,7 +977,7 @@ the slice bounding spheres really bound their slices at every fov the sim uses,
 the cascade weights sum to exactly 1 through every seam, a 0.1-texel camera move
 does not move the map at all and a large one lands on a whole number of texels,
 a 360° roll does not resize any cascade, and the extractor refuses rather than
-guesses. **It is not yet in `npm run check:all`** — one line in `package.json`.
+guesses. It runs in `npm run check:all`.
 
 ### 2.9 `src/aircraft/model.js` — the visual airframe
 
@@ -1337,6 +1390,16 @@ Cheap, specific, and each one falsifies a whole class of bug.
    sea-level data, not from an artist.
 6. **Wheels touch where the ground is drawn.** Land anywhere, on a slope. No
    sinking, no hovering beyond a metre or two on steep ground.
+   **This one has a number now, and it did not before.**
+   `npm run check:airports` builds the real runway meshes over the real DEM and
+   measures the drawn triangles against `getElevationLocal`: the spawn stands
+   **0.32 m** above the collision surface (26% of a 1.20 m gear leg), KBFI
+   14R/32L a mean 0.30 m on the landing band, and exactly one paved runway in
+   the region — KSEA 16R/34L, on 50 m of Miller Creek fill the bare-earth DEM
+   does not contain — floats more than half a metre. Before, the spawn floated
+   0.83 m and no assertion anywhere looked. Watch the console for
+   `[airports] … deck(s) stand more than 1 m above the collision surface`;
+   anything new in that list is a new lie under the wheels.
 7. **KSEA is 8.8 km south of KBFI** — measured 8,829 m on bearing 185.1°. Its
    three runways are surveyed overrides at **180.34° true = 164.74° magnetic**,
    which is what rounds to the "16" on the numbers. Runway designators are

@@ -57,18 +57,56 @@
  *    come off a survey however the baker labelled it.
  *
  * ---------------------------------------------------------------------------
- * HEIGHT: WHY THE RUNWAY IS A PLANE AND NOT A DRAPE
+ * HEIGHT: THE DECK IS A GUIDE PLANE, AND THE DEM WINS EVERY ARGUMENT
  * ---------------------------------------------------------------------------
  * A real runway is graded: flat across, and at most about 1.5% along. Draping
  * one over a 13-52 m/pixel DEM would give it a wave you can feel on the landing
  * roll. So each runway gets a least-squares LINE fitted to the DEM along its own
  * centreline (see fitRunwayPlane), clamped to a believable gradient.
  *
- * It is lifted only far enough to clear the highest DEM sample under its own
- * pavement, because MODULES.md §1.4 is absolute: the collision surface is
- * elevation.getElevationLocal(), NOT this mesh. Lift the deck 3 m to make it
- * look flat and the aircraft lands 3 m underneath it. So the lift is computed,
- * capped at MAX_LIFT_M, and everything else is left to the DEM.
+ * That line is a FLOOR, not a placement. MODULES.md §1.4 is absolute: the
+ * collision surface is elevation.getElevationLocal(), NOT this mesh. Lift the
+ * deck 1 m to make it look flat and the aircraft lands 1 m underneath it — and
+ * with gearHeightM at 1.20 m, that is most of the main gear inside the tarmac
+ * before the pilot has touched anything.
+ *
+ * ROUND 2 SHIPPED EXACTLY THAT AND EVERY GATE WAS GREEN. The deck used to be
+ * raised by ONE GLOBAL LIFT, `clamp(maxAbove + 0.25, 0.25, 2.5)`, where
+ * `maxAbove` was the worst DEM bump ANYWHERE under the pavement — so one hump
+ * at one threshold floated the entire ribbon. Measured on the shipping meshes:
+ * KBFI 14R/32L floated a mean of 0.88 m and the spawn itself 0.83 m. Nothing
+ * measured it, because the number MODULES.md quoted ("KBFI: 2.4 cm") is the
+ * deck BEND — how far the deck departs from its own plane — which is a
+ * different statistic about a different thing.
+ *
+ * The deck is now, at every 25 m station along the runway and every offset
+ * across it,
+ *
+ *     deck(t, s) = max( cross(t, s),  plane(t) if the DEM is not a runway )
+ *                  + MIN_LIFT_M
+ *
+ * where `cross` is the lowest gently-tilted line through the pavement's own
+ * cross-section that still clears every DEM sample on it, smoothed along the
+ * runway (see buildDeckProfile). Three consequences:
+ *
+ *   - The float is MIN_LIFT_M plus the cross-section's own residual, instead of
+ *     the worst bump on the runway plus the plane's distance from the ground.
+ *     Measured at the spawn: 0.83 m -> 0.32 m.
+ *   - A runway cut into a side slope tilts with it, up to MAX_CROSS_GRADE,
+ *     rather than levelling at its uphill edge and floating over the downhill
+ *     one.
+ *   - The fitted plane survives for one case only: PAVED ground whose DEM is
+ *     too rough to be a runway at all, which means the airport's earthworks are
+ *     missing from the data. KSEA 16R/34L stands on 50 m of 2004 fill over the
+ *     Miller Creek valley; the fill is real and the DEM's ravine is real, and
+ *     no deck can be flush with both. That case is not hidden: the deck holds
+ *     its plane, the shoulder SKIRTS down to the terrain and draws the
+ *     retaining wall that is actually there, and `buildRunwayMeshes` publishes
+ *     the standing height in `userData.standingDecks` and warns on the console.
+ *
+ * `npm run check:airports` is the assertion that keeps this honest. It runs
+ * this module's real builder against the real DEM and samples the built
+ * TRIANGLES against getElevationLocal.
  */
 
 import * as THREE from 'three';
@@ -442,18 +480,54 @@ const TAXIWAY_COLOUR = 0x3d4147;
 // ---------------------------------------------------------------------------
 
 /**
- * Minimum float above the fitted plane. Small on purpose — see the header note
- * about MODULES.md §1.4.
+ * Clearance between the drawn pavement and the highest DEM sample under it.
+ *
+ * This is the ONLY deliberate float in the deck, and it is deliberately small:
+ * `gearHeightM` is 1.20 m, so every centimetre here is a centimetre of tyre
+ * inside the tarmac. It cannot be zero — the drawn surface is linear between
+ * stations and the field is not, so a deck sitting exactly on its samples would
+ * let the terrain saw through the pavement between them. 25 cm covers that at
+ * a 25 m station over a 12.95 m/px DEM and is 21% of a gear leg. Asserted by
+ * `npm run check:airports`.
  */
 const MIN_LIFT_M = 0.25;
 
 /**
- * Hard ceiling on the computed lift. If the DEM under a runway is 6 m rougher
- * than the fit, something is wrong with the data, and the right failure is a
- * runway that clips into a bump — not a runway floating three storeys up with
- * the aircraft landing underneath it.
+ * Steepest cross-fall the deck may take to follow a side slope.
+ *
+ * FAA AC 150/5300-13 caps transverse runway grade at 1.5% (2% for the smallest
+ * strips), so this is the real design limit and not a tuning knob. It matters
+ * because the alternative to tilting is levelling at the uphill edge: on a
+ * 40 m wide runway a 2% cross-fall is 0.8 m of float at the far edge, which is
+ * two thirds of a gear leg for nothing.
  */
-const MAX_LIFT_M = 2.5;
+const MAX_CROSS_GRADE = 0.02;
+
+/** Clearance for the shoulder skirt where it lands on the terrain. */
+const SHOULDER_CLEAR_M = 0.06;
+
+/**
+ * How far a shoulder may climb ABOVE its runway's edge to cover ground that
+ * stands higher than the deck. Past this the runway is in a cutting, not on a
+ * shoulder, and a paved ramp up the hillside would be a worse lie than letting
+ * the hillside meet the pavement edge.
+ */
+const SHOULDER_RISE_MAX_M = 2.5;
+
+/** Clearance for the taxiway and apron hints, which conform to the DEM. */
+const HINT_LIFT_M = 0.2;
+
+/**
+ * The deepest hollow the deck may bridge before it follows the ground down.
+ *
+ * This is the ceiling on the float of every runway that is not a reconstructed
+ * earthwork: the deck can never be more than MAX_FILL_M + MIN_LIFT_M above what
+ * its own cross-sections asked for. 2.5 m keeps every real threshold in the
+ * region (KSEA 16L/34R's south end is the deepest at 2.4 m) and stops a DEM
+ * gully under a farm strip from becoming a viaduct. Asserted region-wide by
+ * `npm run check:airports`.
+ */
+const MAX_FILL_M = 2.5;
 
 /** Markings sit this far above the pavement. Enough to beat z-fighting. */
 const PAINT_LIFT_M = 0.02;
@@ -484,7 +558,8 @@ const MAX_GRADE = 0.02;
  *
  * So:
  *   - not straight (raw RMS over ROUGH_RMS_M) -> the DEM has no idea there is
- *     an airport here. Level at the median; nothing better exists.
+ *     an airport here. What to do then depends on whether there is an airport:
+ *     see DRAPE below.
  *   - straight but steeper than MAX_GRADE -> the DEM disagrees with a real
  *     runway's grade, which usually means a 52 m/px base tile has smoothed a
  *     graded strip back into the hillside it was cut from. FOLLOW THE DEM. A
@@ -493,15 +568,38 @@ const MAX_GRADE = 0.02;
  *     (MODULES.md §1.4), and the clamp is only ever relaxed by as much as the
  *     terrain demands.
  *
+ * DRAPE: WHEN A PLANE IS THE WRONG SHAPE ENTIRELY.
+ * Levelling rough ground at its median is only right if something was actually
+ * levelled there. On a PAVED runway it was — a graded structure exists whether
+ * or not the bare-earth DEM contains it, and KSEA 16R/34L is the example the
+ * whole project argues about: 50 m of 2004 fill across the Miller Creek valley,
+ * which is real and which 3DEP does not have. On a mown turf strip nothing was
+ * levelled: the strip IS the field, and half of these are 'synthesised'
+ * endpoints anyway. Levelling those gave WA45 16/34 a deck standing 27.8 m over
+ * its own hillside — a grass bridge to nowhere. Unpaved plus a fit that failed
+ * means the deck drapes on the ground instead, and comes out flush.
+ *
+ * WHAT THIS FUNCTION DOES NOT DO ANY MORE: lift the deck. It used to return
+ * `clamp(maxAbove + MIN_LIFT_M, MIN_LIFT_M, MAX_LIFT_M)` — the worst bump
+ * anywhere under the pavement, applied to the whole ribbon. That is a global
+ * answer to a local question and it cost 0.83 m of float at the spawn itself.
+ * The plane is now a floor and the clearance is applied per station, across the
+ * width, in buildDeckProfile. `maxAboveM` survives as a DIAGNOSTIC only: it is
+ * how far the raw plane is buried at its worst point, which is the honest
+ * measure of how badly the DEM disagrees with the airport's earthworks.
+ *
  * @param {number} ax @param {number} az le end, local metres
  * @param {number} dx @param {number} dz unit vector along the runway
  * @param {number} rx @param {number} rz unit vector across the runway (right)
  * @param {number} lengthM @param {number} widthM
- * @returns {{h0:number, slope:number, lift:number, rms:number, graded:boolean}}
+ * @param {boolean} paved Whether a graded structure exists to be levelled.
+ * @returns {{h0:number, slope:number, maxAboveM:number, rms:number,
+ *            graded:boolean, drape:boolean}}
  *          `graded` is false when the deck had to follow the terrain instead of
- *          holding a believable runway gradient.
+ *          holding a believable runway gradient; `drape` is true when no plane
+ *          should be held at all.
  */
-function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
+function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM, paved) {
   const ROUGH_RMS_M = 4;
   /** End-to-end error the gradient clamp may introduce before we drop it. */
   const CLAMP_SLACK_M = 3;
@@ -540,7 +638,9 @@ function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
   let slope;
   let h0;
   let graded;
-  if (rawRms > ROUGH_RMS_M) {
+  const rough = rawRms > ROUGH_RMS_M;
+  const drape = rough && !paved;
+  if (rough) {
     const sorted = hs.slice().sort((p, q) => p - q);
     h0 = sorted[sorted.length >> 1];
     slope = 0;
@@ -580,90 +680,225 @@ function fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM) {
       if (h - deck > maxAbove) maxAbove = h - deck;
     }
   }
-  const lift = clamp(maxAbove + MIN_LIFT_M, MIN_LIFT_M, MAX_LIFT_M);
-  return { h0, slope, lift, rms, graded };
+  return { h0, slope, maxAboveM: maxAbove, rms, graded, drape, rough };
 }
 
 /**
- * Build the height profile the runway deck is actually drawn at.
+ * Build the surface the runway deck is actually drawn on.
  *
  * ---------------------------------------------------------------------------
- * WHY A PROFILE AND NOT JUST THE PLANE
+ * THE DECK IS A SURFACE, NOT A PLANE AND NOT A CURVE
  * ---------------------------------------------------------------------------
- * `fitRunwayPlane` returns a plane plus a single global `lift`, and that lift
- * is capped at MAX_LIFT_M (2.5 m) for a good reason: an uncapped lift would
- * float the pavement metres above the ground the aircraft actually collides
- * with (MODULES.md §1.4). But the cap has a visible cost. Where the DEM is
- * badly wrong under a runway, terrain pokes straight through the deck and the
- * runway is drawn in pieces.
+ * Round 2 drew it as `max(plane(t) + lift, maxTerrainAcross(t) + MIN_LIFT_M)`,
+ * with `lift` a single number for the whole runway. Both halves of that leaked
+ * float into the picture:
  *
- * Measured at KSEA 16R/34L, whose Miller Creek embankment (up to 50 m of fill,
- * placed 2004-08) is simply not in the DEM: 11.1 m of RMS under a flat deck, so
- * the middle third of an 8,500 ft runway was buried and the runway rendered as
- * two disconnected fragments with a hill in the gap.
+ *   - the GLOBAL lift meant the worst DEM bump anywhere under the pavement
+ *     raised every square metre of it. KBFI 14R/32L came out a mean 0.88 m
+ *     above the collision surface and the spawn 0.83 m, against a 1.20 m gear;
+ *   - `maxTerrainAcross` levelled every cross-section at its highest sample, so
+ *     a runway on a side slope floated over its own downhill edge by the full
+ *     fall across the width.
  *
- * The fix is to let the deck rise — locally, and only where the ground demands
- * it — rather than to lift the whole ribbon. The profile is
+ * Now, per station and across the width,
  *
- *     deck(t) = max(plane(t) + lift, maxTerrainAcross(t) + MIN_LIFT_M)
+ *     deck(t, s) = max( cross(t, s),  plane(t) where a plane is warranted )
+ *                  + MIN_LIFT_M
  *
- * which has the property that matters: **a runway whose plane already clears
- * the terrain everywhere is left exactly as it was.** For 100 of the 108 drawn
- * runways this is bit-identical to the old plane, so the flat, correctly-graded
- * common case is untouched. Only the handful sitting on a DEM that disagrees
- * with reality bend, and they bend to stay flush with the collision surface,
- * which is the trade §1.4 asks for.
+ * `cross(t, s) = c + m*s` is the lowest line through the cross-section that
+ * still clears every DEM sample on the pavement, with `m` the least-squares
+ * cross-fall clamped to MAX_CROSS_GRADE (a real FAA design limit, so the deck
+ * cannot tilt into something no runway would be built as). Anchoring `c` at
+ * `max_k(e_k - m*s_k)` rather than at the mean is what makes the clearance a
+ * guarantee: every sample on the section is under the line by construction, so
+ * the pavement never has terrain sawing through it.
  *
- * Sampled across the full width, not just the centreline — a runway cut into a
- * side slope shows the ground at its edges first.
+ * A PLANE IS WARRANTED IN ONE CASE. The ground under a real runway IS the
+ * runway — it was graded, and the DEM measured the result — so following it is
+ * both the flush answer and the accurate one. The exception is PAVED ground
+ * whose DEM is too rough to be a runway at all (`fit.rough`): there the
+ * earthworks are missing from the data, and the fitted plane is the best
+ * available reconstruction of a structure that exists. Holding a plane anywhere
+ * else costs float and buys nothing — it was worth up to 0.71 m mid-runway at
+ * KBFI, where the DEM is flat for two kilometres and then ramps, and no
+ * straight line is both.
  *
- * @returns {{sample:(t:number)=>number, segs:number, conformed:boolean,
- *            maxBendM:number}}
+ * ---------------------------------------------------------------------------
+ * WHEN THE DECK STILL STANDS PROUD, AND WHY THAT IS THE DEM SPEAKING
+ * ---------------------------------------------------------------------------
+ * KSEA 16R/34L is the region's honest failure. It stands on up to 50 m of fill
+ * placed over the Miller Creek valley in 2004-08; 3DEP's bare-earth DEM has the
+ * valley and not the fill. No deck can be both flush with that ravine and
+ * straight enough to land on. The deck holds its plane, `standM` records how
+ * far it stands above the field, `buildRunwayMeshes` skirts the shoulder down
+ * to the terrain so the embankment is DRAWN rather than implied, and
+ * `npm run check:airports` asserts the number instead of letting it hide.
+ *
+ * @returns {{sample:(t:number, s:number)=>number, segs:number, stepM:number,
+ *            standM:number, crossFallMax:number}}
+ *          `standM` is the worst gap between the drawn deck and what its own
+ *          cross-sections asked for — the float, before MIN_LIFT_M.
  */
 function buildDeckProfile(ax, az, dx, dz, rx, rz, lengthM, widthM, fit) {
   /** Station spacing. Fine enough that the linear span between two stations
    *  cannot hide a hill the samples missed. */
   const STEP_M = 25;
+  /** Samples across the pavement. Odd, so one of them is the centreline. */
+  const ACROSS = 5;
   const n = clamp(Math.round(lengthM / STEP_M) + 1, 5, 256);
   const step = lengthM / (n - 1);
   const half = widthM / 2;
+  /** Deck height on the centreline, per station. */
   const hs = new Float64Array(n);
 
-  let conformed = false;
-  let maxBendM = 0;
+  let standM = 0;
+
+  const ss = new Float64Array(ACROSS);
+  const es = new Float64Array(ACROSS);
+  for (let k = 0; k < ACROSS; k++) ss[k] = ((k / (ACROSS - 1)) * 2 - 1) * half;
+  let sumS2 = 0;
+  for (let k = 0; k < ACROSS; k++) sumS2 += ss[k] * ss[k];
+
+  // --- Pass 1: the cross-fall, ONE number for the whole runway.
+  //
+  // It is one number on purpose, and the reason is geometric rather than
+  // aesthetic. A cross-fall that changes from station to station makes every
+  // pavement quad a TWISTED bilinear patch, and a twisted patch is not the
+  // surface `sample()` reports: the two disagree by the twist in the middle of
+  // the quad, which is where the centreline stripe and the rubber are. Measured
+  // with a per-station cross-fall, 119 marking triangles at KSEA sank into
+  // their own asphalt, the worst by 0.53 m. With `h` linear along each span and
+  // `m` constant, every quad is planar and the paint lands exactly where the
+  // pavement is.
+  //
+  // A real runway is built with one transverse grade per section anyway
+  // (AC 150/5300-13), so this is also the more accurate shape.
+  const perStation = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     const t = i * step;
-    const plane = fit.h0 + fit.slope * t + fit.lift;
-    let maxTerr = -Infinity;
-    for (let k = -2; k <= 2; k++) {
-      const s = (k / 2) * half;
-      const e = getElevationLocal(ax + dx * t + rx * s, az + dz * t + rz * s);
-      if (e > maxTerr) maxTerr = e;
+    let sumE = 0;
+    for (let k = 0; k < ACROSS; k++) {
+      es[k] = getElevationLocal(ax + dx * t + rx * ss[k], az + dz * t + rz * ss[k]);
+      sumE += es[k];
     }
-    const needed = maxTerr + MIN_LIFT_M;
-    if (needed > plane) {
-      hs[i] = needed;
-      conformed = true;
-      if (needed - plane > maxBendM) maxBendM = needed - plane;
-    } else {
-      hs[i] = plane;
+    const meanE = sumE / ACROSS;
+    let num = 0;
+    for (let k = 0; k < ACROSS; k++) num += ss[k] * (es[k] - meanE);
+    perStation[i] = sumS2 > 0 ? num / sumS2 : 0;
+  }
+  // The MEDIAN, not the mean: a few stations crossing a taxiway or a ditch
+  // should not tilt the whole ribbon.
+  const sortedFall = Array.from(perStation).sort((p, q) => p - q);
+  const crossFall = clamp(
+    sortedFall[sortedFall.length >> 1] || 0,
+    -MAX_CROSS_GRADE,
+    MAX_CROSS_GRADE,
+  );
+
+  // --- Pass 2: what each cross-section requires under that cross-fall.
+  /** Centreline height the section needs, per station. */
+  const cs = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = i * step;
+    // Anchor the tilted line so that every sample on the section is under it.
+    let c = -Infinity;
+    for (let k = 0; k < ACROSS; k++) {
+      const e = getElevationLocal(ax + dx * t + rx * ss[k], az + dz * t + rz * ss[k]);
+      const v = e - crossFall * ss[k];
+      if (v > c) c = v;
     }
+    cs[i] = c;
   }
 
-  const sample = (t) => {
+  // --- Pass 3: take the quantisation stairs out of the longitudinal profile.
+  //
+  // The DEM under a runway IS the runway, so the deck follows it. But elevation
+  // is stored in quarter-metre Int16 (§2.4) and `cs` is a max over five
+  // samples, so the profile arrives as a staircase: 6.25, 6.39, 6.42, 6.50,
+  // 6.25 over the last hundred metres of KBFI 14R/32L. One binomial [1 2 1]
+  // pass rounds the treads.
+  //
+  // IT RUNS ON THE DETRENDED PROFILE. Smoothing has to clamp at the two ends,
+  // and clamping on a SLOPED profile drags the threshold toward the interior's
+  // height — the spawn sits exactly on a threshold, so that bias lands on the
+  // one point in the sim that is looked at most. Subtracting the mean gradient
+  // first makes a constant-grade runway come out bit-identical, and the
+  // gradient goes straight back on afterwards.
+  //
+  // ONE PASS, AND NOT MORE, IS MEASURED. Every extra pass is more float: two
+  // passes cost 0.03 m at the spawn and 0.16 m at KSEA 16C's worst point, and
+  // a wider window costs far more than that (a ±150 m morphological closing,
+  // tried and dropped, cost 0.27 m at the spawn and put fourteen paved runways
+  // over half a metre instead of one). The stairs are 0.25 m over 25 m, which
+  // is 0.6 degrees of surface tilt; the float is what the wheels feel.
+  let sumT = 0, sumC = 0;
+  for (let i = 0; i < n; i++) { sumT += i * step; sumC += cs[i]; }
+  const meanT = sumT / n, meanC = sumC / n;
+  let numT = 0, denT = 0;
+  for (let i = 0; i < n; i++) {
+    const dt = i * step - meanT;
+    numT += dt * (cs[i] - meanC);
+    denT += dt * dt;
+  }
+  const trendB = denT > 0 ? numT / denT : 0;
+  const trendA = meanC - trendB * meanT;
+  const trend = (i) => trendA + trendB * i * step;
+
+  const smooth = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = cs[Math.max(0, i - 1)] - trend(Math.max(0, i - 1));
+    const b = cs[i] - trend(i);
+    const c2 = cs[Math.min(n - 1, i + 1)] - trend(Math.min(n - 1, i + 1));
+    smooth[i] = (a + 2 * b + c2) / 4 + trend(i);
+  }
+
+  // --- Pass 4: the floor, and what the deck ends up being.
+  //
+  // The fitted plane is a floor for exactly one case: PAVED ground whose DEM is
+  // too rough to be a runway at all. That is the missing-earthworks case — KSEA
+  // 16R/34L on the Miller Creek fill — where a graded structure exists that the
+  // bare-earth DEM does not contain, and reconstructing it as a plane is the
+  // best available answer. Everywhere else the ground under a runway IS the
+  // runway, and the deck lies on it.
+  const useplane = !fit.drape && fit.rough;
+  for (let i = 0; i < n; i++) {
+    const t = i * step;
+    // Smoothing fills a hollow; it does not build a viaduct. A single deep,
+    // narrow DEM ditch — a farm strip crossing a gully — would otherwise pull
+    // its neighbours' deck up with it, so the fill is capped and the deck
+    // follows the ground down instead.
+    const graded = clamp(smooth[i], cs[i], cs[i] + MAX_FILL_M);
+    const plane = useplane ? fit.h0 + fit.slope * t : -Infinity;
+    // The reconstructed plane stands above the ground it covers where the DEM
+    // has no earthworks; elsewhere the deck lies on the graded ground.
+    hs[i] = Math.max(graded, plane) + MIN_LIFT_M;
+    // How far the drawn deck stands above what its own cross-sections asked
+    // for. This is the number that decides whether the wheels meet the paint.
+    const stand = hs[i] - MIN_LIFT_M - cs[i];
+    if (stand > standM) standM = stand;
+  }
+
+  const sample = (t, s = 0) => {
     const u = clamp(t / step, 0, n - 1);
     const i = Math.min(n - 2, Math.floor(u));
     const f = u - i;
-    return hs[i] + (hs[i + 1] - hs[i]) * f;
+    return hs[i] + (hs[i + 1] - hs[i]) * f + crossFall * s;
   };
 
-  // A flat deck needs no more geometry than it ever did; a bent one needs a
-  // vertex per station or the pavement cuts the corner off its own profile.
-  const segs = conformed
-    ? n - 1
-    : clamp(Math.round(lengthM / 120), 1, 48);
+  // A deck that follows the ground needs a vertex per station or the pavement
+  // cuts the corner off its own profile. One that came out affine — a plane,
+  // which is what the missing-earthworks case reconstructs — needs no more
+  // geometry than it ever did.
+  let affine = true;
+  for (let i = 1; i < n - 1 && affine; i++) {
+    const lin = hs[0] + ((hs[n - 1] - hs[0]) * i) / (n - 1);
+    if (Math.abs(hs[i] - lin) > 1e-6) affine = false;
+  }
+  const segs = affine
+    ? clamp(Math.round(lengthM / 120), 1, 48)
+    : n - 1;
 
-  return { sample, segs, conformed, maxBendM };
+  return { sample, segs, stepM: step, standM, crossFall };
 }
 
 // ---------------------------------------------------------------------------
@@ -713,19 +948,30 @@ function pushTri(sink, A, B, C) {
 
 /**
  * Turn a sink into a BufferGeometry, or null if nothing was pushed.
- * All normals are +Y: these surfaces are flat by construction.
+ *
+ * Normals are +Y by default, because pavement is flat by construction and a
+ * constant is cheaper than a cross product. The SHOULDER is the exception: it
+ * skirts from the deck down to the terrain, so on KSEA 16R/34L it is a 30 m
+ * near-vertical wall, and a wall with an up-facing normal is lit like a floor.
+ * `shaded` computes real ones. No vertex is shared between quads in a sink, so
+ * this comes out per-face — which is what a retaining wall's top edge should
+ * look like.
  */
-function sinkToGeometry(sink) {
+function sinkToGeometry(sink, shaded = false) {
   if (sink.n === 0) return null;
   const g = new THREE.BufferGeometry();
   const pos = new Float32Array(sink.pos);
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   g.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(sink.uv), 2));
-  const normals = new Float32Array(sink.n * 3);
-  for (let i = 0; i < sink.n; i++) normals[i * 3 + 1] = 1;
-  g.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
   g.setIndex(sink.n > 65535 ? new THREE.Uint32BufferAttribute(sink.idx, 1)
                             : new THREE.Uint16BufferAttribute(sink.idx, 1));
+  if (shaded) {
+    g.computeVertexNormals();
+  } else {
+    const normals = new Float32Array(sink.n * 3);
+    for (let i = 0; i < sink.n; i++) normals[i * 3 + 1] = 1;
+    g.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  }
   g.computeBoundingSphere();
   return g;
 }
@@ -977,16 +1223,24 @@ const RUBBER_MIN_M = 1500;
  * @param {{paint: object, numbers: object}} sinks
  * @param {(g:string)=>number[]|undefined} cellFor
  */
-function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
+function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor, breaks = null) {
   const { paint, numbers } = sinks;
   const half = widthM / 2;
   const full = usable >= FULL_MARKINGS_MIN_M;
-  const bar = (u0, u1, s0, s1) =>
-    pushQuad(
-      paint,
-      at(u0, s0), at(u1, s0), at(u1, s1), at(u0, s1),
-      [0, 0], [1, 0], [1, 1], [0, 1],
-    );
+  // Break every bar at the deck's own stations — see stationsBetween() in
+  // buildRunwayMeshes. A threshold bar is 150 ft, six times a station, and the
+  // deck bends at those stations; a single quad is a chord across all of them
+  // and PAINT_LIFT_M is 2 cm.
+  const bar = (u0, u1, s0, s1) => {
+    const us = breaks ? breaks(u0, u1) : [u0, u1];
+    for (let i = 0; i < us.length - 1; i++) {
+      pushQuad(
+        paint,
+        at(us[i], s0), at(us[i + 1], s0), at(us[i + 1], s1), at(us[i], s1),
+        [0, 0], [1, 0], [1, 1], [0, 1],
+      );
+    }
+  };
 
   // --- Threshold bars. 150 ft long, starting 20 ft in from the threshold.
   if (full) {
@@ -1032,11 +1286,11 @@ function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
       const letterCell = letter ? cellFor(letter) : null;
       if (letterCell) {
         const lw = Math.min(NUMERAL_W_FT * FT_TO_M * scale, half * 1.2) / 2;
-        pushGlyph(numbers, at, u, u + numH, -lw, lw, letterCell);
+        pushGlyph(numbers, at, u, u + numH, -lw, lw, letterCell, breaks);
         u += numH + NUMERAL_GAP_FT * FT_TO_M * scale;
       }
       const cell = cellFor(digits);
-      if (cell) pushGlyph(numbers, at, u, u + numH, -numW, numW, cell);
+      if (cell) pushGlyph(numbers, at, u, u + numH, -numW, numW, cell, breaks);
     }
   }
 
@@ -1085,14 +1339,7 @@ function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
     const lanes = [0, half * 0.45, -half * 0.45];
     for (const s of lanes) {
       // From the physical end (u = -displacedM) to 30 m short of the threshold.
-      pushQuad(
-        paint,
-        at(-displacedM + 6, s - shaftW / 2),
-        at(-22, s - shaftW / 2),
-        at(-22, s + shaftW / 2),
-        at(-displacedM + 6, s + shaftW / 2),
-        [0, 0], [1, 0], [1, 1], [0, 1],
-      );
+      bar(-displacedM + 6, -22, s - shaftW / 2, s + shaftW / 2);
       // Arrowhead pointing at the threshold.
       pushTri(paint, at(-22, s - 2.4), at(-8, s), at(-22, s + 2.4));
     }
@@ -1114,13 +1361,24 @@ function paintEnd(at, usable, widthM, displacedM, ident, sinks, cellFor) {
  * CanvasTexture has flipY on, so v = 0 is the BOTTOM of the cell as drawn and
  * cell[3] (the high v) is the top of the character.
  */
-function pushGlyph(sink, at, u0, u1, s0, s1, cell) {
+function pushGlyph(sink, at, u0, u1, s0, s1, cell, breaks = null) {
   const [cu0, cv0, cu1, cv1] = cell;
-  pushQuad(
-    sink,
-    at(u0, s0), at(u1, s0), at(u1, s1), at(u0, s1),
-    [cu0, cv0], [cu0, cv1], [cu1, cv1], [cu1, cv0],
-  );
+  // A 60 ft numeral is two and a half deck stations long, so it is broken at
+  // them like every other marking, with the atlas cell's u interpolated across
+  // the pieces. Without this the middle of a "16" disappears into the asphalt
+  // wherever the deck bends.
+  const us = breaks ? breaks(u0, u1) : [u0, u1];
+  for (let i = 0; i < us.length - 1; i++) {
+    const f0 = (us[i] - u0) / (u1 - u0);
+    const f1 = (us[i + 1] - u0) / (u1 - u0);
+    const a0 = cu0 + (cu1 - cu0) * f0;
+    const a1 = cu0 + (cu1 - cu0) * f1;
+    pushQuad(
+      sink,
+      at(us[i], s0), at(us[i + 1], s0), at(us[i + 1], s1), at(us[i], s1),
+      [a0, cv0], [a0, cv1], [a1, cv1], [a1, cv0],
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,8 +1440,8 @@ export function buildRunwayMeshes(scene, list = airports) {
   const group = new THREE.Group();
   group.name = 'airports';
 
-  /** Decks that had to bend to stay above the DEM. Reported, not hidden. */
-  const conformedDecks = [];
+  /** Decks left standing above the field. This is the one that matters. */
+  const standingDecks = [];
 
   const drawable = [];
   for (const airport of list || []) {
@@ -1253,67 +1511,151 @@ export function buildRunwayMeshes(scene, list = airports) {
     const rz = dx;
 
     const widthM = clamp((rw.widthFt > 0 ? rw.widthFt : 75) * FT_TO_M, 6, 120);
-    const fit = fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM);
+    const surf = SURFACES[cls] || SURFACES.unknown;
+    // `paint` is this module's paved/unpaved split: asphalt and concrete carry
+    // markings, turf and gravel do not. It is also the right test for whether
+    // anything was ever graded here — see fitRunwayPlane's DRAPE note.
+    const fit = fitRunwayPlane(ax, az, dx, dz, rx, rz, lengthM, widthM, surf.paint);
     // The deck follows the plane wherever the plane clears the ground, and
     // rises to stay flush wherever the DEM disagrees with the real earthworks.
     // Identical to the bare plane for every runway that did not need it.
     const prof = buildDeckProfile(ax, az, dx, dz, rx, rz, lengthM, widthM, fit);
     const deck = prof.sample;
-    if (prof.conformed) {
-      conformedDecks.push({
+    if (prof.standM > DECK_STAND_WARN_M) {
+      standingDecks.push({
         ident: airport.ident,
         runway: `${rw.leIdent}/${rw.heIdent}`,
-        bendM: prof.maxBendM,
+        standM: prof.standM,
       });
     }
 
     /** Runway-local (t, s) -> scene point, on the pavement. */
     const at = (t, s, dy = 0) => [
       ax + dx * t + rx * s,
-      deck(t) + dy,
+      deck(t, s) + dy,
       az + dz * t + rz * s,
     ];
 
+    /**
+     * The deck's own station boundaries between t0 and t1, inclusive of both.
+     *
+     * ALIGNMENT, NOT JUST SUBDIVISION. The deck is piecewise linear with kinks
+     * at its stations, and the pavement is drawn with vertices there. A marking
+     * subdivided into its own equal spans has kinks somewhere else, so the two
+     * chords disagree wherever the deck bends — at KSEA 16R/34L, where the deck
+     * steps 5 m in one station to stay on the embankment, an 18 m stripe
+     * segment sank 0.53 m into 25 m pavement quads. Breaking the paint at the
+     * SAME stations makes both surfaces the same piecewise-linear function.
+     */
+    const stationsBetween = (t0, t1) => {
+      const out = [t0];
+      const lo = Math.min(t0, t1);
+      const hi = Math.max(t0, t1);
+      const first = Math.ceil(lo / prof.stepM);
+      const last = Math.floor(hi / prof.stepM);
+      const mid = [];
+      for (let k = first; k <= last; k++) {
+        const t = k * prof.stepM;
+        if (t > lo + 1e-6 && t < hi - 1e-6) mid.push(t);
+      }
+      if (t1 < t0) mid.reverse();
+      out.push(...mid, t1);
+      return out;
+    };
+
+    /** Push a long marking as a chain of quads broken at the deck's stations. */
+    const stripe = (sink, t0, t1, sA, sB, dy) => {
+      const ts = stationsBetween(t0, t1);
+      for (let i = 0; i < ts.length - 1; i++) {
+        const u0 = ts[i];
+        const u1 = ts[i + 1];
+        const v0 = i / (ts.length - 1);
+        const v1 = (i + 1) / (ts.length - 1);
+        pushQuad(
+          sink,
+          at(u0, sA, dy), at(u1, sA, dy), at(u1, sB, dy), at(u0, sB, dy),
+          [0, v0], [1, v0], [1, v1], [0, v1],
+        );
+      }
+    };
+
     const half = widthM / 2;
-    const surf = SURFACES[cls] || SURFACES.unknown;
 
     // --- Pavement. Segmented along its length so the fitted gradient is real
     // geometry rather than a single tilted quad (identical for a straight line,
     // but it keeps the vertex density sane for lighting). A deck that had to
     // conform to the terrain gets a vertex per profile station instead.
+    // Split at the centreline. The deck has a cross-fall, so a quad spanning
+    // the full width is a bilinear patch whose triangulated middle is NOT the
+    // surface `deck()` reports — and the middle is exactly where the aeroplane
+    // and the centreline stripe are. With a row of vertices at s = 0 the
+    // centreline is exact by construction.
     const segs = prof.segs;
     const pav = sinkFor(cls);
     for (let i = 0; i < segs; i++) {
       const t0 = (i / segs) * lengthM;
       const t1 = ((i + 1) / segs) * lengthM;
-      pushQuad(
-        pav,
-        at(t0, -half), at(t1, -half), at(t1, half), at(t0, half),
-        [-half / GRAIN_METRES, t0 / GRAIN_METRES],
-        [-half / GRAIN_METRES, t1 / GRAIN_METRES],
-        [half / GRAIN_METRES, t1 / GRAIN_METRES],
-        [half / GRAIN_METRES, t0 / GRAIN_METRES],
-      );
+      for (const [sa, sb] of [[-half, 0], [0, half]]) {
+        pushQuad(
+          pav,
+          at(t0, sa), at(t1, sa), at(t1, sb), at(t0, sb),
+          [sa / GRAIN_METRES, t0 / GRAIN_METRES],
+          [sa / GRAIN_METRES, t1 / GRAIN_METRES],
+          [sb / GRAIN_METRES, t1 / GRAIN_METRES],
+          [sb / GRAIN_METRES, t0 / GRAIN_METRES],
+        );
+      }
     }
 
-    // --- Paved shoulder. Real runways have one, and it doubles as the cover for
-    // the step where the levelled deck meets sloping ground. Deliberately narrow
-    // (see the header): a wide graded skirt in a colour of my choosing would
-    // fight with terrain.js's procedural palette and read as a halo.
+    // --- Paved shoulder, and the SKIRT that lands it on the ground.
+    //
+    // The shoulder used to be drawn flat at the deck height, which made it a
+    // second float rather than a cover: 74 of its vertices at KSEA were BELOW
+    // the collision surface (terrain poking through the paving) and the ones
+    // over the 16R embankment stood 33 m in the air with nothing under them.
+    //
+    // Its outer edge now sits on the terrain. Where the deck is flush that is a
+    // few centimetres of fall and the shoulder looks exactly as it did; where
+    // the deck genuinely stands proud — KSEA 16R/34L on 50 m of Miller Creek
+    // fill — the same quads become the retaining wall that is actually there,
+    // which is what MODULES.md §2.5 asks for and what "the DEM is the collision
+    // surface" looks like when you draw it honestly. It is capped on the way UP
+    // (SHOULDER_RISE_MAX_M): a runway in a cutting gets a shoulder that meets
+    // the hillside, not a paved ramp climbing it.
     if (surf.paint && lengthM >= FULL_MARKINGS_MIN_M) {
       const sh = Math.min(7.5, widthM * 0.25);
       const shoulder = sinkFor('shoulder');
+      // Always at station resolution: the skirt follows the ground, and the
+      // ground does not care how flat the runway is.
+      const ssegs = Math.max(segs, Math.ceil(lengthM / prof.stepM));
+      /** Outer-edge point: on the terrain, clamped so it stays a shoulder. */
+      const rim = (t, s) => {
+        const x = ax + dx * t + rx * s;
+        const z = az + dz * t + rz * s;
+        const edge = deck(t, s);
+        const y = Math.min(
+          getElevationLocal(x, z) + SHOULDER_CLEAR_M,
+          edge + SHOULDER_RISE_MAX_M,
+        );
+        return [x, y, z];
+      };
       for (const sgn of [-1, 1]) {
-        for (let i = 0; i < segs; i++) {
-          const t0 = (i / segs) * lengthM;
-          const t1 = ((i + 1) / segs) * lengthM;
-          const s0 = sgn * half;
-          const s1 = sgn * (half + sh);
-          const lo = Math.min(s0, s1);
-          const hi = Math.max(s0, s1);
+        for (let i = 0; i < ssegs; i++) {
+          const t0 = (i / ssegs) * lengthM;
+          const t1 = ((i + 1) / ssegs) * lengthM;
+          const sIn = sgn * half;
+          const sOut = sgn * (half + sh);
+          // Winding follows the sign: for sgn = -1 the outer edge is the LOW s,
+          // which is the same swap the old min/max did.
+          const A = sgn > 0 ? at(t0, sIn) : rim(t0, sOut);
+          const B = sgn > 0 ? at(t1, sIn) : rim(t1, sOut);
+          const Cc = sgn > 0 ? rim(t1, sOut) : at(t1, sIn);
+          const D = sgn > 0 ? rim(t0, sOut) : at(t0, sIn);
+          const lo = Math.min(sIn, sOut);
+          const hi = Math.max(sIn, sOut);
           pushQuad(
             shoulder,
-            at(t0, lo), at(t1, lo), at(t1, hi), at(t0, hi),
+            A, B, Cc, D,
             [lo / GRAIN_METRES, t0 / GRAIN_METRES],
             [lo / GRAIN_METRES, t1 / GRAIN_METRES],
             [hi / GRAIN_METRES, t1 / GRAIN_METRES],
@@ -1333,11 +1675,7 @@ export function buildRunwayMeshes(scene, list = airports) {
       const off = 80 * FT_TO_M;
       const clW = 0.45;
       for (let t = 6; t + on < lengthM - 6; t += on + off) {
-        pushQuad(
-          paint,
-          at(t, -clW), at(t + on, -clW), at(t + on, clW), at(t, clW),
-          [0, 0], [1, 0], [1, 1], [0, 1],
-        );
+        stripe(paint, t, t + on, -clW, clW, PAINT_LIFT_M);
       }
 
       // Edge stripes, paved runways wide enough to have them.
@@ -1346,11 +1684,7 @@ export function buildRunwayMeshes(scene, list = airports) {
         const inner = half - 0.6 - ew;
         for (const sgn of [-1, 1]) {
           const s0 = sgn > 0 ? inner : -inner - ew;
-          pushQuad(
-            paint,
-            at(0, s0), at(lengthM, s0), at(lengthM, s0 + ew), at(0, s0 + ew),
-            [0, 0], [1, 0], [1, 1], [0, 1],
-          );
+          stripe(paint, 0, lengthM, s0, s0 + ew, PAINT_LIFT_M);
         }
       }
 
@@ -1362,10 +1696,17 @@ export function buildRunwayMeshes(scene, list = airports) {
       paintEnd(
         (u, s) => at(leDisp + u, s, PAINT_LIFT_M),
         usable, widthM, leDisp, rw.leIdent, { paint, numbers }, cellFor,
+        // u runs forward from the low threshold: t = leDisp + u.
+        (u0, u1) => stationsBetween(leDisp + u0, leDisp + u1).map((t) => t - leDisp),
       );
       paintEnd(
         (u, s) => at(lengthM - heDisp - u, -s, PAINT_LIFT_M),
         usable, widthM, heDisp, rw.heIdent, { paint, numbers }, cellFor,
+        // and backward from the high one: t = lengthM - heDisp - u.
+        (u0, u1) =>
+          stationsBetween(lengthM - heDisp - u0, lengthM - heDisp - u1).map(
+            (t) => lengthM - heDisp - t,
+          ),
       );
 
       // --- Rubber. Jets put it down between about 300 and 900 m past the
@@ -1377,14 +1718,7 @@ export function buildRunwayMeshes(scene, list = airports) {
           [lengthM - heDisp - 900, lengthM - heDisp - 240],
         ]) {
           if (t1 - t0 < 100) continue;
-          pushQuad(
-            rubber,
-            at(t0, -half * 0.85, PAINT_LIFT_M * 0.5),
-            at(t1, -half * 0.85, PAINT_LIFT_M * 0.5),
-            at(t1, half * 0.85, PAINT_LIFT_M * 0.5),
-            at(t0, half * 0.85, PAINT_LIFT_M * 0.5),
-            [0, 0], [1, 0], [1, 1], [0, 1],
-          );
+          stripe(rubber, t0, t1, -half * 0.85, half * 0.85, PAINT_LIFT_M * 0.5);
         }
       }
     }
@@ -1422,10 +1756,13 @@ export function buildRunwayMeshes(scene, list = airports) {
     // is a DIAGNOSTIC, not a correction: the deck has to follow the DEM because
     // the DEM is the collision surface (MODULES.md §1.4), so forcing the
     // pavement onto the surveyed elevation would only mean landing under it.
+    // Measured on the DECK AS DRAWN, not on the plane it was fitted to — the
+    // two are different surfaces now and quoting one for the other is exactly
+    // the mistake that let a metre of float ship (see the header).
     let surveyErrM = null;
     if (Number.isFinite(rw.leElevationFt) && Number.isFinite(rw.heElevationFt)) {
-      const eLe = fit.h0 + fit.lift - rw.leElevationFt * FT_TO_M;
-      const eHe = fit.h0 + fit.slope * lengthM + fit.lift - rw.heElevationFt * FT_TO_M;
+      const eLe = deck(0, 0) - rw.leElevationFt * FT_TO_M;
+      const eHe = deck(lengthM, 0) - rw.heElevationFt * FT_TO_M;
       surveyErrM = Math.abs(eLe) > Math.abs(eHe) ? eLe : eHe;
     }
 
@@ -1437,7 +1774,11 @@ export function buildRunwayMeshes(scene, list = airports) {
       widthM,
       deckH0: fit.h0,
       deckSlope: fit.slope,
-      liftM: fit.lift,
+      /** Worst DEM bump under the raw plane. Diagnostic — no longer a lift. */
+      maxAboveM: fit.maxAboveM,
+      /** How far the drawn deck stands above the field where it is flat. */
+      standM: prof.standM,
+      crossFall: prof.crossFall,
       fitRmsM: fit.rms,
       graded: fit.graded,
       surveyErrM,
@@ -1446,7 +1787,7 @@ export function buildRunwayMeshes(scene, list = airports) {
     });
 
     // Remember the frame for the taxiway/apron pass.
-    rw.__frame = { ax, az, dx, dz, rx, rz, lengthM, widthM, deck, cls };
+    rw.__frame = { ax, az, dx, dz, rx, rz, lengthM, widthM, cls };
   }
 
   buildFieldHints(drawable, hints, hintPaint, lightPos, lightCol);
@@ -1456,8 +1797,8 @@ export function buildRunwayMeshes(scene, list = airports) {
   // Materials and meshes
   // -------------------------------------------------------------------------
   const grainCache = new Map();
-  const addMesh = (sink, material, name) => {
-    const g = sinkToGeometry(sink);
+  const addMesh = (sink, material, name, shaded = false) => {
+    const g = sinkToGeometry(sink, shaded);
     if (!g) return null;
     const m = new THREE.Mesh(g, material);
     m.name = name;
@@ -1479,6 +1820,7 @@ export function buildRunwayMeshes(scene, list = airports) {
         map: spec.grain > 0 ? grainTexture(spec.grain, grainCache) : null,
       }),
       `runway-${cls}`,
+      cls === 'shoulder',
     );
   }
 
@@ -1565,15 +1907,23 @@ export function buildRunwayMeshes(scene, list = airports) {
     group.add(lights);
   }
 
-  group.userData = { runways: meta, count: meta.length, conformedDecks };
+  group.userData = {
+    runways: meta,
+    count: meta.length,
+    standingDecks,
+  };
   reportDeckFit(meta);
-  if (conformedDecks.length) {
-    const worst = conformedDecks.slice().sort((a, b) => b.bendM - a.bendM).slice(0, 5);
-    console.info(
-      `[airports] ${conformedDecks.length} deck(s) bent to stay above a DEM that ` +
-        'does not have the airport\'s earthworks (flush beats flat — MODULES.md §1.4): ' +
-        worst.map((d) => `${d.ident} ${d.runway} +${d.bendM.toFixed(1)} m`).join(', ') +
-        (conformedDecks.length > worst.length ? `, +${conformedDecks.length - worst.length} more` : ''),
+  // The float is the number acceptance check 6 is about, so it is the one the
+  // console leads with. A bend is the deck following the ground and is fine; a
+  // STAND is pavement with air under it, which is where the wheels go through.
+  if (standingDecks.length) {
+    const worst = standingDecks.slice().sort((a, b) => b.standM - a.standM).slice(0, 5);
+    console.warn(
+      `[airports] ${standingDecks.length} deck(s) stand more than ` +
+        `${DECK_STAND_WARN_M} m above the collision surface — the DEM does not ` +
+        'contain those earthworks, and the shoulder is skirted down to draw them: ' +
+        worst.map((d) => `${d.ident} ${d.runway} +${d.standM.toFixed(1)} m`).join(', ') +
+        (standingDecks.length > worst.length ? `, +${standingDecks.length - worst.length} more` : ''),
     );
   }
   if (scene) scene.add(group);
@@ -1586,6 +1936,17 @@ export function buildRunwayMeshes(scene, list = airports) {
  * looking like it belongs to the hill it is on.
  */
 const DECK_SURVEY_WARN_M = 6;
+
+/**
+ * How far the drawn deck may stand above the collision surface before it is
+ * worth saying so.
+ *
+ * 1 m because `gearHeightM` is 1.20 m: past this, a landing aircraft's wheels
+ * are inside the pavement it is being shown. Everything above this threshold in
+ * this region is one real thing — an airport earthwork the bare-earth DEM does
+ * not contain — and it is reported per runway rather than averaged away.
+ */
+const DECK_STAND_WARN_M = 1;
 
 /**
  * Say out loud where the DEM could not support a flat runway.
@@ -1693,11 +2054,25 @@ function buildFieldHints(drawable, hints, hintPaint, lightPos, lightCol) {
     const across = relX * F.rx + relZ * F.rz;
     const side = across >= 0 ? 1 : -1;
 
-    const at = (t, s, dy = 0) => [
-      F.ax + F.dx * t + F.rx * s,
-      F.deck(t) + dy,
-      F.az + F.dz * t + F.rz * s,
-    ];
+    // A hint is drawn 130 m off the runway, where the runway's own deck has no
+    // authority at all — following it put the taxiway metres into the air on
+    // any field with a slope. Hints conform to the DEM directly: their whole
+    // job is to look like pavement lying on the ground.
+    const groundAt = (x, z) => {
+      let h = -Infinity;
+      for (let k = -1; k <= 1; k++) {
+        for (let j = -1; j <= 1; j++) {
+          const e = getElevationLocal(x + k * 8, z + j * 8);
+          if (e > h) h = e;
+        }
+      }
+      return h + HINT_LIFT_M;
+    };
+    const at = (t, s, dy = 0) => {
+      const x = F.ax + F.dx * t + F.rx * s;
+      const z = F.az + F.dz * t + F.rz * s;
+      return [x, groundAt(x, z) + dy, z];
+    };
 
     // --- Parallel taxiway.
     const twOffset = side * (F.widthM / 2 + 130);
@@ -1715,7 +2090,9 @@ function buildFieldHints(drawable, hints, hintPaint, lightPos, lightCol) {
     if (!boxes.some((b) => obbOverlap(twBox, b))) {
       const lo = twOffset - twHalf;
       const hi = twOffset + twHalf;
-      const segs = clamp(Math.round((t1 - t0) / 120), 1, 40);
+      // 25 m stations, matching the runway deck: a strip that conforms to the
+      // ground needs vertices where the ground changes, not every 120 m.
+      const segs = clamp(Math.round((t1 - t0) / 25), 1, 200);
       for (let i = 0; i < segs; i++) {
         const u0 = t0 + ((t1 - t0) * i) / segs;
         const u1 = t0 + ((t1 - t0) * (i + 1)) / segs;
@@ -1728,15 +2105,20 @@ function buildFieldHints(drawable, hints, hintPaint, lightPos, lightCol) {
           [hi / GRAIN_METRES, u0 / GRAIN_METRES],
         );
       }
-      // Continuous yellow taxiway centreline.
-      pushQuad(
-        hintPaint,
-        at(t0, twOffset - 0.075, PAINT_LIFT_M),
-        at(t1, twOffset - 0.075, PAINT_LIFT_M),
-        at(t1, twOffset + 0.075, PAINT_LIFT_M),
-        at(t0, twOffset + 0.075, PAINT_LIFT_M),
-        [0, 0], [1, 0], [1, 1], [0, 1],
-      );
+      // Continuous yellow taxiway centreline, in the same stations as the
+      // pavement under it — one long quad would be a chord over every one.
+      for (let i = 0; i < segs; i++) {
+        const u0 = t0 + ((t1 - t0) * i) / segs;
+        const u1 = t0 + ((t1 - t0) * (i + 1)) / segs;
+        pushQuad(
+          hintPaint,
+          at(u0, twOffset - 0.075, PAINT_LIFT_M),
+          at(u1, twOffset - 0.075, PAINT_LIFT_M),
+          at(u1, twOffset + 0.075, PAINT_LIFT_M),
+          at(u0, twOffset + 0.075, PAINT_LIFT_M),
+          [0, 0], [1, 0], [1, 1], [0, 1],
+        );
+      }
       // Blue taxiway edge lights, if the field is lit at all.
       if (primary.lighted) {
         for (let t = t0; t <= t1; t += 120) {
@@ -1759,26 +2141,34 @@ function buildFieldHints(drawable, hints, hintPaint, lightPos, lightCol) {
     if (boxes.some((b) => obbOverlap(apBox, b))) continue;
     if (obbOverlap(apBox, twBox)) continue;
 
-    // The apron deck follows the primary runway's plane at the ARP's own station
-    // along the runway, which keeps the two hints from stepping apart.
-    const along = relX * F.dx + relZ * F.dz;
-    const y = F.deck(clamp(along, 0, F.lengthM));
-    const corner = (l, w) => [
-      _a.x + F.dx * l + F.rx * w,
-      y,
-      _a.z + F.dz * l + F.rz * w,
-    ];
-    pushQuad(
-      hints,
-      corner(-apHalfL, -apHalfW),
-      corner(apHalfL, -apHalfW),
-      corner(apHalfL, apHalfW),
-      corner(-apHalfL, apHalfW),
-      [-apHalfW / GRAIN_METRES, -apHalfL / GRAIN_METRES],
-      [-apHalfW / GRAIN_METRES, apHalfL / GRAIN_METRES],
-      [apHalfW / GRAIN_METRES, apHalfL / GRAIN_METRES],
-      [apHalfW / GRAIN_METRES, -apHalfL / GRAIN_METRES],
-    );
+    // The apron is a 460 x 280 m slab. Drawn at one height — it used to take
+    // the primary runway's deck at the ARP's station — it is flat by
+    // construction and the ground is not, so at KPAE it stood 9 m up at one
+    // corner and was buried at the other. It conforms on a 25 m lattice
+    // instead, on the same sampler as everything else.
+    const apRows = Math.max(2, Math.round((apHalfL * 2) / 25));
+    const apCols = Math.max(2, Math.round((apHalfW * 2) / 25));
+    const corner = (l, w) => {
+      const x = _a.x + F.dx * l + F.rx * w;
+      const z = _a.z + F.dz * l + F.rz * w;
+      return [x, groundAt(x, z), z];
+    };
+    for (let i = 0; i < apRows; i++) {
+      const l0 = -apHalfL + (2 * apHalfL * i) / apRows;
+      const l1 = -apHalfL + (2 * apHalfL * (i + 1)) / apRows;
+      for (let j = 0; j < apCols; j++) {
+        const w0 = -apHalfW + (2 * apHalfW * j) / apCols;
+        const w1 = -apHalfW + (2 * apHalfW * (j + 1)) / apCols;
+        pushQuad(
+          hints,
+          corner(l0, w0), corner(l1, w0), corner(l1, w1), corner(l0, w1),
+          [w0 / GRAIN_METRES, l0 / GRAIN_METRES],
+          [w0 / GRAIN_METRES, l1 / GRAIN_METRES],
+          [w1 / GRAIN_METRES, l1 / GRAIN_METRES],
+          [w1 / GRAIN_METRES, l0 / GRAIN_METRES],
+        );
+      }
+    }
   }
 }
 
