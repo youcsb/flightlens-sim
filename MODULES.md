@@ -1142,7 +1142,9 @@ createInstruments(container, opts?) -> {
   setLayout('auto'|'panel'|'compact') -> layout,
 }
 COMPACT_QUERY   // '(max-width: 820px), (max-height: 460px)'
-TOUCH_RESERVE   // {landscape:{w:200,h:200}, portrait:{w:200,h:260}}  CSS px
+touchReserve(w, h) -> {w, h}   // CSS px. THE contract with controls/touch.js.
+TOUCH_RESERVE   // that function at the reference phone: landscape 205,
+                // portrait 248. For prose and for overlay.js's static offset.
 pickLayout(pref?) -> 'panel' | 'compact'
 opts = { layout: 'auto' }   // 'auto' also honours ?hud=compact|panel
 ```
@@ -1172,14 +1174,37 @@ dragged narrow has the same problem, `?tier=phone` on a desktop must still be
 measurable, and a tablet at 1180x820 legitimately fits the dials. Verified
 live: `?tier=desktop` at 812x375 still gets the compact HUD.
 
-**`TOUCH_RESERVE` is a contract with `controls/input.js`'s touch layer.**
-Nothing `instruments.js` or `overlay.js` draws enters a `w x h` rectangle in
-either bottom corner, measured inside the safe-area insets. The numbers are
-measured against the shipped touch layer, not guessed — at 667x375 its stick is
-`(14,194) 113x113` and its throttle `(577,177) 76x130`, both inside 200x200;
-at 375x812 its topmost control is 243 px off the bottom, inside the portrait
-260. In portrait the whole bottom 260 px is left clear and the measured
-clearance between the two layers is 25 px.
+**`touchReserve(w, h)` is a contract with `controls/touch.js`, and it is a BAND
+ACROSS THE FULL WIDTH, not two corners.** Nothing `instruments.js` or
+`overlay.js` draws enters the bottom `h` CSS px, measured inside the safe-area
+insets. It is published to the compact stylesheet as `--<u>-res` and rewritten
+on every resize.
+
+Round 3 shipped it as two 200x200 corners and a flat 200 px height, and both
+halves of that were wrong. `touch.js` draws its **rudder bar full width**, so
+the 400 px between the corners belonged to nobody and the attitude cluster went
+there: measured live at 812x375, the cluster covered **7,568 px² of the rudder
+bar, 78% of the BRK button and 55% of CAM**. And the band's height is set by the
+throttle slider, which scales with the viewport — 196 px at 320 tall, 205 at
+375, 224 at 428, **308 on a tablet** — so a flat 200 ran the altitude tape 42 px
+through the throttle in landscape on anything tablet-sized.
+
+Two consequences bind:
+
+1. **The attitude cluster is top-anchored in BOTH orientations**, under the
+   heading strip. Portrait moved it a round ago for its own reason; landscape
+   kept `bottom: 6px` because the two modules had never been run together.
+2. **`touch.js`'s button grid may not climb above the stick/throttle line.** It
+   reflows on rows now — fewest rows whose columns are still `MIN_TOUCH_PX`
+   wide — because the old "6, else 2, else 1 column" rule grew the grid
+   *upward*: at 360x640 that was one column and six rows, buttons from y=242 to
+   y=568, four of them in the sky above the aeroplane.
+
+Measured after, at sixteen viewports from 320x568 to 1180x820: every touch
+rectangle inside the reserve, tightest slack **+7 px**, no button under
+36x46 px, and **zero overlapping pixels** between the two layers at 375x812,
+812x375 and 1024x768 verified live in a browser. `npm run check:touch §
+reserve` is the test that runs the two modules together; nothing did before.
 
 **Safe areas are live in both layouts**, and `overlay.js` adds
 `viewport-fit=cover` to the viewport meta at construction — without it every
@@ -1194,13 +1219,47 @@ the layout swap and the thumb zones.
 ### 2.12 `src/controls/input.js` — a pure sensor
 
 ```js
-createInput(domElement) -> { get(), dispose() }
-get() -> {pitch, roll, yaw, throttle, flaps, brakes}
+createInput(domElement, opts?) -> {
+  get(dtSec?), dispose(),
+  setThrottle(v), setFlaps(v),
+  setMouseYoke(on), isMouseYoke(), hasGamepad(),
+  hasTouch(), setTouchVisible(on), touchLayout(), touchCore(),
+}
+get(dtSec?) -> {pitch, roll, yaw, throttle, flaps, brakes, gear}
+resolveTouchTier(want?, search?, storage?) -> boolean
+opts = { touch: 'auto'|true|false, touchParent: HTMLElement, onAction: fn }
 ```
 
 `get()` returns the **same object every call**, mutated in place — consume it
-within the frame, do not stash it. Timing is derived internally, so it takes no
-`dt`. Never touches the scene, the flight model, or the DOM beyond listeners.
+within the frame, do not stash it. Never touches the scene, the flight model, or
+the DOM beyond listeners.
+
+**`gear` is part of the contract** (0 retracted, 1 extended). `flightModel`
+ignores it today; `aircraft/model.js` should animate it.
+
+**`dtSec` IS OPTIONAL AND THE WALL CLOCK IS STILL THE DEFAULT.** Pass the same
+delta the flight model is about to get — `main.js` does — and every ramp in
+`input.js` and `touch.js` runs on the simulation's clock. On the rAF path the
+two are the same number (`main.js#dtFor` reads the same clock and applies the
+same 0.1 s clamp), so passing it changes nothing about how the aeroplane flies
+and `check:autopilot`'s frame timing is untouched.
+
+It matters everywhere the sim's clock is not the wall clock, which is every
+place this project verifies itself. `window.sim.tick(1/60, 60)` runs a second of
+flight in about five milliseconds of wall time; with the internal clock, **a
+thumb held at the stop through that whole second advanced its axis by 0.008 and
+the aeroplane did not move.** That is why nobody had flown the thumb cockpit —
+the documented way to drive this sim could not press the stick.
+`check-touch.mjs` had already hit it and worked around it by replacing
+`globalThis.performance`.
+
+**`resolveTouchTier` honours `?tier=`**, in this order: `opts.touch` → `?touch=`
+→ `?tier=` / `localStorage['sim.tier']` → `classifyTier(readSignals())`. The
+third entry is the one that was missing: `?tier=phone` is the documented way to
+exercise a phone on a desktop (§2.18) and `main.js` honours it for every budget
+in the sim, but this function asked `classifyTier` for a fresh opinion and got
+`desktop` — so a forced phone got phone memory and phone draw budgets and no
+stick, no rudder bar and no throttle to fly them with.
 
 Bindings: `W/S` or `↑/↓` pitch · `A/D` or `←/→` roll · `Q/E` yaw ·
 `Shift`/`Ctrl` throttle · `X` idle · `Z` full · `F` flaps · `B` brakes ·
@@ -1221,6 +1280,52 @@ and synthetic events. Binding to it alone means those users get an aircraft that
 silently does not respond: the events arrive and match nothing, and there is no
 error to find. `eventCode` prefers `code` and falls back to a code synthesised
 from `e.key`.
+
+### 2.12a `src/controls/touch.js` — the thumb cockpit
+
+```js
+createTouchCore(opts?)     -> pure state machine, NO DOM. Node-runnable.
+createTouchControls(opts?) -> the same core plus an overlay of <div>s.
+computeLayout(w, h)        -> {stick, rudder, throttle, buttons[], grid, w, h}
+curve(v, deadzone, expo)   -> -1..1
+slewAxis(st, axis, target, dt)
+shouldUseTouch(tier)       -> tier === 'phone' || tier === 'tablet'
+
+STICK_DEADZONE 0.16 · STICK_EXPO 0.45 · RUDDER_DEADZONE 0.12 · RUDDER_EXPO 0.3
+THROTTLE_GRAB_TOL 0.14 · MIN_TOUCH_PX 36 · ZONES · BUTTONS
+```
+
+**`controls/input.js` owns this module and is the only thing that constructs
+it.** Everything reaches the aeroplane through `input.get()`'s existing
+contract; nothing in `main.js` knows this file exists beyond passing
+`touchParent`.
+
+Layout: rudder bar full width along the bottom, stick pad bottom-left, throttle
+bottom-right, six buttons in the gap between them. **The rudder is not
+decoration** — KBFI 32L needs about 2.5°/s of right rudder against the
+slipstream on the takeoff roll, and rudder is the control touch pilots are
+usually denied.
+
+Three properties are load-bearing and are asserted rather than eyeballed:
+
+- **A released axis reaches EXACTLY zero**, not 1e-3. `systems/autopilot.js`
+  disconnects above |0.3| on pitch or roll, and a thumb resting on the pad must
+  not trip it. Verified live: a jittering resting thumb over 60 s reads
+  `0.000000` and the autopilot stays engaged.
+- **The throttle LATCHES.** Land on the knob (within `THROTTLE_GRAB_TOL`) and it
+  moves relative; land away from it and it jumps to the finger. Lift the thumb
+  and the lever stays where it was. A spring-return throttle is a platformer
+  control.
+- **The stick slews to a proportional target** under `input.js`'s own keyboard
+  rate law, so touch and keyboard fly like the same aeroplane. A 15% nudge
+  arrives in ~0.09 s; a full-throw slam takes ~0.47 s.
+
+**The button grid may not climb above the stick/throttle line** — see §2.11.
+Everything above that line is windscreen and the HUD is entitled to it.
+
+`npm run check:touch` — 170 assertions, including multi-touch through a real
+DOM shim, return-to-zero, the throttle latch, layout at sixteen viewports, the
+`get(dt)` clock, and the cross-module reserve check against `instruments.js`.
 
 ### 2.13 `src/camera/cameras.js` — the view rig
 
@@ -1803,3 +1908,27 @@ Cheap, specific, and each one falsifies a whole class of bug.
    fetch it again: the peak must not climb. The DEM on disk is 402 MB and the
    pager is the only thing standing between that and the tab. `capViolations`
    above zero is a paging bug, never a tuning problem.
+10. **A phone can fly it, on thumbs, with no keyboard.** Open
+    `?tier=phone` (or a real phone), and fly a complete circuit using only the
+    on-screen controls: full throttle on the slider, right rudder on the bar
+    against the slipstream, rotate at ~58 kt, climb, turn, engage the autopilot
+    on the A/P button, land. Measured on the shipping build with synthesised
+    pointer events at 375x812: rotation at 59 kt, climb 470–880 fpm at 91 kt,
+    a 360° turn at 22° of bank, autopilot engaged from the button and holding
+    ±0 ft with a jittering thumb parked on the stick, touchdown at **55.6 kt,
+    273 fpm, 2.6° nose-up, wheels on the drawn surface, no crash**, stopped on
+    the brake button.
+
+    Two failures this catches that nothing else does. **A resting thumb must not
+    disconnect the autopilot** — the threshold is 0.3 and a released touch axis
+    must read the integer 0. And **`window.sim.tick()` must actually move the
+    controls**: it is the only way to drive the sim in a tab that never becomes
+    visible, and until `input.get(dt)` existed it advanced the flight model a
+    full second while advancing a held thumb by 0.008.
+11. **The autopilot is quiet at a power setting it was not trimmed for.**
+    Engage it, then move the throttle. `npm run check:autopilot § disturbed`
+    asserts the pitch band stays under 1.5° and vertical speed reverses at most
+    twice, across seven conditions. **Altitude band is not a stability
+    measurement** — the build this replaces held altitude inside 8 ft while
+    swinging the nose 13° at 1.3 Hz, which is how the porpoise survived three
+    rounds of a harness that only ever tested one power setting.

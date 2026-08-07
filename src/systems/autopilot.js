@@ -119,8 +119,43 @@ const K_PITCH_D = 0.055;
 const K_PITCH_I = 0.020;
 const PITCH_I_CLAMP = 0.55;
 
-/** Time constant for the rate low-pass, seconds. See pitchRateF below. */
-const RATE_TAU = 0.08;
+/**
+ * Time constant for the rate low-pass, seconds. See pitchRateF below.
+ *
+ * THIS WAS 0.08 AND IT WAS THE PORPOISE. The damping term is the only thing
+ * standing between this loop and the airframe's short period, and a low-pass on
+ * the rate estimate delays that term. At 0.08 s the delay is 33 degrees of
+ * phase at the short period (~1.3 Hz measured), which is enough to turn the
+ * damping term into an EXCITING one — the identical mechanism the TUNE_REF_DT
+ * note below describes for a slow frame rate, arriving here through the filter
+ * instead of through the sample rate.
+ *
+ * It is a limit cycle with two attractors, which is exactly why it survived
+ * three rounds: land in the quiet one and the loop is perfect, land in the
+ * noisy one and it never leaves. `airborne()` in the harness happened to land
+ * in the quiet one at one power setting. Settle the same aeroplane for twenty
+ * seconds first, or move the throttle, and it lands in the other:
+ *
+ *   3,000 ft, 100 kt, 0.65 throttle, engaged and left alone for 65 s
+ *     RATE_TAU 0.08   pitch band  9.57 deg, 24 vertical-speed reversals in 10 s
+ *     RATE_TAU 0.03   pitch band  0.01 deg,  0 reversals
+ *
+ *   then slam the throttle to full and hold 3 minutes
+ *     RATE_TAU 0.08   pitch band 13.17 deg, 79 reversals, 17 ft below the bug
+ *     RATE_TAU 0.03   pitch band  0.01 deg,  0 reversals,  3 ft below the bug
+ *
+ * The altitude band stayed inside 8 ft the whole time in BOTH columns, which is
+ * why every altitude assertion in this project passed while the nose swung ten
+ * degrees. Altitude band is not a stability measurement. The pitch band and the
+ * reversal count are, and `check-autopilot.mjs § disturbed` now asserts them
+ * across seven conditions rather than one.
+ *
+ * 0.03 s is still two frames at 60 Hz, and the two guards that actually bound a
+ * differentiation spike are unchanged: RATE_MIN_DT floors the interval, and
+ * CMD_SLEW_PER_S bounds how fast the resulting command may move. The 30 fps
+ * ±60% jitter case is asserted below and is clean.
+ */
+const RATE_TAU = 0.03;
 
 /**
  * Floor on the differentiation interval, seconds.

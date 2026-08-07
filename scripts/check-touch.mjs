@@ -706,7 +706,19 @@ ok('computeLayout survives garbage', (() => {
   const L = computeLayout(NaN, undefined);
   return Number.isFinite(L.stick.w) && L.stick.w >= MIN_TOUCH_PX;
 })());
-ok('the button grid reflows with the space it is given', computeLayout(320, 568).grid.cols === 1 && computeLayout(375, 812).grid.cols === 2 && computeLayout(1024, 768).grid.cols === 6);
+// The grid reflows on ROWS now, not on a 64 px aesthetic minimum for columns.
+// The old rule only ever tried 6, 2 or 1 column and let the result grow upward,
+// so a 130 px gap became one column and six rows — buttons from y=242 to y=568
+// on a 640 px screen, four of them in the sky above the aeroplane. Fewest rows
+// that still leave a fingertip-wide button is the rule; see computeLayout.
+ok('the button grid reflows to the fewest rows that fit',
+  computeLayout(320, 568).grid.rows === 2
+  && computeLayout(375, 812).grid.rows === 2
+  && computeLayout(812, 375).grid.rows === 1
+  && computeLayout(1024, 768).grid.cols === 6,
+  `320x568 ${computeLayout(320, 568).grid.cols}x${computeLayout(320, 568).grid.rows}, `
+  + `375x812 ${computeLayout(375, 812).grid.cols}x${computeLayout(375, 812).grid.rows}, `
+  + `812x375 ${computeLayout(812, 375).grid.cols}x${computeLayout(812, 375).grid.rows}`);
 
 // ===========================================================================
 console.log('\n\x1b[1mdrawing and teardown\x1b[0m');
@@ -950,6 +962,54 @@ function frames(input, n) {
   fire(btn('gear'), 'pointerup', { id: 9 });
   ok('GEAR toggles', frames(input, 1).gear !== gearBefore);
 
+  // -------------------------------------------------------------------------
+  // get(dt) — the simulation's clock, not the wall clock.
+  //
+  // `window.sim.tick(1/60, n)` is how this project verifies itself, and it runs
+  // a second of flight in a few milliseconds of wall time. Every control ramp
+  // in input.js and touch.js used to run off performance.now(), so a thumb held
+  // at the stop through a simulated second moved the axis by less than 0.01 and
+  // the aeroplane did not respond. That is why the thumb cockpit had never been
+  // flown. The stub at the top of this file is the same workaround, from the
+  // inside — these assertions are what make it unnecessary in a browser.
+  // -------------------------------------------------------------------------
+  {
+    p = at(stickEl, 0.5, 1); // thumb to the bottom of the pad: stick back, nose up
+    fire(stickEl, 'pointerdown', { id: 21, x: p.x, y: p.y });
+
+    // The wall clock is frozen here (clockMs never moves), so anything that
+    // deflects at all deflected on the dt that was handed in.
+    let c2 = input.get();
+    for (let i = 0; i < 60; i += 1) c2 = input.get(1 / 60);
+    ok('get(dt) runs the touch ramp on the dt it was given, with a frozen wall clock',
+      c2.pitch > 0.9, `pitch=${c2.pitch.toFixed(3)} after 1.0 s of supplied dt`);
+    note('a simulated second of thumb, wall clock frozen', c2.pitch.toFixed(3));
+
+    // And the old path is genuinely unchanged: no argument, no wall time, no
+    // movement. This is the bug, reproduced, so a regression re-fails here.
+    const before = c2.pitch;
+    for (let i = 0; i < 60; i += 1) input.get();
+    const c3 = input.get();
+    ok('get() with no argument still reads the wall clock (frozen → no change)',
+      c3.pitch === before, `${before.toFixed(3)} → ${c3.pitch.toFixed(3)}`);
+
+    ok('a non-finite dt falls back to the wall clock rather than poisoning the ramp',
+      Number.isFinite(input.get(NaN).pitch) && Number.isFinite(input.get(undefined).pitch));
+    ok('a negative dt is refused, not applied backwards',
+      input.get(-5).pitch === before);
+    // 0.1 s is the flight model's own clamp; a tab that was backgrounded for a
+    // minute must not slam the stick to the stop on the frame it comes back.
+    const c4 = input.get(60);
+    ok('an absurd dt is clamped to 0.1 s, exactly as the wall-clock path is',
+      c4.pitch <= 1 && c4.pitch >= before, `pitch=${c4.pitch.toFixed(3)}`);
+
+    fire(stickEl, 'pointerup', { id: 21 });
+    let c5 = input.get(1 / 60);
+    for (let i = 0; i < 120; i += 1) c5 = input.get(1 / 60);
+    ok('and a release on the supplied clock still reaches EXACTLY zero',
+      c5.pitch === 0 && c5.roll === 0, `pitch=${c5.pitch}`);
+  }
+
   fire(btn('brakes'), 'pointerdown', { id: 9 });
   const braked = frames(input, 30).brakes;
   ok('BRK ramps the brakes rather than switching them', braked > 0.2 && braked <= 1, `brakes=${braked.toFixed(3)}`);
@@ -995,12 +1055,107 @@ function frames(input, n) {
   ok('and the contract object is unchanged', c.pitch === 0 && c.roll === 0 && c.yaw === 0 && c.gear === 1);
   input.dispose();
 }
+// ===========================================================================
+// THE RESERVE — the two modules, run together, for the first time.
+//
+// `ui/instruments.js` promises not to draw inside a rectangle at the bottom of
+// the screen, and `controls/touch.js` decides where its controls actually go.
+// Nothing had ever compared the two. They disagreed on both axes:
+//
+//   WIDTH  the reserve was described as two 200x200 CORNERS, and the rudder bar
+//          runs the FULL WIDTH, so the 400 px between the corners was nobody's.
+//          The compact HUD put its attitude cluster there. Measured live at
+//          812x375: 7,568 px² of the rudder bar covered, 78% of BRK, 55% of CAM.
+//
+//   HEIGHT the reserve was a flat 200 px, and the band's height is set by the
+//          throttle slider, which scales with the viewport — 196 px at 320 tall,
+//          224 at 428, 308 on a tablet. The altitude tape ran 42 px through the
+//          throttle in landscape on anything tablet-sized.
+//
+// So `touchReserve(w, h)` is now a function, and this is what keeps its
+// arithmetic honest against the rectangles `computeLayout` really returns.
+// ===========================================================================
+{
+  const { touchReserve } = await import('../src/ui/instruments.js');
+
+  const VIEWPORTS = [
+    [320, 568], [360, 640], [375, 667], [375, 812], [390, 844], [414, 896], [428, 926],
+    [568, 320], [667, 375], [736, 414], [812, 375], [844, 390], [896, 414], [926, 428],
+    [1024, 768], [1180, 820],
+  ];
+
+  let worstSlack = Infinity;
+  let worstAt = '';
+  let allInside = true;
+  let allWide = true;
+  let smallest = Infinity;
+  let climbed = null;
+
+  for (const [w, h] of VIEWPORTS) {
+    const L = computeLayout(w, h);
+    const rects = [L.stick, L.throttle, L.rudder, ...L.buttons];
+    const top = Math.min(...rects.map((r) => r.y));
+    const reserve = touchReserve(w, h);
+    const slack = reserve.h - (h - top);
+    if (slack < 0) { allInside = false; worstAt = `${w}x${h} short by ${-slack}px`; }
+    if (slack < worstSlack) { worstSlack = slack; if (slack >= 0) worstAt = `${w}x${h} +${slack}px`; }
+
+    // The rudder bar is the reason the reserve cannot be two corners.
+    if (L.rudder.w < w - 2 * 14) allWide = false;
+
+    // Nothing may stand above the taller of the stick and the throttle: that
+    // line is where the windscreen starts and the HUD is entitled to it.
+    const bandTop = Math.min(L.stick.y, L.throttle.y);
+    for (const b of L.buttons) if (b.y < bandTop) climbed = `${w}x${h}: button at y=${b.y}, band starts ${bandTop}`;
+
+    for (const b of L.buttons) smallest = Math.min(smallest, b.w, b.h);
+  }
+
+  ok('every touch control is inside touchReserve() at all 16 viewports', allInside,
+    allInside ? `tightest ${worstAt}` : worstAt);
+  ok('the reserve is never wasteful either', worstSlack < 40, `worst slack ${worstSlack}px`);
+  ok('the rudder bar really is full width — which is why the reserve is a BAND', allWide);
+  ok('no button ever climbs above the stick/throttle line into the windscreen',
+    climbed === null, climbed || 'none at 16 viewports');
+  ok('and no button is ever smaller than a fingertip', smallest >= MIN_TOUCH_PX,
+    `smallest ${smallest.toFixed(0)}px vs MIN_TOUCH_PX ${MIN_TOUCH_PX}`);
+
+  // The reference values the prose in MODULES.md quotes.
+  note('reserve at 812x375 (landscape phone)', `${touchReserve(812, 375).h}px`);
+  note('reserve at 375x812 (portrait phone)', `${touchReserve(375, 812).h}px`);
+  note('reserve at 1024x768 (tablet landscape)', `${touchReserve(1024, 768).h}px`);
+  ok('the reserve grows with the viewport rather than sitting at a flat 200',
+    touchReserve(1024, 768).h > touchReserve(812, 375).h + 80,
+    `${touchReserve(812, 375).h} -> ${touchReserve(1024, 768).h}`);
+}
+
 {
   const { resolveTouchTier } = await import('../src/controls/input.js');
   ok('?touch=1 forces the thumb cockpit on', resolveTouchTier('auto', '?tier=phone&touch=1') === true);
   ok('?touch=0 forces it off', resolveTouchTier('auto', '?touch=0') === false);
   ok('an explicit boolean beats the query string', resolveTouchTier(false, '?touch=1') === false && resolveTouchTier(true, '?touch=0') === true);
   ok('with no signals and no override, a headless environment gets no overlay', resolveTouchTier('auto', '') === false);
+
+  // ?tier= IS THE DOCUMENTED WAY TO EXERCISE A PHONE ON A DESKTOP (§2.18), and
+  // it used to hand out phone budgets with no controls to fly them with — this
+  // function asked classifyTier for a second opinion and got 'desktop'.
+  ok('?tier=phone brings the thumb cockpit with it', resolveTouchTier('auto', '?tier=phone') === true);
+  ok('?tier=tablet does too', resolveTouchTier('auto', '?tier=tablet') === true);
+  ok('?tier=desktop forced on a phone takes it away', resolveTouchTier('auto', '?tier=desktop') === false);
+  ok('?device= is the same lever', resolveTouchTier('auto', '?device=phone') === true);
+  ok('?touch=0 beats ?tier=phone', resolveTouchTier('auto', '?tier=phone&touch=0') === false);
+  ok('an unknown ?tier= is ignored, not thrown',
+    resolveTouchTier('auto', '?tier=banana') === false);
+
+  const store = (v) => ({ getItem: (k) => (k === 'sim.tier' ? v : null) });
+  ok('a sticky localStorage tier also brings the controls',
+    resolveTouchTier('auto', '', store('phone')) === true);
+  ok('and a sticky desktop takes them away',
+    resolveTouchTier('auto', '', store('desktop')) === false);
+  ok('the query string beats the sticky value',
+    resolveTouchTier('auto', '?tier=desktop', store('phone')) === false);
+  ok('a storage that throws does not break the boot',
+    resolveTouchTier('auto', '', { getItem() { throw new Error('private mode'); } }) === false);
 }
 
 // ===========================================================================

@@ -693,8 +693,14 @@ async function boot() {
   function tick(dt) {
     const state = flight.state;
 
-    // 1. input — the same object every frame, mutated in place
-    const inputs = input.get();
+    // 1. input — the same object every frame, mutated in place.
+    //    It is handed THIS frame's dt, the one the flight model is about to
+    //    get, so every control ramp in input.js and touch.js runs on the
+    //    simulation's clock. On the rAF path that is the same number it used
+    //    to read off performance.now() itself; on the `window.sim.tick()` path
+    //    it is the difference between a thumb that flies the aeroplane and a
+    //    thumb that moves the stick by 0.008 in a simulated second.
+    const inputs = input.get(dt);
 
     if (!paused) {
       // 1b. autopilot. It writes into the SAME inputs object the keyboard just

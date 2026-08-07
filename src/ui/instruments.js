@@ -265,24 +265,57 @@ const COMPACT_QUERY = '(max-width: 820px), (max-height: 460px)';
 
 /**
  * THE THUMB ZONES, in CSS px, measured INSIDE the safe-area insets from the
- * bottom-left and bottom-right corners. Nothing this module or overlay.js
- * draws may enter them: they belong to the touch controls.
+ * bottom of the viewport. Nothing this module or overlay.js draws may enter
+ * them: they belong to the touch controls.
  *
- * Landscape is the tighter case and it is the one that binds — a 375 px-tall
- * window has room for a 200 px-tall control zone and a 46 px heading strip and
- * not much else, so the tapes are pushed up against the top and the cluster is
- * squeezed into the clear width between the two corners. Portrait has height to
- * spare, so the whole bottom third goes to the controls.
+ * IT IS A BAND ACROSS THE FULL WIDTH, NOT TWO CORNERS, AND IT IS A FUNCTION OF
+ * THE VIEWPORT, NOT A CONSTANT. Both of those were wrong here for a whole
+ * round, and the two mistakes hid each other:
  *
- * BOTH NUMBERS ARE MEASURED AGAINST THE SHIPPED TOUCH LAYER, not guessed. At
- * 667x375 its joystick occupies (14, 194) 113x113 and its throttle (577, 177)
- * 76x130 — both inside a 200x200 corner, and NOT inside the 170 this reserved
- * first, which is why the height is 200. At 375x812 its topmost control is at
- * y = 569, which is 243 px off the bottom and inside the portrait 260.
+ *   - `controls/touch.js` draws its rudder bar FULL WIDTH along the bottom,
+ *     because rudder is the control touch pilots are usually denied and the
+ *     takeoff roll needs it. A reserve described as two 200x200 corners says
+ *     nothing about the 400 px of screen between them, so this module put its
+ *     attitude cluster bottom-centre — measured live at 812x375, the cluster
+ *     covered 7,568 px² of the rudder bar, 78% of the BRK button and 55% of
+ *     CAM. The buttons still worked (the HUD is pointer-events: none); you
+ *     simply could not see the rudder your thumb was on.
+ *
+ *   - The height is set by the throttle slider, whose length scales with the
+ *     viewport: `14 + rudderHeight + 10 + throttleHeight`. That is 198 px on a
+ *     375 px-tall phone — which is where the flat 200 came from — and 215 px at
+ *     428 and 300 px at 768. A fixed 200 therefore puts the altitude tape
+ *     through the throttle on any landscape screen taller than about 400 px,
+ *     and 42 px into it on a tablet.
+ *
+ * So it is computed, from the same three clamps `touch.js#computeLayout` uses,
+ * and `check-touch.mjs § reserve` asserts the answer against the REAL rectangles
+ * that function returns at fourteen viewports. If the two ever drift, that is
+ * the test that fails.
+ *
+ * `TOUCH_RESERVE` is kept as the reference-phone value — 812x375 landscape and
+ * 375x812 portrait — because it is what the prose in MODULES.md quotes and what
+ * `overlay.js` uses for a static offset. Live layout uses `touchReserve()`.
  */
+function touchReserve(w, h) {
+  const W = Math.max(200, Number.isFinite(w) ? w : 375);
+  const H = Math.max(240, Number.isFinite(h) ? h : 812);
+  // These four lines mirror touch.js#computeLayout exactly. Duplicated rather
+  // than imported so the HUD does not depend on the control layer for its own
+  // geometry; the harness is what keeps the copy honest.
+  const rudderH = Math.round(Math.min(Math.max(H * 0.075, 44), 64));
+  const padSide = Math.min(Math.max(Math.min(W * 0.36, H * 0.3), 96), 190);
+  const throttleH = Math.min(Math.max(padSide * 1.15, 120), 260);
+  // 14 = the layout inset, 10 = the gap above the rudder bar. The throttle is
+  // the tallest thing standing on that line, so it sets the band.
+  const band = 14 + rudderH + 10 + Math.round(throttleH);
+  // Plus a little air, so a tape does not end exactly on a knob.
+  return { w: 200, h: Math.round(band + 8) };
+}
+
 const TOUCH_RESERVE = Object.freeze({
-  landscape: Object.freeze({ w: 200, h: 200 }),
-  portrait: Object.freeze({ w: 200, h: 260 }),
+  landscape: Object.freeze({ w: 200, h: touchReserve(812, 375).h }),
+  portrait: Object.freeze({ w: 200, h: touchReserve(375, 812).h }),
 });
 
 // ---------------------------------------------------------------------------
@@ -1093,10 +1126,29 @@ function buildCompact(u) {
  * Compact-layout stylesheet. THIS is where the thumb zones are honoured, and
  * every offset below is derived from TOUCH_RESERVE rather than eyeballed:
  *
- *   landscape  the tapes stop 170 px above the bottom safe edge, and the
- *              cluster lives in the 208 px of clear width between the two
- *              200 px-wide corners
- *   portrait   nothing at all in the bottom 260 px
+ *   both orientations   NOTHING enters the bottom `--${u}-res` pixels, across
+ *                       the FULL width, and the attitude cluster lives under
+ *                       the heading strip rather than at the bottom
+ *
+ * `--${u}-res` is written by `pushReserve()` on every resize from
+ * `touchReserve(innerWidth, innerHeight)`. It is a variable rather than a
+ * baked-in constant because the touch layer's height is a function of the
+ * viewport: 196 px on a 320-tall landscape phone, 205 at 375, 224 at 428, 308
+ * on a tablet. The flat 200 this replaces put the altitude tape 42 px through
+ * the throttle slider on a tablet in landscape.
+ *
+ * THE CLUSTER IS NOT AT THE BOTTOM IN EITHER ORIENTATION ANY MORE. Portrait
+ * moved it up a round ago for its own reason (the chase camera frames the
+ * aeroplane dead centre and a bottom-anchored cluster landed on the tail);
+ * landscape kept `bottom: 6px` and the two modules had never been run together,
+ * so nobody saw what that did. Measured live at 812x375: the cluster covered
+ * 7,568 px² of the full-width rudder bar, 78% of the BRK button and 55% of CAM.
+ * Under the heading strip is clear in both orientations, and it is where a real
+ * PFD puts the attitude indicator anyway.
+ *
+ * The STALL banner deliberately still draws over the cluster. It is the one
+ * thing on this screen that must be unmissable, it only exists for the seconds
+ * it is true, and portrait has shipped that way since the compact HUD landed.
  *
  * `env(safe-area-inset-*)` needs `viewport-fit=cover` on the viewport meta to
  * be anything but zero; overlay.js sets that (it owns the page chrome), and a
@@ -1105,6 +1157,8 @@ function buildCompact(u) {
 function compactStyleSheet(u) {
   const L = TOUCH_RESERVE.landscape;
   const P = TOUCH_RESERVE.portrait;
+  /** The live reserve, with the reference-phone value as the fallback. */
+  const res = (fallback) => `var(--${u}-res, ${fallback}px)`;
   const sl = 'env(safe-area-inset-left, 0px)';
   const sr = 'env(safe-area-inset-right, 0px)';
   const st = 'env(safe-area-inset-top, 0px)';
@@ -1133,7 +1187,7 @@ function compactStyleSheet(u) {
 .${u}-w-alt  { right: calc(${sr} + 8px); width: ${C_ALT_W}px; }
 .${u}-w-clu  { left: 50%; transform: translateX(-50%);
                width: ${C_CLU_W}px; height: ${C_CLU_H}px;
-               bottom: calc(${sb} + 6px); }
+               top: calc(${st} + 58px); bottom: auto; }
 .${u}-w-stall {
   left: 50%; transform: translateX(-50%); top: calc(${st} + 58px);
   display: none; padding: 4px 18px 5px;
@@ -1145,11 +1199,13 @@ function compactStyleSheet(u) {
 .${u}-w-stall.blink { animation: ${u}-blink 0.62s steps(1, end) infinite; }
 
 /* LANDSCAPE — the primary orientation. Both tapes are pinned under the heading
-   strip and stop ${L.h}px above the bottom safe edge, which is the touch zone. */
+   strip and stop the live reserve above the bottom safe edge, which is the
+   touch band. The cluster sits between them, under the heading strip; the base
+   rule above already put it there. */
 @media (orientation: landscape) {
   .${u}-w-asi, .${u}-w-alt {
     top: calc(${st} + 58px);
-    height: calc(100vh - ${st} - ${sb} - 58px - ${L.h}px);
+    height: calc(100vh - ${st} - ${sb} - 58px - ${res(L.h)});
     max-height: ${C_TAPE_H}px; min-height: 104px;
   }
 }
@@ -1163,7 +1219,7 @@ function compactStyleSheet(u) {
   .${u}-w-stall { top: calc(${st} + 104px); }
   .${u}-w-asi, .${u}-w-alt {
     top: calc(${st} + 100px);
-    height: calc(100vh - ${st} - ${sb} - 100px - ${P.h}px - ${C_CLU_H}px - 20px);
+    height: calc(100vh - ${st} - ${sb} - 100px - ${res(P.h)} - ${C_CLU_H}px - 20px);
     max-height: ${C_TAPE_H}px; min-height: 104px;
   }
   /* IN PORTRAIT THE CLUSTER GOES TO THE TOP, not the bottom.
@@ -1185,7 +1241,7 @@ function compactStyleSheet(u) {
   /* The tapes start below the cluster rather than beside it. */
   .${u}-w-asi, .${u}-w-alt {
     top: calc(${st} + 100px + ${C_CLU_H_PORTRAIT}px + 10px);
-    height: calc(100vh - ${st} - ${sb} - 100px - ${C_CLU_H_PORTRAIT}px - 10px - ${P.h}px - 16px);
+    height: calc(100vh - ${st} - ${sb} - 100px - ${C_CLU_H_PORTRAIT}px - 10px - ${res(P.h)} - 16px);
   }
 }
 /* THE CLUSTER MUST NOT SIT ON THE AEROPLANE.
@@ -1565,14 +1621,46 @@ export function createInstruments(container, opts = {}) {
     return layout;
   }
 
+  /**
+   * Publish the live thumb reserve as a CSS variable.
+   *
+   * The compact stylesheet is built once, but the height the touch layer takes
+   * is a function of the viewport (see `touchReserve`), so the number has to
+   * reach the CSS some other way. A custom property is the cheapest: one string
+   * write, no reflow of anything the variable does not touch, and the
+   * stylesheet keeps the reference-phone value as its fallback so a browser
+   * that never ran this still lays out sensibly.
+   *
+   * Rounded to 2 px so a URL-bar collapse or an on-screen keyboard — both of
+   * which change innerHeight by a few pixels — cannot re-lay-out the HUD on
+   * every resize event.
+   */
+  function pushReserve() {
+    if (typeof window === 'undefined' || !root || !root.style) return;
+    const r = touchReserve(window.innerWidth, window.innerHeight);
+    root.style.setProperty(`--${u}-res`, `${Math.round(r.h / 2) * 2}px`);
+  }
+
   applyLayout(pickLayout(opts.layout));
+  pushReserve();
 
   // Re-pick when the viewport crosses the threshold. matchMedia rather than a
   // resize listener: it fires once on the crossing instead of sixty times
   // during a drag, and it also catches an orientation change that keeps the
   // area the same.
+  //
+  // The RESERVE, unlike the layout, changes continuously with the viewport, so
+  // it does need the resize event — but it only writes a variable.
   let mq = null;
-  const onMq = () => applyLayout(pickLayout(opts.layout));
+  const onResize = () => pushReserve();
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+  }
+  const onMq = () => {
+    applyLayout(pickLayout(opts.layout));
+    pushReserve();
+  };
   if (
     opts.layout !== 'panel' &&
     opts.layout !== 'compact' &&
@@ -1964,6 +2052,10 @@ export function createInstruments(container, opts = {}) {
       else if (typeof mq.removeListener === 'function') mq.removeListener(onMq);
       mq = null;
     }
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+    }
     root.remove();
   }
 
@@ -1978,4 +2070,4 @@ export function createInstruments(container, opts = {}) {
   };
 }
 
-export { COMPACT_QUERY, TOUCH_RESERVE, pickLayout };
+export { COMPACT_QUERY, TOUCH_RESERVE, touchReserve, pickLayout };

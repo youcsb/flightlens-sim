@@ -105,7 +105,7 @@ globalThis.document = {
 let clockMs = 0;
 globalThis.performance = { now: () => clockMs };
 
-const { createInstruments, TOUCH_RESERVE, COMPACT_QUERY } = await import(
+const { createInstruments, TOUCH_RESERVE, touchReserve, COMPACT_QUERY } = await import(
   '../src/ui/instruments.js'
 );
 
@@ -698,15 +698,34 @@ head('10. the thumb zones are declared, and the stylesheet uses them');
     TOUCH_RESERVE.portrait.h > TOUCH_RESERVE.landscape.h,
     `${TOUCH_RESERVE.portrait.w}x${TOUCH_RESERVE.portrait.h}`);
 
-  // The cluster has to fit in the clear width BETWEEN the two corners on the
-  // narrowest landscape phone we target. 375x812 rotated is 812 wide, and an
-  // iPhone with a notch takes 59 px off each side in landscape.
-  const clear = 812 - 59 * 2 - TOUCH_RESERVE.landscape.w * 2;
-  ok('the cluster fits between the two thumb corners on a 812x375 phone',
-    clear >= 208, `${clear} px clear, cluster is 208`);
+  // THE RESERVE IS A BAND, NOT TWO CORNERS, AND IT IS A FUNCTION.
+  //
+  // The assertion that used to live here checked that the attitude cluster fit
+  // in the clear width BETWEEN two 200 px corners on an 812 px-wide phone. It
+  // passed, and it was measuring the wrong thing: `controls/touch.js` draws its
+  // rudder bar across the FULL width, so that "clear" 208 px is the middle of
+  // the rudder bar. Measured live at 812x375, the cluster covered 7,568 px² of
+  // it, 78% of the BRK button and 55% of CAM. `check-touch.mjs § reserve` now
+  // compares this function against the rectangles that module really returns,
+  // at sixteen viewports, which is the check that was missing.
+  ok('the reserve scales with the viewport rather than sitting at one number',
+    touchReserve(1024, 768).h > touchReserve(812, 375).h,
+    `812x375 -> ${touchReserve(812, 375).h}px, 1024x768 -> ${touchReserve(1024, 768).h}px`);
+  ok('and the reference constants are that function evaluated at a phone',
+    TOUCH_RESERVE.landscape.h === touchReserve(812, 375).h
+    && TOUCH_RESERVE.portrait.h === touchReserve(375, 812).h);
 
   const c = createInstruments(new Node_('div'), { layout: 'compact' });
   const css = c.root.children.find((n) => n.tagName === 'style').textContent;
+
+  // The regression this section exists for: the cluster must be anchored to the
+  // TOP in both orientations. `bottom:` on the cluster is the bug.
+  ok('the attitude cluster is top-anchored, not sitting in the thumb band',
+    /\.ki\d+-w-clu\s*\{[^}]*top:[^}]*bottom:\s*auto/.test(css)
+    && !/\.ki\d+-w-clu\s*\{[^}]*bottom:\s*calc\(env\(safe-area-inset-bottom[^}]*\}/.test(css));
+  ok('and the live reserve reaches the stylesheet as a variable',
+    css.includes(`var(--${c.root.className.split(' ')[0].replace('-root', '')}-res`)
+    || /var\(--ki\d+-res,/.test(css));
   ok('the compact stylesheet keeps off the landscape corners',
     css.includes(`${TOUCH_RESERVE.landscape.h}px`), 'landscape reserve appears in the CSS');
   ok('and off the portrait bottom',

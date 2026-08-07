@@ -78,7 +78,7 @@
 
 import { clamp } from '../core/units.js';
 import { eventCode } from '../core/keycode.js';
-import { classifyTier, readSignals } from '../core/device.js';
+import { classifyTier, readSignals, readTierOverride } from '../core/device.js';
 import { createTouchControls, shouldUseTouch } from './touch.js';
 
 // ---------------------------------------------------------------------------
@@ -162,17 +162,31 @@ function strongest(a, b) {
  * `?touch=1` / `?touch=0` (and `opts.touch === true|false`) exist because the
  * only way to test a thumb cockpit on the machine that builds it is to force
  * it on, and the only way to fly a touchscreen laptop with its keyboard is to
- * force it off. Everything else defers to `core/device.js#classifyTier`, so
- * the overlay appears on exactly the devices that get a phone or tablet budget.
+ * force it off.
+ *
+ * FOUR SOURCES, MOST EXPLICIT FIRST, and the third one is the integration bug
+ * this signature was widened to fix. `?tier=phone` is the documented way to
+ * exercise a phone on a desktop (MODULES.md §2.18), and `main.js` honours it
+ * for every budget in the sim — but this function asked `classifyTier` for a
+ * fresh opinion instead, so a forced phone got phone MEMORY and phone DRAW
+ * BUDGETS and no way to fly: no stick, no rudder bar, no throttle. The tier the
+ * app is actually running as has to be the tier the controls are chosen for, or
+ * `?tier=phone` measures a machine nobody could operate.
+ *
+ *   1. `opts.touch === true|false`      the caller knows
+ *   2. `?touch=1` / `?touch=0`          the user said so, and beats a tier
+ *   3. `?tier=` / localStorage          the tier the whole app booted at
+ *   4. `classifyTier(readSignals())`    what this device actually is
  *
  * `gl: false` skips device.js's WebGL probe: creating a throwaway GL context
  * to decide whether to draw a knob would be a real cost for no information.
  *
  * @param {boolean|'auto'|undefined} want
  * @param {string} [search] defaults to location.search
+ * @param {{getItem?: (k: string) => any}} [storage] defaults to localStorage
  * @returns {boolean}
  */
-export function resolveTouchTier(want, search) {
+export function resolveTouchTier(want, search, storage) {
   if (want === true || want === false) return want;
 
   const q = search ?? (typeof location !== 'undefined' ? location.search : '') ?? '';
@@ -183,7 +197,18 @@ export function resolveTouchTier(want, search) {
     if (v === '1' || v === 'on' || v === 'true') return true;
   }
 
+  let store = storage;
+  if (store === undefined) {
+    try {
+      store = typeof localStorage !== 'undefined' ? localStorage : null;
+    } catch {
+      store = null; // private mode throws on access, not on use
+    }
+  }
+
   try {
+    const forced = readTierOverride(q, store);
+    if (forced) return shouldUseTouch(forced);
     return shouldUseTouch(classifyTier(readSignals({ gl: false })));
   } catch {
     return false;
@@ -205,8 +230,8 @@ export function resolveTouchTier(want, search) {
  *        implementing. Leave it out and they are delivered as synthetic
  *        `keydown`s for C / L / P instead, so main.js needs no wiring at all.
  * @returns {{
- *   get: () => {pitch:number, roll:number, yaw:number, throttle:number,
- *               flaps:number, brakes:number, gear:number},
+ *   get: (dtSec?: number) => {pitch:number, roll:number, yaw:number,
+ *               throttle:number, flaps:number, brakes:number, gear:number},
  *   dispose: () => void,
  *   setMouseYoke: (on:boolean) => void,
  *   isMouseYoke: () => boolean,
@@ -608,15 +633,36 @@ export function createInput(domElement, opts = {}) {
 
   /**
    * Sample the controls. Call once per frame, before stepping the flight model.
-   * Timing is derived internally, so this takes no dt.
    *
+   * `dtSec` IS OPTIONAL AND THE WALL CLOCK IS STILL THE DEFAULT. Pass the same
+   * delta the flight model is about to get and every ramp in here — the
+   * keyboard attack, the touch slew, the throttle rate, the brake squeeze —
+   * runs on the simulation's clock instead of on `performance.now()`.
+   *
+   * On the rAF path the two are the same number: `main.js#dtFor` reads the same
+   * clock and applies the same 0.1 s clamp, so passing it changes nothing about
+   * how the aeroplane flies and `check:autopilot`'s frame timing is untouched.
+   *
+   * It matters everywhere the sim's clock is NOT the wall clock, and that is
+   * every place this project verifies itself. `window.sim.tick(1/60, 60)` runs
+   * a second of flight inside about five milliseconds of wall time; with the
+   * internal clock a thumb held at the stop through that whole second advanced
+   * its axis by 0.008 and the aeroplane did not move. That is not a harness
+   * quirk — it is why nobody had flown the thumb cockpit: the documented way to
+   * drive this sim could not press the stick. `check-touch.mjs` had already hit
+   * it and worked around it by replacing `globalThis.performance`.
+   *
+   * @param {number} [dtSec] seconds since the previous call. Non-finite or
+   *   negative falls back to the wall clock, so an omitted argument is exactly
+   *   the old behaviour.
    * @returns {{pitch:number, roll:number, yaw:number, throttle:number,
    *            flaps:number, brakes:number, gear:number}}
    */
-  function get() {
+  function get(dtSec) {
     const now = performance.now();
-    const dt = lastTime === 0 ? 0 : clamp((now - lastTime) / 1000, 0, 0.1);
+    const wall = lastTime === 0 ? 0 : clamp((now - lastTime) / 1000, 0, 0.1);
     lastTime = now;
+    const dt = Number.isFinite(dtSec) && dtSec >= 0 ? clamp(dtSec, 0, 0.1) : wall;
 
     // --- keyboard ---------------------------------------------------------
     let pitch = rampAxis('pitch', axisFrom(PITCH_NEG, PITCH_POS), dt);

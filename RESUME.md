@@ -12,7 +12,7 @@ npm run dev                                  # http://localhost:5173
 ```
 
 No servers are running — they were stopped to free the machine. `npm run build`
-and `npm run check:all` (573 assertions across 12 harnesses) both pass at HEAD.
+and `npm run check:all` (~620 assertions across 15 harnesses) both pass at HEAD.
 
 **Do not run `npm install`.** No Homebrew on this machine.
 
@@ -30,7 +30,14 @@ and `npm run check:all` (573 assertions across 12 harnesses) both pass at HEAD.
 **Takeoff veers left on purpose** — propwash over the fin yaws ~2.5°/s left under
 power. Hold `E` (right rudder) during the roll. Every single-engine prop does this.
 
-`?tier=desktop` or `?tier=phone` on the URL forces a device tier.
+`?tier=desktop` or `?tier=phone` on the URL forces a device tier — **and now
+brings the matching control scheme with it**, so `?tier=phone` on a desktop puts
+the thumb cockpit on screen. `?touch=1` / `?touch=0` overrides that either way.
+
+**On touch:** left pad = pitch + roll · bottom bar = rudder · right slider =
+throttle, and it LATCHES (land on the knob to move it relative, land away from
+it to jump it) · FLAP / GEAR / BRK / CAM / A/P / II. BRK is momentary — hold it.
+The heading and altitude bugs are in the ☰ menu and accelerate when held.
 
 ## Where things stand
 
@@ -47,19 +54,47 @@ power. Hold `E` (right rudder) during the roll. Every single-engine prop does th
   so ordinary transients read as "−6.0 g". Now needs 6 g held for 60 ms, or 12 g
   instantaneous. Measured: a 700 fpm arrival survives, 1,400 fpm does not.
 
-**Round 3 (mobile) — STOPPED MID-FLIGHT, 4 of 10 agents committed:**
+**Round 3 (mobile) — INTEGRATED. It has now been flown on thumbs.**
 - `be26f43` device tiers + phone budgets (`src/core/device.js`)
 - `774d18b` touch controls (`src/controls/touch.js`) — a thumb cockpit
 - `2992c2c` phone layout — tape HUD + menu sheet
 - `1d8b544` render budget — smaller node cache, no shadow tax, half a city
+- `c11efd0` heap — 45.1 MB of generated textures nobody had counted
+- integration: the four modules run together, and four things were wrong.
 
-**Still to do in round 3:** the memory builder (heap was 352.8 MB on desktop; iOS
-Safari kills tabs in the 200–400 MB range), then integrate, 2 harsh critics
-(playability on a phone, memory/perf regression), and 2 fixes.
+**A full circuit on touch alone**, no keyboard, synthesised pointer events at
+375x812, phone tier: rotate 59 kt · climb 470–880 fpm at 91 kt · 360° turn at
+22° bank · autopilot engaged from the A/P button and holding with a jittering
+thumb parked on the stick · **touchdown 55.6 kt, 273 fpm, 2.6° nose-up, wheels
+on the drawn surface** · stopped on the BRK button.
 
-To resume it, start a fresh workflow covering that list. The old run ID
-(`wf_600ce6c3-df9`) can only be resumed in the session that created it, and that
-session is gone after a restart — but all the code is in git, so nothing needs redoing.
+**What was broken and is fixed:**
+1. `?tier=phone` gave phone budgets and NO CONTROLS — `resolveTouchTier` asked
+   `classifyTier` for a second opinion instead of honouring the override.
+2. `input.get()` ran its ramps off `performance.now()`, so `window.sim.tick()`
+   advanced a held thumb by 0.008 in a simulated second. It takes an optional
+   `dt` now and `main.js` passes it. **This is why nobody had flown it.**
+3. The HUD's attitude cluster sat on the rudder bar and two buttons in
+   landscape — 7,568 px² measured. `TOUCH_RESERVE` was two corners and a flat
+   200 px; the touch layer is a full-width band whose height scales with the
+   viewport. It is `touchReserve(w, h)` now, and `check:touch` runs the two
+   modules together for the first time.
+4. **The autopilot porpoised at any power setting it was not trimmed for** —
+   ±5° of pitch at 1.3 Hz, found by flying it, reproduced in pure Node.
+   `RATE_TAU` 0.08 → 0.03: the low-pass on the rate estimate was delaying the
+   damping term 33° at the short period and turning it into an exciting one.
+   Altitude band was inside 8 ft the whole time, which is how it survived three
+   rounds. `check:autopilot § disturbed` is the new guard.
+
+**Known and NOT fixed — the phone exceeds its own triangle budget.** Over
+downtown at 610 m the phone tier draws **538,564 triangles against a 460,000
+budget** (+17%); draw calls peak at exactly 120 of 120 and shader programs at
+31 of 45. The overage is terrain, not the city: `lodQuality` 0.4 still selects
+~200 nodes there. Nothing asserts this number, so add the assertion before
+tuning it.
+
+**Still to do in round 3:** 2 harsh critics (playability on a phone,
+memory/perf regression) and their fixes.
 
 ## Then
 

@@ -178,7 +178,14 @@ export function computeLayout(w, h) {
 
   let padSide = Math.round(clamp(Math.min(W * 0.36, H * 0.3), 96, 190));
   // The button gap is not a leftover: reserve it first and let the pad shrink.
-  const maxPad = W - 2 * INSET - throttleW - 2 * GAP - MIN_TOUCH_PX;
+  //
+  // RESERVE THREE COLUMNS, NOT ONE. Reserving a single MIN_TOUCH_PX button is
+  // enough for the buttons to EXIST, which is all the first version asked, and
+  // on a 320 px-wide phone that left a 105 px gap — one column, six rows, a
+  // stack of buttons climbing 394 px up a 568 px screen and straight through
+  // the windscreen and the HUD. Three columns is the width at which six buttons
+  // fit in two rows, which is what keeps them inside the thumb band.
+  const maxPad = W - 2 * INSET - throttleW - 2 * GAP - (3 * MIN_TOUCH_PX + 2 * GAP);
   if (padSide > maxPad) padSide = Math.max(72, Math.round(maxPad));
 
   const stick = { x: INSET, y: baseY - padSide, w: padSide, h: padSide };
@@ -191,17 +198,39 @@ export function computeLayout(w, h) {
   const gw = Math.max(MIN_TOUCH_PX, gx1 - gx0);
 
   const n = BUTTONS.length;
-  const fitsCols = (c) => (gw - GAP * (c - 1)) / c >= 64;
-  const cols = fitsCols(6) ? 6 : fitsCols(2) ? 2 : 1;
-  const rows = Math.ceil(n / cols);
 
+  // THE GRID MAY NOT CLIMB OUT OF THE THUMB BAND.
+  //
+  // Everything above `min(stick.y, throttle.y)` is windscreen, and `ui/
+  // instruments.js` is entitled to it — its whole compact layout is derived
+  // from where this band starts (see its `touchReserve`). The old rule chose
+  // between 6, 2 and 1 columns on a 64 px aesthetic minimum and let the grid
+  // grow UPWARD to fit whatever it chose, so a 130 px gap became one column and
+  // six rows: measured at 360x640, buttons from y=242 to y=568, four of them
+  // sitting in the sky above the aeroplane, and at 667x375 a 2x3 block across
+  // the middle of the windscreen.
+  //
+  // So: pick the fewest ROWS whose columns are still a fingertip wide and whose
+  // grid fits the band. One row is the ideal and it is what every landscape
+  // phone gets; two is what a portrait phone gets; the single column survives
+  // only as the last resort for a viewport narrower than anything real.
+  const bandH = baseY - Math.min(stick.y, throttle.y);
+  const btnH = MIN_TOUCH_PX > 46 ? MIN_TOUCH_PX : 46;
+  let cols = 1;
+  for (const c of [6, 3, 2, 1]) {
+    const r = Math.ceil(n / c);
+    const w = (gw - GAP * (c - 1)) / c;
+    if (w >= MIN_TOUCH_PX && r * btnH + GAP * (r - 1) <= bandH) {
+      cols = c;
+      break;
+    }
+  }
+  const rows = Math.ceil(n / cols);
   const btnW = (gw - GAP * (cols - 1)) / cols;
-  // Bottom-aligned with the stick pad, and never taller than the space above it.
-  const maxGridH = baseY - INSET;
-  let btnH = clamp(46, MIN_TOUCH_PX, (maxGridH - GAP * (rows - 1)) / rows);
-  btnH = Math.max(MIN_TOUCH_PX, Math.round(btnH));
   const gridH = rows * btnH + GAP * (rows - 1);
-  const gy = baseY - gridH;
+  // Bottom-aligned with the stick pad. Clamped to the viewport as a floor for
+  // the single-column last resort, which is the only case that can overflow.
+  const gy = Math.max(INSET, baseY - gridH);
 
   const buttons = [];
   for (let i = 0; i < n; i += 1) {

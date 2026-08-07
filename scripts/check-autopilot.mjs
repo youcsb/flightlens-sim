@@ -486,22 +486,141 @@ function capture(startFt, bugOffsetFt, seconds, thr = 0.65) {
   // THE DIAGNOSTIC THAT WOULD HAVE CAUGHT IT DIRECTLY: while displaced, the
   // commanded pitch must actually MOVE. A frozen elevator with the aeroplane
   // off target is the signature of a loop whose gain is too low to correct.
+  //
+  // IT USED TO MEASURE THE RANGE AFTER THE FIRST SECOND, AND THAT STATISTIC
+  // REWARDED THE DEFECT. Range says "how much did the elevator wobble", and a
+  // loop in a limit cycle wobbles enormously — the oscillating build scored
+  // 0.24 here and passed, while a loop that puts the elevator where it belongs
+  // in the first half-second and then HOLDS it scored 0.035 and failed. The
+  // skip of the first 60 frames threw away the only part of the trace that
+  // answers the question being asked.
+  //
+  // So the two things the assertion actually means are now asserted directly:
+  // the elevator has to depart from neutral by something an aeroplane can feel,
+  // and the aeroplane has to close the gap. A frozen loop fails the first; a
+  // limit-cycling one fails the second and the pitch band below.
   const flight = airborne(0, 3000);
   const ap = createAutopilot();
   ap.toggle(flight.state);
   ap.nudgeAltitude(300); // displace the target
-  let pLo = Infinity, pHi = -Infinity;
+  const h0 = flight.state.altitudeFt;
+  let peak = 0;
+  let pitchLo = Infinity, pitchHi = -Infinity;
   for (let i = 0; i < 20 * 60; i += 1) {
     const inputs = { pitch: 0, roll: 0, yaw: 0, throttle: 1, flaps: 0, brakes: 0, gear: 1 };
     ap.update(DT, flight.state, inputs);
     flight.step(DT, inputs, GROUND_M);
-    if (i > 60) { pLo = Math.min(pLo, inputs.pitch); pHi = Math.max(pHi, inputs.pitch); }
+    if (Math.abs(inputs.pitch) > Math.abs(peak)) peak = inputs.pitch;
+    if (i > 5 * 60) {
+      pitchLo = Math.min(pitchLo, flight.state.pitchDeg);
+      pitchHi = Math.max(pitchHi, flight.state.pitchDeg);
+    }
   }
+  const gained = flight.state.altitudeFt - h0;
   ok(
     'commands real elevator travel while off target',
-    pHi - pLo > 0.05,
-    `elevator range ${(pHi - pLo).toFixed(3)} over 20 s while 300 ft low`,
+    Math.abs(peak) > 0.05,
+    `peak elevator ${peak.toFixed(3)} while 300 ft low`,
   );
+  ok(
+    'and the aeroplane actually closes the gap',
+    gained > 100 && flight.state.verticalSpeedFpm > 50,
+    `${gained.toFixed(0)} ft gained in 20 s, ${flight.state.verticalSpeedFpm.toFixed(0)} fpm still climbing`,
+  );
+  ok(
+    'without hunting on the way — a limit cycle is not "correcting"',
+    pitchHi - pitchLo < 3,
+    `pitch band ${(pitchHi - pitchLo).toFixed(2)} deg during the climb`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DISTURBED — the section that was missing, and the reason a ten-degree
+// porpoise shipped three times.
+//
+// Everything above engages the autopilot on an aeroplane that is already
+// trimmed for its power setting and then leaves the power alone. That is one
+// point in the envelope, and at that one point this loop was always fine. The
+// oscillation is a LIMIT CYCLE with two attractors: perturb the aeroplane hard
+// enough and it falls into the noisy one and never climbs out. Reported four
+// times from a browser, invisible here, because the harness never perturbed it.
+//
+// The disturbances below are not exotic. They are: move the throttle, and move
+// the altitude bug. On a phone the throttle is a slider under the right thumb
+// and the bug is a press-and-hold button, so they are the two things a touch
+// pilot does most.
+//
+// ALTITUDE BAND IS NOT A STABILITY MEASUREMENT and that is the trap. Through
+// every one of these the old build held altitude inside 8 ft while swinging the
+// nose thirteen degrees at 1.3 Hz. The statistics that see it are the PITCH
+// BAND and the VERTICAL-SPEED REVERSAL COUNT.
+// ---------------------------------------------------------------------------
+console.log('\nautopilot — disturbed (throttle and bug moved under it)');
+
+{
+  const IN_ = (thr) => ({ pitch: 0, roll: 0, yaw: 0, throttle: thr, flaps: 0, brakes: 0, gear: 1 });
+
+  /** Settle in FREE flight first, then engage. See the note above. */
+  function settled(kts, thr, altFt = 3000) {
+    const f = createFlightModel();
+    f.reset(47.53, -122.30, 0, { altitudeMslM: altFt * 0.3048, airspeedMs: kts * 0.514444 });
+    for (let i = 0; i < 20 * 60; i += 1) f.step(DT, IN_(thr), GROUND_M);
+    const ap = createAutopilot();
+    ap.toggle(f.state);
+    ap.nudgeAltitude(Math.round(f.state.altitudeFt) - ap.status().altitudeBug);
+    return { f, ap };
+  }
+
+  function run({ f, ap }, sec, thr, bugDelta = 0) {
+    if (bugDelta) ap.nudgeAltitude(bugDelta);
+    const n = Math.round(sec / DT);
+    const tr = [];
+    for (let i = 0; i < n; i += 1) {
+      const inp = IN_(thr);
+      ap.update(DT, f.state, inp);
+      f.step(DT, inp, GROUND_M);
+      tr.push([f.state.pitchDeg, f.state.verticalSpeedFpm, f.state.altitudeFt]);
+    }
+    return tr;
+  }
+
+  /** Pitch band and vertical-speed reversals over the LAST `sec` of a trace. */
+  function tail(tr, sec) {
+    const t = tr.slice(-Math.round(sec / DT));
+    const p = t.map((r) => r[0]);
+    const v = t.map((r) => r[1]);
+    let rev = 0;
+    for (let i = 1; i < v.length; i += 1) if (Math.sign(v[i]) !== Math.sign(v[i - 1])) rev += 1;
+    return { band: Math.max(...p) - Math.min(...p), rev, alt: t[t.length - 1][2] };
+  }
+
+  const cases = [
+    ['left alone at cruise', 100, 0.65, (h) => tail(run(h, 65, 0.65), 15), 0],
+    ['throttle slammed to full', 100, 0.65, (h) => { run(h, 45, 0.65); return tail(run(h, 180, 1.0), 30); }, 0],
+    ['throttle chopped to 0.40', 100, 0.65, (h) => { run(h, 45, 0.65); return tail(run(h, 180, 0.40), 30); }, 0],
+    ['throttle nudged to 0.85', 100, 0.65, (h) => { run(h, 45, 0.65); return tail(run(h, 180, 0.85), 30); }, 0],
+    ['bug +400 ft at full power', 100, 0.65, (h) => { run(h, 45, 0.65); return tail(run(h, 240, 1.0, 400), 40); }, 400],
+    ['bug -400 ft at cruise', 100, 0.65, (h) => { run(h, 45, 0.65); return tail(run(h, 240, 0.65, -400), 40); }, -400],
+    ['fast cruise, 118 kt at 0.90', 118, 0.90, (h) => { run(h, 45, 0.90); return tail(run(h, 180, 0.90), 30); }, 0],
+  ];
+
+  for (const [name, kts, thr, act] of cases) {
+    const h = settled(kts, thr);
+    const r = act(h);
+    // 1.5 deg is generous: the passing build measures under 0.1 at every one of
+    // these, and the failing build measured 9.6 to 13.2.
+    ok(
+      `${name} — the nose does not hunt`,
+      r.band < 1.5,
+      `pitch band ${r.band.toFixed(2)} deg`,
+    );
+    // A settled autopilot has ONE sign of vertical speed, or none at all.
+    ok(
+      `${name} — vertical speed does not keep reversing`,
+      r.rev <= 2,
+      `${r.rev} reversals`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
