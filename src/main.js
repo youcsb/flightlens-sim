@@ -57,6 +57,13 @@ import { createCameras } from './camera/cameras.js';
 import { createSoundscape } from './audio/soundscape.js';
 import { createAutopilot } from './systems/autopilot.js';
 import { eventCode } from './core/keycode.js';
+import {
+  resolveDevice,
+  budgetsFor,
+  effectivePixelRatio,
+  describeDevice,
+  TIERS,
+} from './core/device.js';
 
 const appEl = document.getElementById('app');
 const hudEl = document.getElementById('hud');
@@ -143,10 +150,39 @@ const TIMES = [
 ];
 
 // ---------------------------------------------------------------------------
+// Device tier — resolved BEFORE the renderer, because two of its constructor
+// options are budget decisions (`antialias`) and one of its first calls is
+// (`setPixelRatio`). See core/device.js for the rules and every number.
+//
+// A phone at devicePixelRatio 3 renders nine times the pixels per CSS pixel,
+// which is the single easiest framerate cliff in the project; and iOS Safari
+// terminates a tab in the 200-400 MB range, counting GPU allocations, so the
+// budgets are a survival requirement rather than a preference.
+//
+// `?tier=phone` on the URL, or localStorage['sim.tier'], forces a tier — that
+// is how a phone budget is measured on a desktop without a phone.
+// ---------------------------------------------------------------------------
+const device = resolveDevice({
+  search: typeof location !== 'undefined' ? location.search : '',
+  storage: (() => {
+    try {
+      return typeof localStorage !== 'undefined' ? localStorage : null;
+    } catch {
+      return null; // private mode throws on access, not on use
+    }
+  })(),
+});
+/** Mutable: window.sim.setQuality() reassigns it. Read it, do not cache it. */
+let budgets = device.budgets;
+console.info(describeDevice(device));
+
+// ---------------------------------------------------------------------------
 // Renderer + scene
 // ---------------------------------------------------------------------------
 const renderer = new THREE.WebGLRenderer({
-  antialias: true,
+  // MSAA is a tier decision. On a tile GPU the resolve costs bandwidth, and the
+  // phone tier buys its edges with a 1.5x supersample instead (device.js).
+  antialias: budgets.antialias,
   powerPreference: 'high-performance',
   // REQUIRED. The camera far plane is 300 km (Mount Rainier is 84 km out) and
   // the near plane is 0.35 m for the cockpit view. A linear depth buffer cannot
@@ -158,7 +194,24 @@ const renderer = new THREE.WebGLRenderer({
   // which loses the depth test against terrain twelve times farther away.
   logarithmicDepthBuffer: true,
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+/**
+ * Apply the tier's pixel-ratio budget to the current viewport.
+ *
+ * Called at boot AND on every resize, because the binding ceiling is an
+ * absolute pixel count as well as a ratio: rotating a phone into landscape
+ * changes the area, and therefore the ratio that fits inside it.
+ */
+function applyPixelRatio() {
+  const r = effectivePixelRatio(
+    budgets,
+    window.devicePixelRatio,
+    window.innerWidth,
+    window.innerHeight,
+  );
+  if (renderer.getPixelRatio() !== r) renderer.setPixelRatio(r);
+  return r;
+}
+applyPixelRatio();
 renderer.setSize(window.innerWidth, window.innerHeight);
 // NO TONE MAPPING, deliberately. sky.js evaluates Preetham and hands the
 // terrain and water shaders absolute-ish radiance already scaled for direct
@@ -196,7 +249,15 @@ async function boot() {
   // 2. Terrain loads the DEM and is the gate for every ground query below.
   overlay.setLoadingText('loading elevation tiles…');
   await nextFrame(); // let the loading screen actually paint before we block
-  const terrain = await createTerrain(scene, {});
+  // `lodQuality` is the tier's largest single lever: node count scales as its
+  // square, and the node geometry cache is the largest term in the JS heap
+  // (~199 MB at quality 1). `viewRadiusM` is NOT a tier decision — Mount
+  // Rainier is 84 km out and §1.5 says simplify the tessellation, never the
+  // extent — so every tier passes the same 90 km.
+  const terrain = await createTerrain(scene, {
+    lodQuality: budgets.terrainLodQuality,
+    viewRadiusM: budgets.terrainViewRadiusM,
+  });
 
   overlay.setLoadingText('lighting the sky…');
   await nextFrame();
@@ -243,8 +304,20 @@ async function boot() {
     // Cascaded shadow maps, owned by sky.js because a shadow-casting cascade
     // IS a light and §1.7 gives every light to that module. It fits the
     // cascades from `scene.onBeforeRender`, so there is no per-frame call here.
+    // Tier decision. Shadows cost DRAW CALLS, not fill (shadows.js measured
+    // that shrinking every map from 2048 to 256 changed the frame time by
+    // nothing), and the phone tier's whole call budget is 120 against the
+    // desktop's 432 — so the phone gets the 'off' tier. Desktop still gets
+    // 'high' and nothing about it changes.
+    //
+    // The shadow SYSTEM is always constructed, even at 'off'. Passing
+    // `shadows: false` would leave `sky.shadows` null and make the runtime
+    // override one-way; at 'off' the handle exists, builds no cascade lights,
+    // and turns the renderer's shadow pass off itself. What it still costs is
+    // one `scene.traverse` per frame for tagging, which on a phone-tier scene
+    // is a few hundred objects.
     shadows: true,
-    shadowQuality: 'high',
+    shadowQuality: budgets.shadowQuality,
   });
 
   // 3-4. Real airports at real coordinates, sitting on the real terrain.
@@ -382,10 +455,16 @@ async function boot() {
   // Window + key wiring
   // -------------------------------------------------------------------------
   function onWindowResize() {
+    // Pixel ratio first: the tier's ceiling is an absolute pixel COUNT as well
+    // as a ratio, so rotating a phone into landscape changes which ratio fits.
+    applyPixelRatio();
     renderer.setSize(window.innerWidth, window.innerHeight);
     cameras.onResize();
   }
   window.addEventListener('resize', onWindowResize);
+  // A phone reports the rotation through `orientationchange` before `resize`
+  // settles, and some iOS versions fire only one of the two.
+  window.addEventListener('orientationchange', onWindowResize);
 
   /** True while the user is typing into something that is not the sim. */
   function isEditable(el) {
@@ -647,32 +726,92 @@ async function boot() {
     /** Cascade fitting, texel sizes and per-cascade render cadence. */
     shadowStats: () => sky.shadows?.getStats?.() ?? null,
     /**
-     * ONE LEVER FOR THE WHOLE PICTURE.
+     * WHAT THIS MACHINE IS, and what it is allowed to spend. The critics read
+     * this. `budgets` is the resolved set — every number in it is justified in
+     * core/device.js, and every other module's mobile work is measured against
+     * it.
+     */
+    device,
+    get tier() {
+      return budgets.tier;
+    },
+    get budgets() {
+      return budgets;
+    },
+    /** The raw capability signals, so a caller can decide for itself. */
+    deviceSignals: () => device.signals,
+    /** What the renderer actually ended up at, for the pixel-budget check. */
+    pixelBudget: () => {
+      const r = renderer.getPixelRatio();
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      return {
+        devicePixelRatio: window.devicePixelRatio,
+        pixelRatio: r,
+        cssWidth: w,
+        cssHeight: h,
+        drawingBufferPx: Math.round(w * r) * Math.round(h * r),
+        maxDrawingBufferPx: budgets.maxDrawingBufferPx,
+        pixelRatioMax: budgets.pixelRatioMax,
+      };
+    },
+    /**
+     * ONE LEVER FOR THE WHOLE PICTURE — now a DEVICE TIER rather than a
+     * nameless quality knob.
      *
-     * Everything expensive in this scene is either shadow map rendering or
-     * terrain draw calls, and both already had a tier control — they just had
-     * no single owner, so there was no way to answer "make it faster" without
-     * knowing which module to ask. This is the composition root, so it is the
-     * place that knows both.
+     * 'phone' | 'tablet' | 'desktop' select the budget sets in core/device.js.
+     * The old names still work — 'low' -> phone, 'medium' -> tablet,
+     * 'high' -> desktop — because they were the same lever under a name that
+     * did not say what it was for.
      *
-     * 'high'   everything on. The default, and what the frame budget was
-     *          measured against.
-     * 'medium' shadows drop to 1024-px cascades. Terrain is untouched: it is
-     *          the geometry the whole sim exists to show.
-     * 'low'    shadows off entirely. This is the tier for a machine where the
-     *          shadow pass alone is not affordable — it costs draw calls, not
-     *          fill, so shrinking the maps further buys nothing.
+     * WHAT IS APPLIED LIVE and what is not, stated plainly:
+     *
+     *   applied now    renderer pixel ratio, shadow tier
+     *   boot only      antialias (a renderer constructor flag), terrain
+     *                  lodQuality (a createTerrain option), the DEM resident
+     *                  cap and paging policy, the building LOD tiers
+     *
+     * The boot-only ones are still published on `window.sim.budgets` the moment
+     * this returns, so a module that re-reads them picks the new numbers up. To
+     * get them from frame 0, force the tier before load instead: `?tier=phone`.
+     *
+     * IT DOES NOT PERSIST unless you ask. A quality lever that silently changes
+     * the NEXT boot is hidden state, and hidden state is how a measurement round
+     * gets thrown away — pass `{persist: true}` (or use `?tier=`) when you
+     * actually want it to stick.
      *
      * Returns the tier actually applied.
      */
-    setQuality(tier) {
-      const t = String(tier);
-      if (t === 'low') sky.shadows?.setEnabled?.(false);
-      else {
-        sky.shadows?.setEnabled?.(true);
-        sky.shadows?.setQuality?.(t === 'medium' ? 'medium' : 'high');
+    setQuality(tier, opts = {}) {
+      const alias = { low: 'phone', medium: 'tablet', high: 'desktop' };
+      const raw = String(tier ?? '').toLowerCase();
+      const t = TIERS.includes(raw) ? raw : (alias[raw] ?? budgets.tier);
+      budgets = budgetsFor(t);
+
+      applyPixelRatio();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      cameras.onResize();
+
+      // setQuality('off') on the shadow handle builds no cascade lights and
+      // disables the shadow map; anything else rebuilds them. Both recompile
+      // lit materials, so this is a settings change, not a per-frame call.
+      sky.shadows?.setEnabled?.(budgets.shadowQuality !== 'off');
+      sky.shadows?.setQuality?.(budgets.shadowQuality);
+
+      if (opts.persist) {
+        try {
+          localStorage.setItem('sim.tier', t);
+        } catch {
+          /* private mode — the override just does not stick */
+        }
       }
       overlay.toast(`quality · ${t}`);
+      console.info(
+        `[device] tier -> ${t} | dpr ${renderer.getPixelRatio()} | ` +
+          `shadows ${budgets.shadowQuality} | tri <= ${budgets.maxTriangles} | ` +
+          `calls <= ${budgets.maxDrawCalls} | heap <= ${budgets.heapTargetMB} MB ` +
+          '(terrain LOD, DEM cap and building tiers are boot-time — reload to apply)',
+      );
       return t;
     },
     /** Run n frames of exactly dt seconds each, through the real loop. */
@@ -690,6 +829,7 @@ async function boot() {
   dispose = () => {
     running = false;
     window.removeEventListener('resize', onWindowResize);
+    window.removeEventListener('orientationchange', onWindowResize);
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('pointerdown', onFirstGesture);
     window.removeEventListener('keydown', onFirstGesture);

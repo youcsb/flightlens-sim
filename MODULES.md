@@ -1305,6 +1305,107 @@ with contention, so both a quiet-window and a contended figure are given):
 | 11,000 ft at Mount Rainier | — | **0.00 ms** | 6 | 11.7k |
 | 400 m over the CBD, machine at load 4 | 15.33 ms floor (**65 fps**) | +2.71 ms paired median | 115 | 634k |
 
+### 2.18 `src/core/device.js` — the tier, and every budget derived from it
+
+```js
+TIER_PHONE, TIER_TABLET, TIER_DESKTOP, TIERS      // ordered: smallest budget first
+PHONE_MAX_SHORT_EDGE_CSS_PX                        // 600
+PHONE_*                                            // every phone budget, named
+PHONE_SHARES                                       // per-subsystem allocation
+BUDGETS                                            // {phone, tablet, desktop} -> Budgets
+
+probeWebGL(makeCanvas?) -> caps | null   // creates a context, then LOSES it
+readSignals(env?)       -> DeviceSignals // env is injectable; Node-safe
+classifyTier(signals)   -> tier          // PURE. no UA, no side effects
+isTouchPrimary(signals) -> boolean
+budgetTierFor(signals, tier?) -> {tier, reasons}   // capability derate, one step
+budgetsFor(tier)        -> Budgets       // unknown name -> desktop (§1.6)
+readTierOverride(search?, storage?) -> tier | null
+resolveDevice(opts?)    -> {tier, detectedTier, budgetTier, budgets, signals,
+                            derated, derateReasons, overridden, touch}
+effectivePixelRatio(budgets, dpr, cssW, cssH) -> number
+describeDevice(resolved) -> string       // one line, for the console
+```
+
+**No imports, no three.js, no DOM at module scope**, so `check-device.mjs`
+runs the shipping classifier in Node against synthetic devices. Keep it that
+way — it is the only reason the tier rules are assertable at all.
+
+**THE USER-AGENT IS NEVER A CLASSIFICATION SIGNAL.** It is recorded as
+`signals.uaHint` for bug reports and `classifyTier` does not read it.
+`check-device.mjs` classifies all twelve fleet devices under twelve UA
+permutations each and asserts the tier never moves. Two live reasons: the
+browser-pane `mobile` preset sets an **Android UA on a desktop GPU**, and
+iPadOS ships a **desktop Safari UA on a tablet** — a UA check is wrong in both
+directions at once. Capability beats UA.
+
+The rules, and the two guards that matter:
+
+```
+touchPrimary = maxTouchPoints >= 1 && (pointer: coarse)
+               && NOT ((any-pointer: fine) && (hover: hover))
+
+maxTouchPoints >= 1 && (any-pointer: coarse) && shortEdge < 600 -> phone  [floor]
+!touchPrimary                                                   -> desktop
+touchPrimary && shortEdge < 600                                 -> phone
+touchPrimary && shortEdge >= 600                                -> tablet
+```
+
+The mouse term is what stops a **desktop with a touchscreen** — ten touch
+points — being handed a phone budget. The floor runs *before* it, because iOS
+genuinely switches the primary pointer to fine when a Bluetooth mouse is paired,
+and a **phone handed a desktop budget is a tab iOS Safari kills mid-flight**.
+`shortEdge` is `min(screen.width, screen.height)`, so neither rotating the device
+nor resizing the window can change the answer.
+
+`classifyTier` reports the honest device class; `budgetTierFor` may hand it a
+smaller tier's budget when the probe says the class average is optimistic
+(`deviceMemory <= 2`, `MAX_TEXTURE_SIZE < 8192`, no linearly-filterable float
+textures, no WebGL at all). One step down, never two, never up. `deviceMemory`
+absent is **not** small — Safari does not expose it.
+
+**The phone budgets, and what each one is cut from.** Full derivations live in
+the file; these are the numbers other modules must hit.
+
+| budget | phone | desktop | why |
+|---|---|---|---|
+| JS heap | **160 MB** | 352.8 measured | 200 MB iOS floor − 40 MB GPU/DOM reserve |
+| DEM resident | **48 MiB** | 96 MiB | 238 pinned + 96 @z13 + 48 @z14 = 47.75 MiB |
+| triangles/frame | **460,000** | 1,836,118 | 45 Mvert/s × 33.3 ms ≈ 31% of the frame |
+| draw calls | **120** | 432 | ~60 µs/call through Metal = 7.2 ms |
+| shader programs | **45** | 65 | each is a first-use main-thread compile stall |
+| pixel ratio | **1.5** (≤1.2 Mpx) | 2 | DPR 3 is 9× the pixels; 1.5 is 4× fewer |
+| shadows | **off** | 4 cascades | one cascade is ~35 calls of a 120 budget |
+| terrain `lodQuality` | **0.40** | 1 | nodes ∝ q²; the node cache is the heap |
+| terrain `viewRadiusM` | **90,000** | 90,000 | **UNCHANGED** — Rainier is 84 km out |
+| buildings | **tall+major**, 8 km | all, 25/6 km | minor is 57% of buffers, 0.6 px on a phone |
+
+`PHONE_SHARES` splits the frame per subsystem, because a ceiling nobody owns is
+a ceiling nobody cuts. Measured at the phone tier, parked at KBFI, 375×812:
+
+| group | measured tri / calls | share | who closes it |
+|---|---|---|---|
+| terrain | 330,284 / 37 | 300,000 / 40 | **done** — `lodQuality` 0.40 |
+| landmarks | 98,126 / **84** | 90,000 / 40 | drop the minor tier, 8 km major cutoff |
+| airports | 45,578 / 10 | 40,000 / 10 | already inside |
+| aircraft | 27,827 / 29 | 28,000 / 20 | merge airframe materials |
+| sky | 976 / 9 | 2,000 / 10 | already inside |
+| **total** | **502,791 / 169** | **460,000 / 120** | |
+
+**`main.js` owns the application, and only three of these are live.**
+`window.sim.setQuality('phone'|'tablet'|'desktop')` re-applies the pixel ratio
+and the shadow tier immediately and republishes `window.sim.budgets`; the old
+names still work (`low`→phone, `medium`→tablet, `high`→desktop). Everything
+else — `antialias` (a renderer constructor flag), `terrainLodQuality` (a
+`createTerrain` option), the DEM cap and the building tiers — is **boot-time**.
+To measure a phone budget from frame 0 on a desktop, load `?tier=phone`.
+`setQuality` deliberately does **not** persist unless passed `{persist: true}`:
+a lever that silently changes the next boot is hidden state.
+
+`window.sim.device`, `.tier`, `.budgets`, `.deviceSignals()` and
+`.pixelBudget()` expose all of it for the acceptance checks.
+
+Verified by `npm run check:device` — 191 assertions, no DOM and no GPU.
 
 ---
 
