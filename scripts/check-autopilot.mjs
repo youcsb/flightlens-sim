@@ -233,6 +233,79 @@ console.log('\nautopilot — altitude hold');
   );
 }
 
+// ---------------------------------------------------------------------------
+// SMOOTHNESS. The gap that let the porpoising ship: every altitude test above
+// checks where the aeroplane ENDED UP, and a phugoid has a perfectly good mean.
+// It can oscillate +/-300 ft all day and still land inside "near(3000, 120)".
+// These assertions watch the whole trajectory instead of its endpoint.
+// ---------------------------------------------------------------------------
+console.log('\nautopilot — smoothness (no phugoid)');
+
+/** Fly and record, returning the altitude/pitch envelope over the run. */
+function flyRecording(flight, ap, seconds, pilot = {}) {
+  const n = Math.round(seconds / DT);
+  let altMin = Infinity, altMax = -Infinity, pitchMin = Infinity, pitchMax = -Infinity;
+  let vsSignChanges = 0, lastVsSign = 0;
+  for (let i = 0; i < n; i += 1) {
+    const inputs = {
+      pitch: 0, roll: 0, yaw: 0, throttle: 0.65, flaps: 0, brakes: 0, gear: 1, ...pilot,
+    };
+    ap.update(DT, flight.state, inputs);
+    flight.step(DT, inputs, GROUND_M);
+    const s = flight.state;
+    altMin = Math.min(altMin, s.altitudeFt); altMax = Math.max(altMax, s.altitudeFt);
+    pitchMin = Math.min(pitchMin, s.pitchDeg); pitchMax = Math.max(pitchMax, s.pitchDeg);
+    const sign = Math.sign(s.verticalSpeedFpm);
+    if (sign !== 0 && lastVsSign !== 0 && sign !== lastVsSign) vsSignChanges += 1;
+    if (sign !== 0) lastVsSign = sign;
+  }
+  return {
+    altBand: altMax - altMin,
+    pitchBand: pitchMax - pitchMin,
+    vsSignChanges,
+  };
+}
+
+{
+  const flight = airborne(0, 3000);
+  const ap = createAutopilot();
+  ap.toggle(flight.state);
+  // Let the initial capture settle, THEN measure the steady state.
+  fly(flight, ap, 45);
+  const r = flyRecording(flight, ap, 180);
+  ok(
+    'altitude stays inside a 60 ft band for 3 min',
+    r.altBand < 60,
+    `band ${r.altBand.toFixed(0)} ft`,
+  );
+  ok(
+    'pitch does not hunt',
+    r.pitchBand < 6,
+    `pitch band ${r.pitchBand.toFixed(1)} deg`,
+  );
+  ok(
+    'vertical speed does not keep reversing (phugoid)',
+    r.vsSignChanges < 25,
+    `${r.vsSignChanges} reversals in 3 min`,
+  );
+}
+
+{
+  // Smooth THROUGH a turn, which is where the load-factor feed-forward earns
+  // its place: the aeroplane must not sag and then over-correct.
+  const flight = airborne(0, 3000);
+  const ap = createAutopilot();
+  ap.toggle(flight.state);
+  fly(flight, ap, 30);
+  ap.nudgeHeading(90);
+  const r = flyRecording(flight, ap, 120);
+  ok(
+    'holds altitude through a 90 deg turn',
+    r.altBand < 150,
+    `band ${r.altBand.toFixed(0)} ft across the turn`,
+  );
+}
+
 console.log('\nautopilot — engage rules and disconnect');
 
 {

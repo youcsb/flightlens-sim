@@ -15,6 +15,28 @@
 const BASE = import.meta.env?.BASE_URL ?? '/';
 
 /**
+ * Optional absolute origin for the DEM tiles, e.g. 'https://tiles.example.com'.
+ * Set VITE_DEM_BASE_URL at BUILD time; unset it and tiles are served from the
+ * app's own origin exactly as before, so dev is untouched.
+ *
+ * WHY THIS EXISTS. The baked tiles are ~494 MB. That is fine on a local dev
+ * server and wrong on a static host: it blows past sensible repo sizes, and
+ * every re-bake would store another full copy in git history forever. Object
+ * storage with free egress is the right home for them; the app just needs to
+ * be told where.
+ *
+ * *** CORS IS NOT OPTIONAL ON THAT BUCKET. ***
+ * This is the exact failure that shaped the whole design. The upstream AWS
+ * terrarium bucket sends no access-control-allow-origin, so browser reads of
+ * those tiles taint the canvas and getImageData() throws — which is why the
+ * tiles are baked and served same-origin in the first place. Move them to a
+ * remote origin WITHOUT CORS headers and you reintroduce that bug in
+ * production only, where it will look like "the ground is missing". The bucket
+ * must send access-control-allow-origin for the game's origin.
+ */
+const DEM_BASE = (import.meta.env?.VITE_DEM_BASE_URL ?? '').replace(/\/+$/, '');
+
+/**
  * @param {string} rel Path relative to the public/ directory, no leading slash.
  * @returns {string} A URL safe to fetch() in both dev and the production build.
  */

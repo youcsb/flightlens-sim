@@ -70,10 +70,34 @@ const MAX_VS_FPM = 600;
  *  asks for 660 fpm, so it saturates only on large captures. */
 const K_ALT_TO_VS = 2.2;
 
-/** Elevator per fpm of vertical-speed error, plus its integrator. */
-const K_VS_P = 0.00085;
-const K_VS_I = 0.00040;
-const VS_I_CLAMP = 0.6;
+/**
+ * VERTICAL CASCADE: altitude -> vertical speed -> PITCH ATTITUDE -> elevator.
+ *
+ * The attitude stage in the middle is not decoration, and leaving it out is
+ * what made the first version porpoise. Driving the elevator straight from
+ * vertical-speed error closes a slow loop (altitude and vertical speed both lag
+ * the elevator by seconds) around an airframe that already has a lightly damped
+ * phugoid — a long-period exchange of height for speed. The controller then
+ * pumps that mode instead of damping it: nose up, speed decays, sink, nose
+ * down, speed builds, climb, forever.
+ *
+ * Closing an inner loop on PITCH ATTITUDE fixes it, because attitude responds
+ * to the elevator almost immediately. The outer loops then only have to ask for
+ * an attitude, which is a request the aeroplane can satisfy without overshoot.
+ */
+
+/** Degrees of pitch commanded per fpm of vertical-speed error. */
+const K_VS_TO_PITCH = 0.010;
+
+/** Steepest attitude the autopilot will command, degrees. */
+const MAX_PITCH_CMD_DEG = 8;
+
+/** Inner attitude loop: elevator per degree of pitch error, per deg/s of pitch
+ *  rate (the damping term), and the integrator that replaces the missing trim. */
+const K_PITCH_P = 0.075;
+const K_PITCH_D = 0.055;
+const K_PITCH_I = 0.020;
+const PITCH_I_CLAMP = 0.55;
 
 /**
  * Airspeed protection, knots.
@@ -131,14 +155,31 @@ export function createAutopilot() {
 
   // Integrator state. Zeroed on every engage — see the header note.
   let bankI = 0;
-  let vsI = 0;
+  let pitchI = 0;
+
+  /**
+   * Previous attitude, for locally differentiated rates.
+   *
+   * The flight model does not publish angular rates on `state` — there is no
+   * p/q/r and no pitchRateDps. The first version of this file reached for
+   * `state.rollRateDps ?? state.p ?? 0`, which meant the damping term was
+   * silently ZERO in every frame it ever ran. An undamped controller on a
+   * lightly damped airframe is exactly the porpoise that got reported.
+   *
+   * So the rates are differentiated here instead. NaN on the first frame after
+   * engage is avoided by seeding these at engage time.
+   */
+  let prevPitchDeg = 0;
+  let prevRollDeg = 0;
+  let haveRates = false;
 
   /** Why we last disengaged, for the HUD to show. */
   let lastReason = '';
 
   function resetIntegrators() {
     bankI = 0;
-    vsI = 0;
+    pitchI = 0;
+    haveRates = false;
   }
 
   function disengage(why) {
@@ -225,17 +266,23 @@ export function createAutopilot() {
 
       const d = dt > 0 && dt < 0.5 ? dt : 1 / 60;
 
+      // Differentiate attitude for the damping terms. The model publishes no
+      // angular rates, so we keep our own. First frame after engage has no
+      // history, so the rates are zero for exactly one step.
+      const pitchDeg = state.pitchDeg ?? 0;
+      const rollDeg = state.rollDeg ?? 0;
+      const pitchRate = haveRates ? (pitchDeg - prevPitchDeg) / d : 0;
+      const rollRate = haveRates ? (rollDeg - prevRollDeg) / d : 0;
+      prevPitchDeg = pitchDeg;
+      prevRollDeg = rollDeg;
+      haveRates = true;
+
       // --- lateral: heading -> bank -> aileron ------------------------------
       const hdgErr = wrap180(headingBug - (state.headingDeg ?? 0));
       const bankTarget = clamp(hdgErr * K_HDG_TO_BANK, -MAX_BANK_DEG, MAX_BANK_DEG);
-      const bankErr = bankTarget - (state.rollDeg ?? 0);
+      const bankErr = bankTarget - rollDeg;
 
       bankI = clamp(bankI + bankErr * d * K_BANK_I, -BANK_I_CLAMP, BANK_I_CLAMP);
-
-      // Roll RATE damping. state.rollRateDps is not guaranteed, so fall back to
-      // the body-axis rate if present and to zero if neither exists — a missing
-      // damping term degrades the response, it does not invert it.
-      const rollRate = state.rollRateDps ?? state.p ?? 0;
       const rollCmd = bankErr * K_BANK_P + bankI - rollRate * K_BANK_D;
       inputs.roll = clamp(rollCmd, -1, 1);
 
@@ -259,23 +306,38 @@ export function createAutopilot() {
       const room = (kts - VS_FLOOR_KTS) / (VS_PROTECT_KTS - VS_FLOOR_KTS);
       if (room < 0) {
         vsTarget = Math.min(vsTarget, clamp(room, -1, 0) * MAX_VS_FPM);
-        if (vsI > 0) vsI = 0;
+        if (pitchI > 0) pitchI = 0;
       } else if (vsTarget > 0) {
         vsTarget *= clamp(room, 0, 1);
       }
 
+      // Stage 2: vertical-speed error asks for a PITCH ATTITUDE, not for an
+      // elevator deflection. See the cascade note above — this is the stage
+      // whose absence caused the porpoising.
       const vsErr = vsTarget - (state.verticalSpeedFpm ?? 0);
+      let pitchTarget = clamp(
+        vsErr * K_VS_TO_PITCH,
+        -MAX_PITCH_CMD_DEG,
+        MAX_PITCH_CMD_DEG,
+      );
 
-      vsI = clamp(vsI + vsErr * d * K_VS_I, -VS_I_CLAMP, VS_I_CLAMP);
+      // In a bank some lift goes sideways, so level flight needs a little more
+      // nose. Feeding it forward here keeps the integrator from having to
+      // discover it again on every turn.
+      const bankRad = (rollDeg * Math.PI) / 180;
+      pitchTarget += clamp(1 / Math.max(0.4, Math.cos(bankRad)) - 1, 0, 0.5) * 3;
 
-      // In a bank, some lift goes sideways; without this the aircraft sags in
-      // every turn and the integrator has to chase it. 1/cos(bank) is the
-      // textbook load-factor term, capped so a steep bank cannot demand
-      // unbounded back-pressure.
-      const bankRad = ((state.rollDeg ?? 0) * Math.PI) / 180;
-      const loadComp = clamp(1 / Math.max(0.4, Math.cos(bankRad)) - 1, 0, 0.5);
+      // Stage 3: the fast inner loop. Proportional on attitude error, DAMPED on
+      // pitch rate, with an integrator standing in for the trim the airframe
+      // does not have.
+      const pitchErr = pitchTarget - pitchDeg;
+      pitchI = clamp(pitchI + pitchErr * d * K_PITCH_I, -PITCH_I_CLAMP, PITCH_I_CLAMP);
 
-      inputs.pitch = clamp(vsErr * K_VS_P + vsI + loadComp * 0.35, -1, 1);
+      inputs.pitch = clamp(
+        pitchErr * K_PITCH_P + pitchI - pitchRate * K_PITCH_D,
+        -1,
+        1,
+      );
 
       // Rudder: hold it neutral. The airframe already models adverse yaw and a
       // slipstream term; adding an uncalibrated coordination term on top of
