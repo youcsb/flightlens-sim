@@ -385,6 +385,31 @@ export const PHONE_BUILDING_MAJOR_CUTOFF_M = 8000;
 export const PHONE_BUILDING_MINOR_CUTOFF_M = 0;
 
 /**
+ * CITY CHUNK EDGE — 8 km on a phone against the 3 km the desktop builds with.
+ *
+ * Draw calls are the binding constraint on a phone, not triangles. Measured at
+ * phone tier over downtown: the city cost 101 draw calls for 99,164 triangles
+ * against a 40-call share — 84% of the entire 120-call budget for 17% of the
+ * triangles. Chunk count scales as (1/edge)^2, so 3 km -> 8 km folds roughly
+ * seven chunks into one.
+ *
+ * MEASURED, AND IT DID NOT PAY. 8,000 was tried and reverted: over downtown it
+ * took the city from 101 draw calls to 96 — five calls — while triangles went
+ * from 99,164 to 134,243. Thirty-five thousand triangles for five calls is the
+ * wrong side of a trade when BOTH are over budget. The mechanism stays because
+ * it is the right knob and the tablet uses it, but the phone keeps 3 km until
+ * something measures better.
+ *
+ * The city was never the real cost anyway. Chunk merging already collapses
+ * 23,951 footprints into 26 drawn meshes. The 96 remaining calls are the
+ * INDIVIDUALLY MODELLED landmarks: Space Needle 19 meshes, Tacoma Narrows
+ * Bridge 19, Boeing Everett Factory 11, Great Wheel 9, T-Mobile Park 9 — about
+ * 120 meshes across 20 landmarks, none of them merged and none distance-culled.
+ * That is the next piece of work, and it is a real one.
+ */
+export const PHONE_CITY_CHUNK_M = 3000;
+
+/**
  * PROCEDURAL TEXTURE SCALE — 0.5 linear, so a quarter of the texels.
  *
  * MEASURED IN CHROME AT THE PHONE TIER, production build, by walking the scene
@@ -497,6 +522,7 @@ const PHONE_BUDGETS = freeze({
     tallCutoffM: PHONE_BUILDING_TALL_CUTOFF_M,
     majorCutoffM: PHONE_BUILDING_MAJOR_CUTOFF_M,
     minorCutoffM: PHONE_BUILDING_MINOR_CUTOFF_M,
+    cityChunkM: PHONE_CITY_CHUNK_M,
   },
   // NEVER false, on any tier. The far plane is 300 km and the near plane 0.35 m
   // (MODULES §2.13); without it the distant terrain z-fights and sky.js's cloud
@@ -556,6 +582,9 @@ const TABLET_BUDGETS = freeze({
     // minor tier's buffers are only paid for where they are actually seen.
     majorCutoffM: 14000,
     minorCutoffM: 3000,
+    // Halfway, for the same reason as the phone: a tablet has more call budget
+    // than a phone and less than a desktop.
+    cityChunkM: 5000,
   },
   logarithmicDepthBuffer: true,
 });

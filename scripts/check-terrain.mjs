@@ -547,6 +547,68 @@ head('13. The node cache scales with the tier — and does not cost a node');
     `peak built ${peakBuilt} against ${ps.cacheCap} + ${ps.evictSlack}`,
   );
 
+  // -------------------------------------------------------------------------
+  // THE TRIANGLE BUDGET. Nothing asserted this, and the gap let a wrong
+  // conclusion stand: a note recorded the phone as +17% over its 460,000
+  // triangle budget "and the overage is terrain". Measured here, it is not.
+  //
+  // The subtlety that produced the confusion: stats().triangles counts every
+  // node the SELECTOR emitted, while renderer.info.render.triangles counts what
+  // survives FRUSTUM CULLING. Over downtown those differ by about 4x, so a
+  // headless number and a browser number can disagree wildly while both are
+  // correct about different things. This assertion culls, so it is comparable
+  // to the renderer's own count.
+  // -------------------------------------------------------------------------
+  const visibleTris = (t, cam) => {
+    cam.updateMatrixWorld(true);
+    const fr = new THREE.Frustum().setFromProjectionMatrix(
+      new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse),
+    );
+    let tris = 0;
+    let drawn = 0;
+    for (const c of t.group.children) {
+      if (!c.visible || !/^terrain-\d+\//.test(c.name) || !c.geometry) continue;
+      if (!c.geometry.boundingSphere) c.geometry.computeBoundingSphere();
+      const sph = c.geometry.boundingSphere.clone().applyMatrix4(c.matrixWorld);
+      if (!fr.intersectsSphere(sph)) continue;
+      drawn += 1;
+      const g = c.geometry;
+      tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
+    }
+    return { tris: Math.round(tris), drawn };
+  };
+
+  // The four viewpoints a player actually starts at or flies to, at the
+  // altitudes PLACES uses. Downtown is the dense case; KBFI is the worst,
+  // because low over a city puts the finest nodes closest to the camera.
+  let worstTris = 0;
+  let worstAt = '';
+  let worstCalls = 0;
+  for (const [label, lat, lon, alt] of [
+    ['downtown 610 m', 47.57, -122.339, 610],
+    ['downtown core 610 m', 47.6062, -122.3321, 610],
+    ['Space Needle 610 m', 47.6204, -122.3491, 610],
+    ['KBFI 200 m', 47.53, -122.302, 200],
+  ]) {
+    parkPhone(lat, lon, alt, 10);
+    const v = visibleTris(phone, phoneCam);
+    if (v.tris > worstTris) {
+      worstTris = v.tris;
+      worstAt = label;
+      worstCalls = v.drawn;
+    }
+  }
+  ok(
+    'phone terrain stays inside its 300,000-triangle share',
+    worstTris <= 300000,
+    `worst ${worstTris.toLocaleString()} at ${worstAt} (${worstCalls} nodes)`,
+  );
+  ok(
+    'and inside its 40-draw-call share',
+    worstCalls <= 40,
+    `${worstCalls} nodes drawn at ${worstAt}`,
+  );
+
   // Stationary means stationary. A cache under the working set does not
   // oscillate visibly frame to frame, but it does hunt; a single value over
   // 20 frames at the worst camera is the guard.

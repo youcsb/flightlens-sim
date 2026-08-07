@@ -40,7 +40,7 @@
 import * as THREE from 'three';
 import { llToLocal, localToLl } from '../geo/coords.js';
 import { getElevation, isWater, isLoaded } from '../geo/elevation.js';
-import { loadBuildings } from '../geo/buildings.js';
+import { loadBuildings, buildingBudget } from '../geo/buildings.js';
 
 const DEG = Math.PI / 180;
 
@@ -1378,6 +1378,29 @@ function hash01(a, b) {
 const CITY_CHUNK_M = 3000;
 
 /**
+ * Chunk edge actually used, which the device tier may widen.
+ *
+ * WHY THIS IS TIER-AWARE. Draw calls, not triangles, are what a phone cannot
+ * afford: measured at phone tier over downtown, the city cost 101 draw calls
+ * for only 99,164 triangles against a 40-call share — 84% of the whole 120-call
+ * budget for 17% of the triangles. That is a batching problem. Chunk count
+ * scales as (1 / edge)^2, so widening the edge from 3 km to 8 km collapses
+ * roughly seven chunks into one.
+ *
+ * The cost is coarser frustum culling: a wider chunk is kept whole, so more
+ * off-screen geometry is submitted. That trade is right here precisely because
+ * the phone's building set is already small — maxCount 6,724 with the minor
+ * tier not built at all — so the triangles a wider chunk drags in are cheap,
+ * while every call it saves is not.
+ *
+ * Read once per build, from the same policy object that carries the cutoffs.
+ */
+function cityChunkM() {
+  const m = buildingBudget()?.cityChunkM;
+  return Number.isFinite(m) && m > 0 ? m : CITY_CHUNK_M;
+}
+
+/**
  * THREE TIERS, and the boundaries are measured rather than picked.
  *
  * `tall` — anything over TALL_H_M. Drawn at every distance, no cutoff. From
@@ -1718,6 +1741,7 @@ function buildRealCity(group, set, exclude) {
   const lz = new Float32Array(count);
   const baseY = new Float32Array(count);
   const topY = new Float32Array(count);
+  const chunkM = cityChunkM();
   const chunks = new Map();
 
   let excluded = 0;
@@ -1788,12 +1812,12 @@ function buildRealCity(group, set, exclude) {
     topY[i] = ground + set.heightM[i];
     baseY[i] = Math.min(lo, ground) - CITY_EMBED_SLACK_M;
 
-    const key = `${Math.floor(cx / CITY_CHUNK_M)},${Math.floor(cz / CITY_CHUNK_M)}`;
+    const key = `${Math.floor(cx / chunkM)},${Math.floor(cz / chunkM)}`;
     let c = chunks.get(key);
     if (!c) {
       c = {
-        ox: (Math.floor(cx / CITY_CHUNK_M) + 0.5) * CITY_CHUNK_M,
-        oz: (Math.floor(cz / CITY_CHUNK_M) + 0.5) * CITY_CHUNK_M,
+        ox: (Math.floor(cx / chunkM) + 0.5) * chunkM,
+        oz: (Math.floor(cz / chunkM) + 0.5) * chunkM,
         tall: [],
         major: [],
         minor: [],
