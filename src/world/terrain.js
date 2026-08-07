@@ -126,6 +126,7 @@ import {
   loadDetailLayers,
   setViewer,
   getElevationLocal,
+  getFieldEpoch,
   fillHeightGrid,
   isLoaded as demLoaded,
   SEA_LEVEL_M,
@@ -292,6 +293,81 @@ const MAX_LEVEL = Math.round(Math.log2(ROOT_SIZE / MIN_NODE_SIZE)); // 10
  */
 const DEM_SPACING_FINE = 6.47;
 const DEM_SPACING_REGION = 12.95;
+
+// ---------------------------------------------------------------------------
+// REVALIDATION — the DEM improves under a node that was already measured
+// ---------------------------------------------------------------------------
+/**
+ * A node measures its own geometric error ONCE, in makeNode, and builds its
+ * vertices from the field ONCE, in buildNode. Both were safe when the elevation
+ * field was a single pinned layer that never changed after boot. Paging broke
+ * that assumption, and it broke it exactly where it hurts most.
+ *
+ * WHAT ACTUALLY HAPPENED, measured. The bootstrap `converge()` runs at the scene
+ * origin with only the 51.8 m/px base resident, and the root is 262 km across —
+ * so the coarse nodes it creates cover the ENTIRE region, Mount Rainier
+ * included, and every one of them gets its `err` measured against the base
+ * layer. `switchDistanceFor` turns a small measured error into a short switch
+ * distance, so those nodes then refuse to subdivide no matter how close the
+ * camera gets, and they keep drawing vertices sampled from the coarse layer.
+ * Flying to Rainier afterwards drew the summit from the base layer:
+ *
+ *   drawn surface vs the field the wheels use ... 26.6 m worst, 20.4 m RMS
+ *   finest cell selected at 3,000 m over the summit .......... 64 m
+ *   finest cell the baked z=13 data actually supports ........ 16 m
+ *
+ * None of that is visible in a screenshot of the mountain — it just looks like a
+ * slightly soft mountain — and `getHeightAt` is right the whole time, which is
+ * worse: the wheels are correct and the picture is wrong, which is precisely the
+ * failure §1.4's note about coarse tessellation tells you to fix with more
+ * triangles rather than by touching the sampler.
+ *
+ * THE FIX. elevation.js publishes a field epoch (`getFieldEpoch`) that bumps
+ * whenever a tile decodes, is evicted, or finishes its arrival ramp. A node
+ * stamps the epoch it was measured at; when the epoch has moved on, the node
+ * re-probes, and if the ground under it really did change it recomputes its
+ * switch distance and drops its geometry so it rebuilds from current data.
+ *
+ * THE TWO BUDGETS BELOW ARE WHAT KEEP THIS OFF THE CRITICAL PATH.
+ *
+ * `REVALIDATE_RADIUS_M` — beyond the paged layers' own reach the field cannot
+ * have changed, so re-probing out there is pure waste. The z=13 layer pages to
+ * a 30 km radius; 36 km covers it with margin and excludes the ~80% of drawn
+ * nodes that are pure distant backdrop.
+ *
+ * `REVALIDATE_PER_FRAME` — a probe is a 17x17 field sample, about 40 us. Six per
+ * frame is a 0.24 ms ceiling, and it only ever runs while tiles are actually
+ * arriving: once paging settles the epoch stops moving, the sweep completes, and
+ * the cost goes to zero. Nearest-first, so what the pilot is looking at is
+ * repaired before the backdrop.
+ */
+const REVALIDATE_RADIUS_M = 36000;
+const REVALIDATE_PER_FRAME = 6;
+/**
+ * How much the measured error must move before the geometry is thrown away.
+ *
+ * Not zero: the arrival ramp means a node re-probed mid-fade sees a value that
+ * is still moving, and rebuilding on every millimetre would rebuild the same
+ * node every frame for the 1.5 s a tile takes to fade in. 0.25 m is below what
+ * anyone can see on a hillside and far above the ramp's per-frame step.
+ */
+const REVALIDATE_ERR_EPS_M = 0.25;
+/**
+ * Stale-node rebuilds allowed per selection pass.
+ *
+ * A rebuild is not optional the way a prefetch is — the node is on screen, so
+ * visit() does it regardless of the time budget, exactly as it does for a node
+ * with no geometry at all. That makes an unbounded number of them able to eat
+ * the whole frame and leave `drainPrefetch` nothing, which does not look like a
+ * slow frame: it looks like an LOD that will not descend, because the children
+ * that would replace the stale node are the very things that never get built.
+ *
+ * Bounding it means a stale node may be drawn one frame longer. That is the
+ * right way round — a slightly out-of-date surface beats a permanently coarse
+ * one, and the ones that wait are the far ones, because revalidateNear works
+ * nearest-first.
+ */
+const REBUILD_PER_PASS = 3;
 
 /**
  * Built geometries kept alive. 134 KB each (positions and morph as Float32,
@@ -755,6 +831,21 @@ export async function createTerrain(scene, opts = {}) {
   let nextEmitted = [];
   let frameId = 0;
   let buildDeadline = 0;
+  /**
+   * The field epoch the tree was last swept against, and whether that sweep
+   * finished. Together they make the whole revalidation path free once paging
+   * has settled: one integer compare per frame and nothing else.
+   */
+  let lastFieldEpoch = -1;
+  let revalDone = false;
+  /**
+   * Stale rebuilds left in the current selection pass, and the budget it is
+   * refilled to. converge() raises the budget to Infinity because a teleport is
+   * a stall the user already asked for and arriving with a correct surface is
+   * the whole point of it.
+   */
+  let rebuildBudget = REBUILD_PER_PASS;
+  let rebuildsLeft = REBUILD_PER_PASS;
   /** @type {Array<Object>} Nodes whose geometry we want but do not urgently need. */
   const prefetch = [];
 
@@ -832,14 +923,29 @@ export async function createTerrain(scene, opts = {}) {
    */
   function converge(x, y, z) {
     const prevDeadline = buildDeadline;
+    const prevRebuild = rebuildBudget;
     buildDeadline = Infinity;
+    rebuildBudget = Infinity;
     let n = 0;
     for (; n <= MAX_LEVEL + 1; n++) {
+      // Revalidate with NO budget, between passes.
+      //
+      // This is the teleport case and it is the one that most needs it: main.js
+      // awaits warmAt() before calling us, so the fine layers for the
+      // destination have just landed and every node the old selection cached
+      // out there was measured against the coarse base. Repairing them here,
+      // inside the stall the user already asked for, is the difference between
+      // arriving over a real Mount Rainier and arriving over a smooth one that
+      // sharpens up over the next several seconds. It runs over the PREVIOUS
+      // pass's selection, so it must come before this pass's — same ordering
+      // argument as update().
+      revalidateNear(x, z, Infinity);
       selectFrom(x, y, z);
       if (prefetch.length === 0) break;
       drainPrefetch();
     }
     buildDeadline = prevDeadline;
+    rebuildBudget = prevRebuild;
     return n;
   }
 
@@ -919,6 +1025,16 @@ export async function createTerrain(scene, opts = {}) {
     }
     _camPrev.copy(_camPos);
     _camPrevMs = tNow;
+
+    // BEFORE the selection, not after. The DEM the last selection was made
+    // against may have improved since those nodes were measured, and a node's
+    // switch distance is what decides whether it subdivides — so re-measuring
+    // has to happen while the selector can still act on it. See the
+    // REVALIDATION block at the top of this file: without this, flying to
+    // Mount Rainier draws a summit built from the 51.8 m/px base while
+    // 12.95 m/px data sits resident underneath it. Budgeted, nearest-first,
+    // and free once paging settles.
+    revalidateNear(_camPos.x, _camPos.z);
 
     buildDeadline = performance.now() + BUILD_BUDGET_MS;
     selectFrom(_camPos.x, _camPos.y, _camPos.z);
@@ -1023,6 +1139,9 @@ export async function createTerrain(scene, opts = {}) {
       level,
       ix,
       iz,
+      // Kept so revalidate() can re-apply the nesting clamp against a parent
+      // whose own switch distance may since have been re-measured.
+      parent,
       size,
       x0,
       z0,
@@ -1037,13 +1156,157 @@ export async function createTerrain(scene, opts = {}) {
       // Padded: a 17x17 probe of a 262 km node still misses a lot of mountain.
       yMin: (lo - size * 0.05) * exag,
       yMax: (hi + size * 0.05) * exag,
+      // THE PROBE'S OWN ANSWER, kept unpadded and unexaggerated.
+      //
+      // This exists so revalidate() can compare like with like. `yMin`/`yMax`
+      // start as the padded probe but are overwritten by buildNode() with the
+      // real geometry's bounding box — a different measurement at a different
+      // sample spacing. Comparing a fresh probe against THOSE finds a
+      // difference on every mountainous node forever, which marks it stale
+      // forever, which rebuilds it every frame and starves drainPrefetch of the
+      // budget it needs to deepen the tree. Measured while that bug was live:
+      // Mount Rainier pinned at 32 m cells with all four children of the node
+      // under the camera permanently unbuilt.
+      probeLo: lo,
+      probeHi: hi,
       children: null,
       geometry: null,
       mesh: null,
       lastUsed: 0,
+      // The field epoch this node's err/switchD were measured at, and the one
+      // its vertices were sampled at. They differ: a node can be re-measured
+      // and found unchanged, which stamps `epoch` without touching the mesh.
+      epoch: getFieldEpoch(),
+      // Set when revalidate() finds the ground under this node has moved. The
+      // geometry is NOT thrown away at that moment — see rebuildStale().
+      stale: false,
     };
     nodes.set(key, node);
     return node;
+  }
+
+  /**
+   * Re-measure one node against the field as it stands now.
+   *
+   * Returns true if anything actually changed. See the REVALIDATION block at
+   * the top of this file for why a node's first measurement cannot be trusted
+   * forever.
+   */
+  function revalidate(node) {
+    node.epoch = getFieldEpoch();
+    if (!node.hasData) return false;
+
+    const p = probeNode(node.x0, node.z0, node.size);
+    // Probe against probe. See probeLo/probeHi in makeNode for what happens
+    // when this is compared against the geometry's bounding box instead.
+    const errMoved = Math.abs(p.err - node.err) > REVALIDATE_ERR_EPS_M;
+    const surfaceMoved =
+      Math.abs(p.lo - node.probeLo) > REVALIDATE_ERR_EPS_M ||
+      Math.abs(p.hi - node.probeHi) > REVALIDATE_ERR_EPS_M;
+    if (!errMoved && !surfaceMoved) return false;
+
+    node.err = p.err;
+    node.probeLo = p.lo;
+    node.probeHi = p.hi;
+    // Only the probe owns these until a geometry exists; once one does,
+    // buildNode's exact bounding box is strictly better and must not be undone.
+    if (!node.geometry) {
+      node.yMin = (p.lo - node.size * 0.05) * exag;
+      node.yMax = (p.hi + node.size * 0.05) * exag;
+    }
+    const parentD = node.parent ? node.parent.switchD : Infinity;
+    const prevSwitchD = node.switchD;
+    node.switchD = switchDistanceFor(p.err, node.size, node.x0, node.z0, parentD);
+
+    // A node's children morph toward it over ITS switch distance, and that
+    // distance is baked into their aMorph.y. Changing it here without telling
+    // them leaves the geomorph blending over the wrong band — a pop at every
+    // LOD transition under this node. They are already going to be rebuilt if
+    // their own data moved; this makes sure they are rebuilt if OURS did.
+    if (node.children && node.switchD !== prevSwitchD) {
+      for (let i = 0; i < 4; i++) {
+        const kid = node.children[i];
+        kid.morphEnd = node.switchD;
+        if (kid.geometry) kid.stale = true;
+      }
+    }
+
+    // MARK, DO NOT DEMOLISH. Releasing the geometry here would take the mesh
+    // out of the scene graph the instant this runs, and this runs on the
+    // per-frame path — so a node that is on screen would vanish for however
+    // many frames pass before something rebuilds it. A hole in the ground is a
+    // far worse artefact than the stale surface we are replacing. rebuildStale()
+    // swaps it, inside visit(), in the same frame, with the mesh never absent.
+    if (node.geometry) node.stale = true;
+    return true;
+  }
+
+  /**
+   * Replace a stale node's geometry in place, atomically.
+   *
+   * Called from visit() at the moment the node is chosen for drawing, so the
+   * old mesh is only ever removed once the new one exists.
+   */
+  function rebuildStale(node) {
+    node.stale = false;
+    const old = node.mesh;
+    const oldGeo = node.geometry;
+    node.geometry = null;
+    node.mesh = null;
+    const at = built.indexOf(node);
+    if (at >= 0) built.splice(at, 1);
+    buildNode(node);
+    if (old) group.remove(old);
+    oldGeo?.dispose();
+  }
+
+  /**
+   * Spend this frame's revalidation budget on the nodes nearest the camera.
+   *
+   * Runs over the set the selector just emitted, which is the right set: those
+   * are the meshes on screen, and a stale `switchD` on a drawn node is exactly
+   * what stops it subdividing into the finer data that has arrived beneath it.
+   */
+  function revalidateNear(px, pz, budget = REVALIDATE_PER_FRAME) {
+    const epoch = getFieldEpoch();
+    if (epoch === lastFieldEpoch && revalDone) return;
+    if (epoch !== lastFieldEpoch) {
+      lastFieldEpoch = epoch;
+      revalDone = false;
+    }
+
+    let spent = 0;
+    let anyStale = false;
+    // Nearest-first without sorting: two passes over a small array beat a sort
+    // of 750 meshes every frame (§1.8 — this runs per frame, so it allocates
+    // nothing and never sorts).
+    let bestD = Infinity;
+    for (let round = 0; round < budget; round++) {
+      let best = null;
+      bestD = Infinity;
+      for (let i = 0; i < emitted.length; i++) {
+        const node = nodes.get(emitted[i].name.slice('terrain-'.length));
+        if (!node || node.epoch === epoch) continue;
+        const dx = Math.max(node.x0 - px, 0, px - (node.x0 + node.size));
+        const dz = Math.max(node.z0 - pz, 0, pz - (node.z0 + node.size));
+        const d = Math.sqrt(dx * dx + dz * dz);
+        if (d > REVALIDATE_RADIUS_M) {
+          // Out of every paged layer's reach: it cannot have changed, so stamp
+          // it and stop reconsidering it until the epoch moves again.
+          node.epoch = epoch;
+          continue;
+        }
+        anyStale = true;
+        if (d < bestD) {
+          bestD = d;
+          best = node;
+        }
+      }
+      if (!best) break;
+      revalidate(best);
+      spent++;
+    }
+    if (spent === 0 && !anyStale) revalDone = true;
   }
 
   function ensureChildren(node) {
@@ -1079,6 +1342,7 @@ export async function createTerrain(scene, opts = {}) {
     frameId++;
     prefetch.length = 0;
     nextEmitted.length = 0;
+    rebuildsLeft = rebuildBudget;
     visit(root, px, py, pz);
 
     for (let i = 0; i < emitted.length; i++) emitted[i].visible = false;
@@ -1125,6 +1389,13 @@ export async function createTerrain(scene, opts = {}) {
     // Needed THIS frame, so build regardless of budget — a missing chunk is a
     // hole in the world, and one 0.6 ms build beats that every time.
     if (!node.geometry) buildNode(node);
+    // Same argument for a node whose ground moved under it: the swap happens
+    // here, where the replacement is built before the original is dropped —
+    // but under a budget, so it can never starve drainPrefetch.
+    else if (node.stale && rebuildsLeft > 0) {
+      rebuildsLeft--;
+      rebuildStale(node);
+    }
     node.lastUsed = frameId;
     nextEmitted.push(node.mesh);
   }
@@ -1141,6 +1412,7 @@ export async function createTerrain(scene, opts = {}) {
 
   function buildNode(node) {
     node.geometry = buildNodeGeometry(node, sharedIndex, exag);
+    node.stale = false;
     const mesh = new THREE.Mesh(node.geometry, terrainMat);
     mesh.name = `terrain-${node.key}`;
     mesh.matrixAutoUpdate = false;

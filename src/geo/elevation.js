@@ -437,6 +437,12 @@ let pageIns = 0;
 let evictions = 0;
 let capViolations = 0;
 
+/**
+ * Bumped whenever the field's answer can have moved. See getFieldEpoch().
+ * Every write to it is next to the line that changed what a sample returns.
+ */
+let fieldEpoch = 0;
+
 /** Viewer state in LOCAL scene metres, driven by setViewer(). */
 let viewX = 0;
 let viewZ = 0;
@@ -910,7 +916,13 @@ function advanceRamps(dtMs) {
     for (const tile of layer.tiles.values()) {
       if (tile.q && tile.w < 1) {
         tile.w += step;
-        if (tile.w > 1) tile.w = 1;
+        // The ramp COMPLETING is a field change like any other: it is the
+        // moment this tile's opinion stops being diluted by the coarser layer
+        // underneath it. A consumer that re-measured mid-ramp measured a blend.
+        if (tile.w >= 1) {
+          tile.w = 1;
+          fieldEpoch++;
+        }
       }
     }
   }
@@ -1019,6 +1031,9 @@ function repageLayer(layer, force, radiusScale = 1) {
     layer.tiles.delete(key);
     residentBytes -= tile.q.byteLength;
     evictions++;
+    // Losing a tile moves the field just as surely as gaining one — the fold
+    // falls back to the coarser layer under it.
+    fieldEpoch++;
   }
 
   // Queue the misses, nearest first.
@@ -1157,6 +1172,9 @@ function pumpDecode(budgetMs) {
     tilesLoaded++;
     pageIns++;
     loaded = true;
+    // New data is readable from this instant. During the warm-up and on the
+    // pinned base rec.w is already 1, so this is the only bump those get.
+    fieldEpoch++;
   }
   if (residentBytes > peakResidentBytes) peakResidentBytes = residentBytes;
   if (decodeQueue.length) scheduleDecode();
@@ -1198,7 +1216,12 @@ async function drainPaging() {
 export async function flushPaging() {
   await drainPaging();
   for (const layer of layers) {
-    for (const tile of layer.tiles.values()) if (tile.q) tile.w = 1;
+    for (const tile of layer.tiles.values()) {
+      if (tile.q && tile.w < 1) {
+        tile.w = 1;
+        fieldEpoch++;
+      }
+    }
   }
 }
 
@@ -1306,6 +1329,38 @@ export function isLoaded() {
   return loaded;
 }
 
+// ---------------------------------------------------------------------------
+// THE FIELD EPOCH — "the answer at some point in the region just changed"
+// ---------------------------------------------------------------------------
+/**
+ * Monotonic counter, bumped whenever this module's answer to
+ * `getElevationLocal` can have moved anywhere in the region: a tile decoded, a
+ * resident tile evicted, or an arrival ramp reaching 1.
+ *
+ * WHY ANYTHING NEEDS THIS. Before paging, the field was constant after boot, so
+ * a consumer could sample it once and cache the result forever. That is no
+ * longer true and the failure it causes is silent: `world/terrain.js` measures
+ * each LOD node's geometric error ONCE, when the node is created, and builds its
+ * vertices from the field at build time. Boot creates the coarse nodes covering
+ * the whole 262 km root while only the pinned 51.8 m/px base is resident, so
+ * every node out over the Cascades was measured — and drawn — against a surface
+ * four times coarser than the one the aircraft would later fly over. Measured
+ * before the fix: flying to Mount Rainier drew a summit built from the base
+ * layer, 26.6 m away from the field the wheels use, one whole LOD level short of
+ * what the baked data supports.
+ *
+ * This is deliberately ONE GLOBAL COUNTER rather than a per-tile or per-region
+ * signal. A consumer that wants to know whether a specific place changed can
+ * re-measure that place; what it cannot do without help is know that re-measuring
+ * is worth the cost. A counter it can compare in one integer compare per frame is
+ * exactly enough, and it costs nothing when nothing is paging.
+ *
+ * @returns {number} increments; never resets, never wraps in any real session
+ */
+export function getFieldEpoch() {
+  return fieldEpoch;
+}
+
 /**
  * Diagnostics for the HUD, the console and check-elevation.mjs.
  *
@@ -1349,6 +1404,7 @@ export function getRegionStats() {
     pageIns,
     evictions,
     capViolations,
+    fieldEpoch,
     pendingLoads: loadQueue.length + inflight.size + decodeQueue.length,
   };
 }
