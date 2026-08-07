@@ -358,6 +358,11 @@ export function createOverlay(container, o = {}) {
   const stTime = row(status, 'TIME');
   const stAudio = row(status, 'SOUND');
   const stAp = row(status, 'A/P');
+  /* The two readouts the compact HUD crops off the windscreen. On a desktop
+     they sit here in the status panel; on a phone this whole panel reparents
+     into the menu sheet, so they are one tap away rather than in the view. */
+  const stNear = row(status, 'FIELD');
+  const stRpm = row(status, 'RPM');
   root.appendChild(status);
 
   // --- key legend ---------------------------------------------------------
@@ -614,6 +619,19 @@ export function createOverlay(container, o = {}) {
      * anything; disengaged it shows the armed bugs in grey, because the numbers
      * you are about to fly to matter before you press the button.
      */
+    /**
+     * Readouts displaced from the compact cluster. Called every frame, so it
+     * writes only on change — assigning an unchanged string still dirties
+     * layout in some engines.
+     * @param {{rpm:number, nearest:string, nearestSub:string}} info
+     */
+    setFlightInfo(info) {
+      if (!info) return;
+      const near = info.nearestSub ? `${info.nearest} ${info.nearestSub}` : info.nearest;
+      if (stNear.textContent !== near) stNear.textContent = near;
+      const rpm = String(info.rpm ?? 0);
+      if (stRpm.textContent !== rpm) stRpm.textContent = rpm;
+    },
     setAutopilot(ap) {
       const txt = ap.engaged
         ? `HDG ${String(Math.round(ap.headingBug)).padStart(3, '0')} · ALT ${Math.round(ap.altitudeBug)}`

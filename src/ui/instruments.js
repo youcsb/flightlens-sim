@@ -1127,14 +1127,23 @@ function buildCompact(u) {
   );
 
   /**
-   * PORTRAIT SHOWS THE BALL ONLY.
+   * THE COMPACT HUD SHOWS THE BALL ONLY, IN BOTH ORIENTATIONS.
    *
    * The cluster is an attitude ball plus what this file calls the demoted
-   * column — RPM, flaps, gear/brake lamps, nearest field — and in portrait the
-   * whole thing sits under the heading strip, in the windscreen. Reported as
-   * "the gauge under the compass is too in the way", and it is: 168 x 100 on a
-   * 390 px screen is 43% of the width, parked exactly where you look when the
-   * aeroplane is banked over.
+   * column — RPM, flaps, gear/brake lamps, nearest field — and on a phone the
+   * whole thing sits under the heading strip, IN THE WINDSCREEN. Reported twice:
+   * first in portrait, then in landscape as "the ball gear with blue and brown
+   * + other info is over the graphics of where I am flying".
+   *
+   * Moving it does not help, and that is worth recording because it is the
+   * obvious idea. Both side edges are already full top to bottom — MENU and the
+   * airspeed tape on the left, the A/P chip and the altitude tape on the right —
+   * and the heading strip cannot go in a corner because it is a 300-unit ribbon
+   * showing a SCALE either side of the current heading; narrow it and it
+   * degrades into a number the tapes already show. The only free space is the
+   * centre, which is exactly the space that must stay clear.
+   *
+   * So the fix is footprint, not position: crop to the ball and shrink it.
    *
    * The column is the half worth losing on a phone. FLAP and BRK are already
    * touch buttons that show their own state, and the throttle slider carries
@@ -1147,23 +1156,7 @@ function buildCompact(u) {
    * the column off. One attribute, switched with the orientation.
    */
   const cluSvg = cluBox.firstElementChild;
-  const portraitMq =
-    typeof window !== 'undefined' && window.matchMedia
-      ? window.matchMedia('(orientation: portrait)')
-      : null;
-  const applyCluCrop = () => {
-    if (!cluSvg) return;
-    const portrait = portraitMq ? portraitMq.matches : false;
-    cluSvg.setAttribute(
-      'preserveAspectRatio',
-      portrait ? 'xMinYMid slice' : 'xMidYMid meet',
-    );
-  };
-  applyCluCrop();
-  if (portraitMq) {
-    if (portraitMq.addEventListener) portraitMq.addEventListener('change', applyCluCrop);
-    else if (portraitMq.addListener) portraitMq.addListener(applyCluCrop);
-  }
+  if (cluSvg) cluSvg.setAttribute('preserveAspectRatio', 'xMinYMid slice');
 
   // The stall banner is plain DOM: it is a word on a red field that blinks, and
   // an SVG for that would cost a viewBox and buy nothing.
@@ -1310,11 +1303,15 @@ function compactStyleSheet(u) {
    So the cluster scales with the height it actually has. It scales as a whole
    rather than dropping a row, because a row that is sometimes there is worse
    than one that never is. */
-@media (orientation: landscape) and (max-height: 430px) {
-  .${u}-w-clu { width: 172px; height: 98px; }
+/* Landscape is SHORT: the touch controls take the bottom, so the windscreen is
+   a thin band and anything sitting in it is in the way. The ball only, small.
+   The 112:124 aspect is what makes the crop land exactly at the ball's edge —
+   see applyCluCrop; any other ratio leaks the demoted column back in. */
+@media (orientation: landscape) {
+  .${u}-w-clu { width: 84px; height: 93px; }
 }
 @media (orientation: landscape) and (max-height: 340px) {
-  .${u}-w-clu { width: 150px; height: 84px; }
+  .${u}-w-clu { width: 72px; height: 80px; }
 }
 `;
 }
@@ -1729,6 +1726,14 @@ export function createInstruments(container, opts = {}) {
   }
 
   // -------------------------------------------------------------------------
+  /* Last values written to the demoted column. The compact HUD crops that
+     column out of the windscreen, so these are what `info()` hands to
+     overlay.js to show in the status panel — which reparents into the menu
+     sheet on a phone. Cropped from the view, not lost. */
+  let lastRpm = 0;
+  let lastNearest = '----';
+  let lastNearestSub = '';
+
   // Displayed (smoothed) values. These are what the needles actually show; the
   // state supplies the targets, and every one is chased, never copied.
   // -------------------------------------------------------------------------
@@ -2055,6 +2060,7 @@ export function createInstruments(container, opts = {}) {
     setAttr(el.rpmBar, 'width', (rpmFrac * (C_CLU_W - 122)).toFixed(2));
     setAttr(el.rpmBar, 'fill', d.rpm > TACH_REDLINE ? RED : d.rpm >= TACH_GREEN_LO ? GREEN : CYAN);
     setText(el.rpmV, group(d.rpm));
+    lastRpm = Math.round(d.rpm);
 
     // --- flaps -------------------------------------------------------------
     if (hasFlap) {
@@ -2092,14 +2098,16 @@ export function createInstruments(container, opts = {}) {
     if (!n) {
       setText(el.nrst, '----');
       setText(el.nrstSub, 'no airport data');
+      lastNearest = '----';
+      lastNearestSub = 'no airport data';
       return;
     }
     const nm = n.distanceM * M_TO_NM;
+    const sub = `${nm.toFixed(nm < 10 ? 1 : 0)} NM  ${pad3(Math.round(n.bearingDeg))}°`;
     setText(el.nrst, n.airport.ident);
-    setText(
-      el.nrstSub,
-      `${nm.toFixed(nm < 10 ? 1 : 0)} NM  ${pad3(Math.round(n.bearingDeg))}°`,
-    );
+    setText(el.nrstSub, sub);
+    lastNearest = n.airport.ident;
+    lastNearestSub = sub;
   }
 
   function dispose() {
@@ -2118,6 +2126,13 @@ export function createInstruments(container, opts = {}) {
   return {
     update,
     dispose,
+    /**
+     * The readouts the compact HUD crops away, for whoever wants to show them
+     * elsewhere. `overlay.js` puts them in the status panel, which reparents
+     * into the menu sheet on a phone — so cropping the cluster hides them from
+     * the windscreen without losing them.
+     */
+    info: () => ({ rpm: lastRpm, nearest: lastNearest, nearestSub: lastNearestSub }),
     root,
     /** 'panel' | 'compact'. For the acceptance check and the console. */
     getLayout: () => layout,

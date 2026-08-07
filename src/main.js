@@ -733,6 +733,10 @@ async function boot() {
     //    not off an event, so it survives a paused frame and a camera change.
     instruments.update(state, inputs);
     overlay.setAutopilot(autopilot);
+    // The compact HUD crops RPM and the nearest field off the windscreen; the
+    // status panel carries them instead (and reparents into the menu sheet on
+    // a phone). instruments owns the values because it owns the lookup.
+    overlay.setFlightInfo(instruments.info());
     overlay.setCrashed(state.crashed, state.crashDetail);
     if (state.crashed !== crashLogged) {
       crashLogged = state.crashed;
