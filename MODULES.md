@@ -1084,13 +1084,60 @@ to `state`.
 ### 2.11 `src/ui/instruments.js` — the display boundary
 
 ```js
-createInstruments(container) -> { update(state) }
+createInstruments(container, opts?) -> {
+  update(state, inputs?), dispose(), root,
+  getLayout() -> 'panel' | 'compact',
+  setLayout('auto'|'panel'|'compact') -> layout,
+}
+COMPACT_QUERY   // '(max-width: 820px), (max-height: 460px)'
+TOUCH_RESERVE   // {landscape:{w:200,h:200}, portrait:{w:200,h:260}}  CSS px
+pickLayout(pref?) -> 'panel' | 'compact'
+opts = { layout: 'auto' }   // 'auto' also honours ?hud=compact|panel
 ```
 
 The **only** place in the codebase allowed to speak imperial. Reads the
 pre-computed display fields; never does physics, never converts units itself,
 never writes back to `state`. Owns its own child nodes and must not clear
 siblings.
+
+**TWO LAYOUTS, PICKED BY VIEWPORT — NEVER BY TIER AND NEVER BY USER AGENT.**
+`panel` is the seven-dial strip. `compact` is a moving-tape HUD: airspeed tape
+left, altitude tape plus VSI bar right, heading strip top, attitude ball
+bottom-centre, and the rest demoted (turn rate and slip fold into the ball,
+the tachometer into a bar with the same redline, radio altitude under the
+altimeter). The stall warning is promoted OUT of the panel into a banner
+across the top. Dropped on a phone: Hobbs, Kollsman, three greens on a
+fixed-gear aeroplane, lat/lon.
+
+Measured at 812x375, which is an iPhone in landscape: the seven-dial strip
+renders **508 x 101 px — 67.5 px dials, 6.0 px airspeed numerals and 4.0 px
+data-strip labels**. That is the whole argument. The compact HUD's primary
+readouts render **24 / 21 / 17 px** (airspeed / altitude / heading) and the
+whole HUD covers **20.9%** of the screen against the strip's 16.9%.
+
+The breakpoint is deliberately **not** `device.js`'s tier: a desktop window
+dragged narrow has the same problem, `?tier=phone` on a desktop must still be
+measurable, and a tablet at 1180x820 legitimately fits the dials. Verified
+live: `?tier=desktop` at 812x375 still gets the compact HUD.
+
+**`TOUCH_RESERVE` is a contract with `controls/input.js`'s touch layer.**
+Nothing `instruments.js` or `overlay.js` draws enters a `w x h` rectangle in
+either bottom corner, measured inside the safe-area insets. The numbers are
+measured against the shipped touch layer, not guessed — at 667x375 its stick is
+`(14,194) 113x113` and its throttle `(577,177) 76x130`, both inside 200x200;
+at 375x812 its topmost control is 243 px off the bottom, inside the portrait
+260. In portrait the whole bottom 260 px is left clear and the measured
+clearance between the two layers is 25 px.
+
+**Safe areas are live in both layouts**, and `overlay.js` adds
+`viewport-fit=cover` to the viewport meta at construction — without it every
+`env(safe-area-inset-*)` in this project is a hard zero on iOS and a
+safe-area-aware layout is indistinguishable from one that never tried.
+
+Swapping layouts keeps the smoothed values, so rotating a phone re-draws the
+same readings instead of sweeping every needle up from the stop. Asserted by
+`npm run check:instruments` — 117 assertions, of which 59 are the compact HUD,
+the layout swap and the thumb zones.
 
 ### 2.12 `src/controls/input.js` — a pure sensor
 

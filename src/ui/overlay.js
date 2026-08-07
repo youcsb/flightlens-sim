@@ -16,7 +16,49 @@
  *
  * 2. **It owns its own subtree and touches nothing else.** `instruments.js`
  *    mounts into the same container and neither may clear the other.
+ *
+ *    One documented exception: the `viewport` meta tag. `env(safe-area-inset-*)`
+ *    is a hard zero on iOS unless the viewport carries `viewport-fit=cover`, so
+ *    without it every safe-area offset in this file and in instruments.js is a
+ *    no-op and the place picker sits under the notch. It is set here, idempotently,
+ *    because this module owns the page chrome and because doing it in JS cannot
+ *    collide with an edit to `index.html` (see ensureViewportFit).
+ *
+ * ---------------------------------------------------------------------------
+ * THE PHONE STORY
+ * ---------------------------------------------------------------------------
+ * Below the COMPACT_QUERY breakpoint (the same one instruments.js switches its
+ * layout on — imported, not copied, so the two cannot disagree) the chrome
+ * collapses to three always-visible things and a sheet:
+ *
+ *   MENU button   top left     opens the sheet
+ *   A/P chip      top right    the autopilot annunciator, which must never be
+ *                              behind a tap — it is how the player knows the
+ *                              autopilot is flying
+ *   toast         top centre   unchanged, moved clear of the heading strip
+ *
+ * Everything else — the place picker, the status rows, the key legend — is
+ * REPARENTED into the sheet rather than duplicated, so `setActive`, `setCamera`
+ * and friends keep writing to the same nodes in both layouts.
+ *
+ * The key legend is a desktop artefact: a phone has no keyboard, and listing
+ * "W / S nose down / up" to someone who cannot press W is worse than showing
+ * nothing. On a coarse pointer the sheet shows TAPPABLE actions instead, which
+ * synthesise the keystroke their desktop equivalent would send (or call
+ * `o.onAction(code)` if the integrator supplies one).
+ *
+ * THE TWO BOTTOM CORNERS BELONG TO THE TOUCH CONTROLS. Nothing in this file is
+ * positioned into TOUCH_RESERVE; the sheet is centred and the chips are along
+ * the top.
  */
+
+import { COMPACT_QUERY, TOUCH_RESERVE, pickLayout } from './instruments.js';
+
+/** Safe-area shorthands. A device without a notch answers 0px, which is right. */
+const SL = 'env(safe-area-inset-left, 0px)';
+const SR = 'env(safe-area-inset-right, 0px)';
+const ST = 'env(safe-area-inset-top, 0px)';
+const SB = 'env(safe-area-inset-bottom, 0px)';
 
 const CSS = `
 .ovl, .ovl * { box-sizing: border-box; }
@@ -24,6 +66,11 @@ const CSS = `
   position: absolute; inset: 0; pointer-events: none;
   font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: #cfd8e3; -webkit-font-smoothing: antialiased;
+  /* ABOVE the instrument panel, which sits at z-index 20. Without this the
+     compact menu sheet — and the boot screen — render UNDER the tapes, which
+     is invisible on a desktop (the panel is bottom-centre, the chrome is at
+     the edges) and glaring the moment the HUD moves to the screen edges. */
+  z-index: 30;
 }
 .ovl-panel {
   position: absolute; pointer-events: auto;
@@ -34,7 +81,7 @@ const CSS = `
   box-shadow: 0 6px 22px rgba(0,0,0,0.45);
   padding: 9px 10px;
 }
-.ovl-places { top: 12px; left: 12px; width: 216px; }
+.ovl-places { top: calc(${ST} + 12px); left: calc(${SL} + 12px); width: 216px; }
 .ovl-h {
   font-size: 9.5px; letter-spacing: 0.16em; text-transform: uppercase;
   color: #7f93ad; margin-bottom: 7px;
@@ -58,7 +105,7 @@ const CSS = `
 .ovl-btn.on .sub { color: #a9c8ea; }
 
 .ovl-status {
-  top: 12px; right: 12px; min-width: 176px; text-align: right;
+  top: calc(${ST} + 12px); right: calc(${SR} + 12px); min-width: 176px; text-align: right;
   pointer-events: none; padding: 8px 10px;
 }
 .ovl-status div { white-space: nowrap; }
@@ -68,19 +115,20 @@ const CSS = `
 /* The instrument panel owns the bottom ~210 px of the window and runs the full
    width, so the key legend sits ABOVE it rather than beside it. */
 .ovl-keys {
-  bottom: 226px; left: 12px; width: 248px;
+  bottom: calc(${SB} + 226px); left: calc(${SL} + 12px); width: 248px;
   max-height: calc(100vh - 420px); overflow: hidden;
 }
 .ovl-keys table { border-collapse: collapse; width: 100%; }
 .ovl-keys td { padding: 1.5px 0; vertical-align: top; white-space: nowrap; }
 .ovl-keys td.k { color: #8fb4de; width: 84px; padding-right: 8px; }
 .ovl-hint {
-  position: absolute; bottom: 226px; left: 12px; pointer-events: auto;
+  position: absolute; bottom: calc(${SB} + 226px); left: calc(${SL} + 12px);
+  pointer-events: auto;
   cursor: pointer; color: #7f93ad; background: rgba(10,14,20,0.6);
   border: 1px solid rgba(150,175,205,0.18); border-radius: 7px; padding: 4px 8px;
 }
 .ovl-toast {
-  position: absolute; left: 50%; top: 74px; transform: translateX(-50%);
+  position: absolute; left: 50%; top: calc(${ST} + 74px); transform: translateX(-50%);
   pointer-events: none; padding: 6px 14px; border-radius: 20px;
   background: rgba(10,14,20,0.8); border: 1px solid rgba(150,175,205,0.28);
   color: #ffffff; opacity: 0; transition: opacity 220ms ease;
@@ -90,7 +138,7 @@ const CSS = `
 /* A band, not a curtain. The chase camera frames the aeroplane dead centre, so
    anything drawn there hides the one thing the user is looking at. */
 .ovl-paused {
-  position: absolute; left: 0; right: 0; top: 0; display: none;
+  position: absolute; left: 0; right: 0; top: ${ST}; display: none;
   justify-content: center; pointer-events: none;
   background: linear-gradient(rgba(4,7,11,0.72), rgba(4,7,11,0));
   padding: 10px 0 26px;
@@ -104,7 +152,7 @@ const CSS = `
    frames the aeroplane dead centre and the wreck is the thing worth looking at.
    It sits below the toast so a "reset · KBFI" toast is still readable. */
 .ovl-crash {
-  position: absolute; left: 50%; top: 108px; transform: translateX(-50%);
+  position: absolute; left: 50%; top: calc(${ST} + 108px); transform: translateX(-50%);
   display: none; pointer-events: none; text-align: center;
   padding: 12px 22px; border-radius: 10px;
   background: rgba(38,8,10,0.86); border: 1px solid rgba(255,120,120,0.55);
@@ -137,10 +185,125 @@ const CSS = `
   0%   { transform: translateX(-100%); }
   100% { transform: translateX(340%); }
 }
-/* Too little room to show the legend without covering the windscreen. */
+/* Too little room to show the legend without covering the windscreen.
+   The CHILD combinator matters: once compact mode reparents the legend into
+   the sheet it is no longer a child of .ovl, this rule stops applying, and a
+   narrow desktop window — which still has a keyboard — gets its legend back
+   inside the menu. Only the coarse-pointer rule below takes it away for good. */
 @media (max-width: 900px), (max-height: 700px) {
-  .ovl-keys, .ovl-hint { display: none !important; }
+  .ovl > .ovl-keys, .ovl > .ovl-hint { display: none !important; }
 }
+
+/* =========================================================================
+   COMPACT — everything below here is inert until JS adds .ovl-c to the root.
+   A class, not a media query, so this file and instruments.js switch on the
+   SAME decision (including the ?hud= override) and can never disagree about
+   which layout is on screen.
+   ========================================================================= */
+
+/* The three always-visible chips. */
+.ovl-menu, .ovl-ap {
+  position: absolute; display: none; pointer-events: auto;
+  background: rgba(10,14,20,0.72);
+  border: 1px solid rgba(150,175,205,0.22); border-radius: 8px;
+  backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px);
+  color: #cfd8e3; font: inherit; cursor: pointer;
+  min-height: 34px; padding: 0 12px; line-height: 32px; white-space: nowrap;
+}
+.ovl-c .ovl-menu, .ovl-c .ovl-ap { display: block; }
+.ovl-menu { top: calc(${ST} + 6px); left: calc(${SL} + 8px); letter-spacing: 0.12em; }
+.ovl-ap {
+  top: calc(${ST} + 6px); right: calc(${SR} + 8px);
+  pointer-events: none; color: #7f93ad; letter-spacing: 0.06em;
+}
+.ovl-ap.on {
+  color: #0b0d10; background: #3fb96b; border-color: #7fe0a4; font-weight: 700;
+}
+
+/* On a phone the panels move INSIDE the sheet, so their absolute positions,
+   fixed widths and backdrop go away and the sheet lays them out in flow. */
+.ovl-c .ovl-places, .ovl-c .ovl-status, .ovl-c .ovl-keys, .ovl-c .ovl-hint {
+  display: none;
+}
+.ovl-sheet-body .ovl-panel {
+  position: static; width: auto; min-width: 0; text-align: left;
+  background: none; border: none; box-shadow: none; backdrop-filter: none;
+  -webkit-backdrop-filter: none; padding: 0; margin-bottom: 14px;
+  display: block !important; max-height: none; overflow: visible;
+}
+.ovl-sheet-body .ovl-status div { display: flex; justify-content: space-between; }
+
+/* The sheet itself. Centred, never in a bottom corner — those are thumbs. */
+.ovl-sheet {
+  position: absolute; inset: 0; display: none; pointer-events: auto;
+  background: rgba(4,6,9,0.62);
+  align-items: center; justify-content: center;
+  padding: calc(${ST} + 8px) calc(${SR} + 8px) calc(${SB} + 8px) calc(${SL} + 8px);
+}
+.ovl-sheet.show { display: flex; }
+.ovl-sheet-card {
+  width: min(420px, 100%); max-height: 100%; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  background: rgba(10,14,20,0.94);
+  border: 1px solid rgba(150,175,205,0.28); border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.6); padding: 12px 12px 14px;
+}
+.ovl-sheet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+}
+.ovl-sheet-head b { font-size: 12px; letter-spacing: 0.2em; font-weight: 600; }
+.ovl-x {
+  pointer-events: auto; cursor: pointer; background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(150,175,205,0.22); border-radius: 8px; color: #d7e2ee;
+  font: inherit; width: 38px; height: 38px; line-height: 1;
+}
+/* Actions: what the keyboard shortcuts are, for a device with no keyboard. */
+.ovl-acts-wrap { margin-bottom: 2px; }
+.ovl-acts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
+.ovl-acts button {
+  pointer-events: auto; cursor: pointer; min-height: 44px;
+  background: rgba(255,255,255,0.045);
+  border: 1px solid rgba(150,175,205,0.16); border-radius: 8px;
+  color: #d7e2ee; font: inherit; padding: 4px 2px;
+}
+.ovl-acts button:active { background: rgba(120,180,255,0.22); }
+
+/* Bigger targets wherever a finger is the pointer, sheet or not. */
+@media (pointer: coarse) {
+  .ovl-btn { min-height: 44px; padding: 7px 10px; }
+  .ovl-menu, .ovl-ap { min-height: 38px; line-height: 36px; }
+}
+/* No keyboard, no key legend — see the header note. */
+@media (pointer: coarse) and (any-pointer: coarse) and (hover: none) {
+  .ovl-sheet-body .ovl-keys { display: none !important; }
+}
+
+/* Landscape is the primary orientation; portrait gets a chip that says so and
+   then gets out of the way. It sits mid-screen, clear of both thumb corners. */
+.ovl-rotate {
+  position: absolute; left: 50%; transform: translateX(-50%);
+  bottom: calc(${SB} + ${TOUCH_RESERVE.portrait.h}px + 150px);
+  display: none; pointer-events: auto; cursor: pointer;
+  padding: 7px 14px; border-radius: 20px;
+  background: rgba(10,14,20,0.82); border: 1px solid rgba(150,175,205,0.3);
+  color: #cfd8e3; opacity: 1; transition: opacity 500ms ease;
+}
+@media (orientation: portrait) {
+  .ovl-c .ovl-rotate { display: block; }
+}
+.ovl-rotate.gone { opacity: 0; pointer-events: none; }
+
+/* Compact toast: clear of the heading strip instruments.js puts at the top. */
+.ovl-c .ovl-toast { top: calc(${ST} + 108px); max-width: 74vw; white-space: normal;
+                    text-align: center; }
+@media (orientation: portrait) { .ovl-c .ovl-toast { top: calc(${ST} + 152px); } }
+.ovl-c .ovl-crash { top: calc(${ST} + 150px); padding: 9px 14px; }
+.ovl-c .ovl-crash .h { font-size: 13px; }
+.ovl-c .ovl-crash .d { font-size: 11px; }
+.ovl-c .ovl-paused { padding: 6px 0 18px; }
+.ovl-c .ovl-paused span { font-size: 12px; }
+.ovl-load { padding: ${ST} ${SR} ${SB} ${SL}; }
 `;
 
 /**
@@ -153,6 +316,8 @@ const CSS = `
 export function createOverlay(container, o = {}) {
   const host = container || document.body;
   const locations = o.locations || [];
+
+  ensureViewportFit();
 
   const root = document.createElement('div');
   root.className = 'ovl';
@@ -176,6 +341,7 @@ export function createOverlay(container, o = {}) {
       // Blur FIRST. A focused button eats Space and the arrow keys, and the
       // arrow keys are the elevator.
       b.blur();
+      closeSheet(); // no-op on desktop, where the picker is not in a sheet
       if (typeof o.onGoto === 'function') o.onGoto(i);
     });
     places.appendChild(b);
@@ -211,6 +377,51 @@ export function createOverlay(container, o = {}) {
   });
   root.appendChild(hint);
 
+  // --- compact chrome -----------------------------------------------------
+  // Three chips and a sheet. Built unconditionally and left `display: none` by
+  // the stylesheet until `.ovl-c` is on the root: building them lazily would
+  // mean the first frame after a rotation has no autopilot annunciator.
+  const menuBtn = document.createElement('button');
+  menuBtn.className = 'ovl-menu';
+  menuBtn.type = 'button';
+  menuBtn.textContent = '☰ MENU';
+  root.appendChild(menuBtn);
+
+  // The autopilot annunciator's compact home. It is `pointer-events: none` and
+  // it is never inside the sheet, because "is the autopilot flying?" has to be
+  // answerable without opening anything.
+  const apChip = document.createElement('div');
+  apChip.className = 'ovl-ap';
+  apChip.textContent = 'A/P OFF';
+  root.appendChild(apChip);
+
+  const rotateEl = document.createElement('div');
+  rotateEl.className = 'ovl-rotate';
+  rotateEl.textContent = '⟳  turn sideways to fly';
+  root.appendChild(rotateEl);
+
+  const sheet = document.createElement('div');
+  sheet.className = 'ovl-sheet';
+  sheet.innerHTML =
+    '<div class="ovl-sheet-card">' +
+    '<div class="ovl-sheet-head"><b>MENU</b>' +
+    '<button class="ovl-x" type="button" aria-label="close">✕</button></div>' +
+    '<div class="ovl-sheet-body"></div></div>';
+  const sheetBody = sheet.querySelector('.ovl-sheet-body');
+  root.appendChild(sheet);
+
+  // The actions block. On a phone these ARE the keyboard: each button sends
+  // the keystroke its desktop equivalent would send, so main.js needs no new
+  // callback and cannot drift out of sync with the legend.
+  const acts = document.createElement('div');
+  acts.className = 'ovl-acts-wrap';
+  acts.innerHTML =
+    '<div class="ovl-h">Controls</div><div class="ovl-acts">' +
+    ACTIONS.map(
+      (a) => `<button type="button" data-code="${a[0]}"${a[2] ? ' data-hold="1"' : ''}>${esc(a[1])}</button>`,
+    ).join('') +
+    '</div>';
+
   // --- toast / paused / loading ------------------------------------------
   const toastEl = document.createElement('div');
   toastEl.className = 'ovl-toast';
@@ -244,6 +455,104 @@ export function createOverlay(container, o = {}) {
   let keysShown = true;
   let crashShown = false;
   let crashText = '';
+  let rotateTimer = 0;
+
+  // -------------------------------------------------------------------------
+  // Compact mode: reparent, do not duplicate.
+  // -------------------------------------------------------------------------
+  /** null until applyMode() runs, so the first call always does the work. */
+  let compact = null;
+
+  function applyMode(next) {
+    if (next === compact) return;
+    compact = next;
+    root.classList.toggle('ovl-c', next);
+    if (next) {
+      // Same nodes, new parent — every setter in the returned handle keeps
+      // working, and `setActive` still lights the button the user tapped.
+      sheetBody.appendChild(places);
+      sheetBody.appendChild(status);
+      sheetBody.appendChild(acts);
+      sheetBody.appendChild(keys);
+      keys.style.display = ''; // the sheet decides, not the H key
+    } else {
+      // insertBefore, not appendChild: appending would move these three PAST
+      // the loading screen in document order, and they would paint on top of
+      // it for the whole of the boot.
+      root.insertBefore(places, menuBtn);
+      root.insertBefore(status, menuBtn);
+      root.insertBefore(keys, menuBtn);
+      if (acts.parentNode) acts.parentNode.removeChild(acts);
+      keys.style.display = keysShown ? '' : 'none';
+      closeSheet();
+    }
+  }
+
+  function openSheet() {
+    sheet.classList.add('show');
+  }
+  function closeSheet() {
+    sheet.classList.remove('show');
+  }
+
+  menuBtn.addEventListener('click', () => {
+    menuBtn.blur();
+    if (sheet.classList.contains('show')) closeSheet();
+    else openSheet();
+  });
+  sheet.querySelector('.ovl-x').addEventListener('click', (e) => {
+    e.target.blur();
+    closeSheet();
+  });
+  // A tap on the scrim, not on the card, dismisses.
+  sheet.addEventListener('click', (e) => {
+    if (e.target === sheet) closeSheet();
+  });
+
+  // Rotate hint: say it once, then get out of the way. It is a chip, not a
+  // curtain — portrait is a WORSE layout here, not a broken one, and locking
+  // the player out of their own aeroplane over an orientation is not graceful.
+  let rotateDismissed = false;
+  rotateEl.addEventListener('click', () => {
+    rotateDismissed = true;
+    clearTimeout(rotateTimer);
+    rotateEl.classList.add('gone');
+  });
+  function armRotateHint() {
+    if (rotateDismissed || typeof setTimeout !== 'function') return;
+    clearTimeout(rotateTimer);
+    rotateEl.classList.remove('gone');
+    rotateTimer = setTimeout(() => rotateEl.classList.add('gone'), 7000);
+  }
+  armRotateHint();
+  // Re-arm on every ENTRY into portrait. Without this the hint is spent seven
+  // seconds after boot, so the player who boots in landscape and then turns the
+  // phone upright — the only person it is for — never sees it.
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    const pmq = window.matchMedia('(orientation: portrait)');
+    const onP = (e) => {
+      if (e.matches) armRotateHint();
+    };
+    if (typeof pmq.addEventListener === 'function') pmq.addEventListener('change', onP);
+    else if (typeof pmq.addListener === 'function') pmq.addListener(onP);
+  }
+
+  // --- action buttons ------------------------------------------------------
+  wireActions(acts, (code) => {
+    if (typeof o.onAction === 'function') o.onAction(code);
+    else fireKey(code);
+    if (code === 'KeyR' || code === 'KeyP') closeSheet();
+  });
+
+  // --- which mode? ---------------------------------------------------------
+  let mq = null;
+  const onMq = () => applyMode(wantCompact());
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    mq = window.matchMedia(COMPACT_QUERY);
+    if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onMq);
+    else if (typeof mq.addListener === 'function') mq.addListener(onMq);
+  }
+  applyMode(wantCompact());
 
   function row(parent, label) {
     const d = document.createElement('div');
@@ -253,6 +562,13 @@ export function createOverlay(container, o = {}) {
   }
 
   function toggleKeys() {
+    // On a phone the legend lives in the sheet, so H — which a phone does not
+    // have anyway, but a Bluetooth keyboard does — toggles the sheet instead.
+    if (compact) {
+      if (sheet.classList.contains('show')) closeSheet();
+      else openSheet();
+      return;
+    }
     keysShown = !keysShown;
     keys.style.display = keysShown ? '' : 'none';
     hint.style.display = keysShown ? 'none' : '';
@@ -303,6 +619,12 @@ export function createOverlay(container, o = {}) {
       if (stAp.textContent !== txt) stAp.textContent = txt;
       stAp.classList.toggle('v', true);
       stAp.classList.toggle('warn', !!ap.engaged);
+
+      // The compact chip carries its own label, because on a phone the row
+      // heading ("A/P") that makes the status panel readable is gone.
+      const chip = ap.engaged ? `A/P  ${txt}` : 'A/P OFF';
+      if (apChip.textContent !== chip) apChip.textContent = chip;
+      apChip.classList.toggle('on', !!ap.engaged);
     },
     setPaused(p) {
       pausedEl.classList.toggle('show', !!p);
@@ -330,11 +652,155 @@ export function createOverlay(container, o = {}) {
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1500);
     },
+    /** True when the phone chrome is on screen. For the acceptance check. */
+    isCompact: () => !!compact,
     dispose() {
       clearTimeout(toastTimer);
+      clearTimeout(rotateTimer);
+      if (mq) {
+        if (typeof mq.removeEventListener === 'function') mq.removeEventListener('change', onMq);
+        else if (typeof mq.removeListener === 'function') mq.removeListener(onMq);
+        mq = null;
+      }
       root.remove();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Compact-mode helpers. Module scope, so they are testable and so nothing here
+// touches the DOM until a factory runs (MODULES.md §2.18 makes the same
+// argument for device.js, and for the same reason: it has to run in Node).
+// ---------------------------------------------------------------------------
+
+/**
+ * `[code, label, hold?]`. These are exactly the app-level keys `main.js`
+ * handles — the flight controls (W/A/S/D, throttle, flaps, brakes) are NOT
+ * here, because they belong to `controls/input.js` and its touch layer.
+ *
+ * `hold` marks the two that repeat: the heading bug steps one degree per press
+ * and swinging it 90 degrees by tapping is not a control.
+ */
+const ACTIONS = [
+  ['KeyC', 'VIEW'],
+  ['KeyV', 'PANEL'],
+  ['KeyT', 'TIME'],
+  ['KeyN', 'SOUND'],
+  ['KeyP', 'PAUSE'],
+  ['KeyR', 'RESET'],
+  ['KeyL', 'A/P'],
+  ['KeyY', 'BUG=HDG'],
+  ['KeyU', 'ALT +100'],
+  ['KeyJ', 'ALT −100'],
+  ['BracketLeft', 'HDG −', true],
+  ['BracketRight', 'HDG +', true],
+];
+
+/** `e.code` is preferred by core/keycode.js, but send `key` too — §2.0. */
+const KEY_CHAR = {
+  KeyC: 'c', KeyV: 'v', KeyT: 't', KeyN: 'n', KeyP: 'p', KeyR: 'r',
+  KeyL: 'l', KeyY: 'y', KeyU: 'u', KeyJ: 'j',
+  BracketLeft: '[', BracketRight: ']',
+};
+
+/**
+ * Send the keystroke a desktop player would send. This is deliberately NOT a
+ * new callback into `main.js`: the switch in `main.js#onKeyDown` is already the
+ * single definition of what each action does, and a parallel path would be a
+ * second one to keep in step.
+ *
+ * `controls/input.js` uses the same trick for its own touch buttons
+ * (`TOUCH_KEY`), so the pattern is the house pattern, not an invention here.
+ */
+function fireKey(code) {
+  if (typeof window === 'undefined' || typeof KeyboardEvent !== 'function') return;
+  const init = { code, key: KEY_CHAR[code] || '', bubbles: true, cancelable: true };
+  window.dispatchEvent(new KeyboardEvent('keydown', init));
+  window.dispatchEvent(new KeyboardEvent('keyup', init));
+}
+
+/**
+ * Wire the action grid. Tap fires once; press-and-hold on a `data-hold`
+ * button repeats and accelerates, which is how the heading bug is usable at
+ * all with a thumb.
+ *
+ * NB: `main.js#onKeyDown` returns early on `e.repeat`, so a synthetic repeat
+ * flag would be swallowed. Each tick is therefore a fresh non-repeat event.
+ */
+function wireActions(host, run) {
+  const buttons = host.querySelectorAll ? host.querySelectorAll('button[data-code]') : [];
+  for (const b of buttons) {
+    const code = b.getAttribute('data-code');
+    if (!b.getAttribute('data-hold')) {
+      b.addEventListener('click', () => {
+        b.blur();
+        run(code);
+      });
+      continue;
+    }
+    let timer = 0;
+    let n = 0;
+    const stop = () => {
+      clearTimeout(timer);
+      timer = 0;
+      n = 0;
+    };
+    const step = () => {
+      run(code);
+      n += 1;
+      timer = setTimeout(step, n < 4 ? 190 : n < 14 ? 90 : 55);
+    };
+    b.addEventListener('pointerdown', (e) => {
+      if (e.preventDefault) e.preventDefault();
+      b.blur();
+      stop();
+      step();
+    });
+    for (const ev of ['pointerup', 'pointercancel', 'pointerleave']) {
+      b.addEventListener(ev, stop);
+    }
+  }
+}
+
+/**
+ * Add `viewport-fit=cover` to the page's viewport meta if it is missing.
+ *
+ * WITHOUT THIS EVERY `env(safe-area-inset-*)` IN THIS PROJECT IS ZERO. iOS only
+ * reports the insets when the page has opted into drawing under the notch and
+ * the home indicator; a page at the default `contain` fit gets a letterboxed
+ * viewport and four zeroes, so a "safe area aware" layout that has never been
+ * tested with the flag looks identical to one with no safe-area handling at
+ * all — which is exactly how this goes unnoticed.
+ *
+ * Done in JS rather than in `index.html` so it is idempotent and cannot
+ * conflict with another edit to the same tag.
+ */
+function ensureViewportFit() {
+  if (typeof document === 'undefined' || !document.querySelector) return;
+  let meta = document.querySelector('meta[name="viewport"]');
+  if (!meta) {
+    if (!document.head || !document.createElement) return;
+    meta = document.createElement('meta');
+    meta.setAttribute('name', 'viewport');
+    meta.setAttribute('content', 'width=device-width, initial-scale=1.0, viewport-fit=cover');
+    document.head.appendChild(meta);
+    return;
+  }
+  const content = meta.getAttribute('content') || '';
+  if (/viewport-fit\s*=/.test(content)) return;
+  meta.setAttribute('content', `${content.replace(/,\s*$/, '')}, viewport-fit=cover`);
+}
+
+/**
+ * The chrome and the instruments must agree about which layout is on screen —
+ * a MENU button over a seven-dial panel, or a place-picker panel over a tape
+ * HUD, are both worse than either layout alone. So this asks instruments.js
+ * rather than re-deriving it, which also picks up the `?hud=` override for
+ * free (COMPACT_QUERY is imported only so the media listener watches the same
+ * query the answer is derived from).
+ */
+function wantCompact() {
+  return pickLayout('auto') === 'compact';
 }
 
 const KEYMAP = [

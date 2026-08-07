@@ -105,7 +105,9 @@ globalThis.document = {
 let clockMs = 0;
 globalThis.performance = { now: () => clockMs };
 
-const { createInstruments } = await import('../src/ui/instruments.js');
+const { createInstruments, TOUCH_RESERVE, COMPACT_QUERY } = await import(
+  '../src/ui/instruments.js'
+);
 
 // ---------------------------------------------------------------------------
 let failures = 0;
@@ -476,6 +478,248 @@ head('7. robustness — it must never take the frame down');
 
   a.dispose();
   ok('dispose() removes the root', a.root.removed === true);
+}
+
+// ---------------------------------------------------------------------------
+head('8. the compact HUD — the phone layout');
+// ---------------------------------------------------------------------------
+// Same failure mode as section 1, and worse: the compact layout is the ONLY
+// one a phone ever renders, so a mistyped id there is a dead gauge that no
+// desktop screenshot can show. The layout is forced rather than detected — the
+// shim has no window, so `pickLayout()` correctly answers 'panel' and the
+// seven-dial path above is what a Node run exercises by default.
+{
+  const c = createInstruments(new Node_('div'), { layout: 'compact' });
+  ok('an explicit layout is honoured', c.getLayout() === 'compact', c.getLayout());
+  ok('the root is tagged compact', [...c.root.classes].some((x) => /-compact$/.test(x)),
+    c.root.className);
+
+  // Four widgets: heading strip, airspeed tape, altitude tape, cluster.
+  const wrap = c.root.children.find((n) => n.tagName === 'div');
+  const boxes = wrap ? wrap.children.filter((n) => n.tagName === 'div') : [];
+  ok('four svg widgets plus a stall banner are mounted', boxes.length === 5, `${boxes.length}`);
+
+  const svgsC = boxes.map((b) => b.children[0]).filter(Boolean);
+  const all = new Map();
+  for (const s of svgsC) for (const [k, v] of s.byId) all.set(k, v);
+  const pre = [...all.keys()][0].split('-')[0];
+  const cn = (id) => all.get(`${pre}-${id}`);
+
+  const DRIVEN_C = [
+    'c-asi-tape', 'c-asi-v',
+    'c-alt-tape', 'c-alt-v', 'c-vsi-bar', 'c-agl',
+    'c-hdg-tape', 'c-hdg-v',
+    'c-ai-card', 'c-ai-roll', 'c-slip',
+    'c-rpm-bar', 'c-rpm-v',
+    'c-flap-0', 'c-flap-1', 'c-flap-2', 'c-flap-3', 'c-flap-v',
+    'c-lamp-gnd', 'c-lamp-brk', 'c-nrst', 'c-nrst-sub',
+  ];
+  const missC = DRIVEN_C.filter((id) => !cn(id));
+  ok('every compact node id is present', missC.length === 0, missC.join(', ') || `${DRIVEN_C.length} ids`);
+
+  const mkC = svgsC.map((s) => s.innerHTML).join('');
+  ok('nothing NaN leaked into the compact markup', !/NaN|undefined|Infinity/.test(mkC),
+    (mkC.match(/NaN|undefined|Infinity/) || [''])[0]);
+  ok('the compact HUD keeps the V-speed arcs as a band',
+    /fill="#3fb96b"/.test(mkC) && /fill="#ffb02e"/.test(mkC) && /fill="#e2453c"/.test(mkC));
+  ok('the heading strip carries N / E / S / W', /">N</.test(mkC) && /">E</.test(mkC) &&
+    /">S</.test(mkC) && /">W</.test(mkC));
+  ok('the six-pack is NOT drawn in compact mode', !/-bezel\)/.test(mkC));
+
+  const run = (st, n = 400) => {
+    for (let i = 0; i < n; i++) {
+      clockMs += 16.7;
+      c.update(st);
+    }
+  };
+  const ty = (id) => {
+    const m = (cn(id).getAttribute('transform') || '').match(/translate\(([-\d.]+) ([-\d.]+)\)/);
+    return m ? parseFloat(m[2]) : NaN;
+  };
+  const tx = (id) => {
+    const m = (cn(id).getAttribute('transform') || '').match(/translate\(([-\d.]+)/);
+    return m ? parseFloat(m[1]) : NaN;
+  };
+
+  // --- the tapes really move, and they move LINEARLY with the reading -------
+  run(makeState({ airspeedKts: 50, indicatedAirspeedKts: 50, altitudeFt: 1000, onGround: false }));
+  const a50 = ty('c-asi-tape');
+  const alt1k = ty('c-alt-tape');
+  run(makeState({ airspeedKts: 150, indicatedAirspeedKts: 150, altitudeFt: 5000, onGround: false }), 900);
+  const a150 = ty('c-asi-tape');
+  const alt5k = ty('c-alt-tape');
+  const upk = (a150 - a50) / 100;
+  const upf = (alt5k - alt1k) / 4000;
+  ok('the airspeed tape slides with the reading', a150 > a50 + 100, `${a50.toFixed(1)} -> ${a150.toFixed(1)}`);
+  ok('and its scale is linear and positive', upk > 1 && upk < 10, `${upk.toFixed(3)} units/kt`);
+  ok('the altitude tape slides with the reading', alt5k > alt1k + 100, `${alt1k.toFixed(1)} -> ${alt5k.toFixed(1)}`);
+  ok('and its scale is linear and positive', upf > 0.02 && upf < 1, `${upf.toFixed(4)} units/ft`);
+  ok('the airspeed readout shows the knots', cn('c-asi-v').textContent === '150', cn('c-asi-v').textContent);
+  ok('the altitude readout shows the feet', cn('c-alt-v').textContent === '5,000', cn('c-alt-v').textContent);
+
+  // --- vertical speed: one rect, grown from the reading line ---------------
+  run(makeState({ verticalSpeedFpm: 1000, altitudeFt: 5000, onGround: false }), 900);
+  const upY = parseFloat(cn('c-vsi-bar').getAttribute('y'));
+  const upH = parseFloat(cn('c-vsi-bar').getAttribute('height'));
+  run(makeState({ verticalSpeedFpm: -1000, altitudeFt: 5000, onGround: false }), 900);
+  const dnY = parseFloat(cn('c-vsi-bar').getAttribute('y'));
+  const dnH = parseFloat(cn('c-vsi-bar').getAttribute('height'));
+  ok('VSI bar grows UPWARD in a climb', upH > 5 && upY < dnY, `y ${upY.toFixed(1)} h ${upH.toFixed(1)}`);
+  ok('VSI bar grows DOWNWARD in a descent', dnH > 5 && Math.abs(dnY - 110) < 0.01,
+    `y ${dnY.toFixed(1)} h ${dnH.toFixed(1)}`);
+  run(makeState({ verticalSpeedFpm: 9000, altitudeFt: 5000, onGround: false }), 900);
+  const clamped = parseFloat(cn('c-vsi-bar').getAttribute('height'));
+  ok('and it clamps at full scale (2,000 fpm) rather than running off the widget',
+    Math.abs(clamped - upH * 2) < 0.5, `${clamped.toFixed(1)} units at 9,000 fpm vs ${(upH * 2).toFixed(1)} at full scale`);
+  ok('the VSI bar never leaves the tape it sits beside', clamped <= 110, `${clamped.toFixed(1)}`);
+
+  // --- heading strip: the translate must stay inside the drawn range -------
+  // The ticks are serialised once, from -50 to 410 degrees. If the translate is
+  // ever computed from an unwrapped heading the strip walks off its own ticks
+  // and the pilot gets a blank bar — silently, because nothing throws.
+  for (const h of [0, 1, 89, 90, 179, 180, 271, 330.13, 359, 359.9]) {
+    run(makeState({ headingDeg: h, onGround: false }), 700);
+    // The lubber line sits at x = 150 and shows heading H when the strip is
+    // translated to 150 - H * unitsPerDegree. Invert that and compare.
+    const shown = (150 - tx('c-hdg-tape')) / 4.1667;
+    const err = ((((shown - h) % 360) + 540) % 360) - 180;
+    ok(
+      `heading strip reads ${h} back correctly`,
+      Math.abs(err) < 1.5 && shown >= -50 && shown <= 410,
+      `strip at ${shown.toFixed(2)} deg, error ${err.toFixed(2)}`,
+    );
+  }
+  ok('the digital heading repeat agrees', cn('c-hdg-v').textContent === '360°T' ||
+    cn('c-hdg-v').textContent === '000°T', cn('c-hdg-v').textContent);
+
+  // --- attitude, and the slip bar's transform ORDER ------------------------
+  run(makeState({ pitchDeg: 8, rollDeg: 25, headingDeg: 0, onGround: false }), 900);
+  const card = cn('c-ai-card').getAttribute('transform');
+  ok('the compact attitude card banks', /rotate\(-2[45]\./.test(card), card);
+  ok('and pitches', /translate\(0 1[23]\./.test(card), card);
+  ok('the roll pointer rotates but does NOT take the pitch translation',
+    /^rotate\(-2[45]\.\d+\)$/.test(cn('c-ai-roll').getAttribute('transform')),
+    cn('c-ai-roll').getAttribute('transform'));
+  ok('the slip bar rotates FIRST and slides second (aircraft axis, not horizon)',
+    /^rotate\([-\d.]+\) translate\([-\d.]+ 0\)$/.test(cn('c-slip').getAttribute('transform')),
+    cn('c-slip').getAttribute('transform'));
+
+  // --- the demoted indicators ---------------------------------------------
+  run(makeState({ rpm: 2400, onGround: true, brakes: 1, flapsPos: 1, flaps: 1 }), 900);
+  ok('the power bar tracks rpm', parseFloat(cn('c-rpm-bar').getAttribute('width')) > 20,
+    `${cn('c-rpm-bar').getAttribute('width')} units`);
+  ok('the power readout agrees', cn('c-rpm-v').textContent === '2,400', cn('c-rpm-v').textContent);
+  ok('the power bar never overruns its track',
+    parseFloat(cn('c-rpm-bar').getAttribute('width')) <= 86.01);
+  ok('flaps read the full detent', cn('c-flap-v').textContent === '30°', cn('c-flap-v').textContent);
+  ok('GND lamp lit on the ground', cn('c-lamp-gnd').classes.has('on'));
+  ok('BRK lamp lit with the brakes on', cn('c-lamp-brk').classes.has('on'));
+  ok('nearest field survives the demotion',
+    cn('c-nrst').textContent === '----' || /^[A-Z0-9]{3,4}$/.test(cn('c-nrst').textContent),
+    cn('c-nrst').textContent);
+
+  // --- the stall warning is promoted out of the panel ----------------------
+  const stallEl = boxes[boxes.length - 1];
+  run(makeState({ onGround: false, stallWarning: true }), 200);
+  ok('the stall banner lights STEADY on the buffet',
+    stallEl.classes.has('on') && !stallEl.classes.has('blink'), stallEl.className);
+  run(makeState({ onGround: false, stallWarning: true, stalled: true }), 200);
+  ok('and FLASHES once the wing lets go',
+    stallEl.classes.has('on') && stallEl.classes.has('blink'), stallEl.className);
+  run(makeState({ onGround: false }), 200);
+  ok('and goes out again', !stallEl.classes.has('on'));
+
+  // --- robustness ----------------------------------------------------------
+  let threwC = null;
+  try {
+    c.update(null);
+    c.update({});
+    c.update(makeState({ airspeedKts: NaN, altitudeFt: Infinity, headingDeg: NaN, rpm: -1,
+      verticalSpeedFpm: NaN, pitchDeg: 1e9, rollDeg: -1e9, lat: NaN, lon: NaN }));
+    run(makeState({ airspeedKts: 90, indicatedAirspeedKts: 90, onGround: false }), 30);
+  } catch (e) {
+    threwC = e;
+  }
+  ok('the compact HUD survives null / NaN / Infinity state', !threwC, threwC ? threwC.message : '');
+  const attrsC = [...all.values()].flatMap((n) => [...n.attrs.values(), n.textContent]);
+  ok('no NaN written into any compact attribute', !attrsC.some((v) => /NaN|Infinity/.test(v)),
+    attrsC.find((v) => /NaN|Infinity/.test(v)) || '');
+}
+
+// ---------------------------------------------------------------------------
+head('9. swapping layouts must not jolt a needle');
+// ---------------------------------------------------------------------------
+// Rotating a phone crosses the breakpoint, which tears the DOM down and builds
+// the other layout. The SMOOTHED values have to survive that: rebuilding from
+// zero would send every needle sweeping up from the stop, mid-flight.
+{
+  const c = createInstruments(new Node_('div'), { layout: 'compact' });
+  const cruise = makeState({ airspeedKts: 120, indicatedAirspeedKts: 120, altitudeFt: 3000,
+    headingDeg: 90, rpm: 2400, onGround: false });
+  for (let i = 0; i < 600; i++) {
+    clockMs += 16.7;
+    c.update(cruise);
+  }
+  ok('starts compact', c.getLayout() === 'compact');
+  c.setLayout('panel');
+  ok('swaps to the seven-dial panel', c.getLayout() === 'panel');
+  clockMs += 16.7;
+  c.update(cruise);
+
+  const s2 = c.root.children.find((n) => n.tagName === 'svg');
+  const pre2 = [...s2.byId.keys()][0].split('-')[0];
+  const asiRot = parseFloat(
+    s2.byId.get(`${pre2}-asi-n`).getAttribute('transform').match(/rotate\(([-\d.]+)\)/)[1],
+  );
+  const want = 210 + ((120 - 40) / 160) * 330;
+  ok('the airspeed needle is ALREADY at 120 kt on the first frame after the swap',
+    Math.abs(asiRot - want) < 2, `${asiRot.toFixed(1)} vs ${want.toFixed(1)} deg`);
+  ok('the heading card is already at 090',
+    Math.abs(parseFloat(
+      s2.byId.get(`${pre2}-hi-card`).getAttribute('transform').match(/rotate\(([-\d.]+)\)/)[1],
+    ) + 90) < 2);
+
+  c.setLayout('compact');
+  clockMs += 16.7;
+  c.update(cruise);
+  ok('and back again', c.getLayout() === 'compact');
+}
+
+// ---------------------------------------------------------------------------
+head('10. the thumb zones are declared, and the stylesheet uses them');
+// ---------------------------------------------------------------------------
+{
+  ok('TOUCH_RESERVE is frozen', Object.isFrozen(TOUCH_RESERVE) &&
+    Object.isFrozen(TOUCH_RESERVE.landscape));
+  ok('landscape reserves a corner big enough for a thumb',
+    TOUCH_RESERVE.landscape.w >= 160 && TOUCH_RESERVE.landscape.h >= 150,
+    `${TOUCH_RESERVE.landscape.w}x${TOUCH_RESERVE.landscape.h}`);
+  ok('portrait reserves more, because it has the height to give',
+    TOUCH_RESERVE.portrait.h > TOUCH_RESERVE.landscape.h,
+    `${TOUCH_RESERVE.portrait.w}x${TOUCH_RESERVE.portrait.h}`);
+
+  // The cluster has to fit in the clear width BETWEEN the two corners on the
+  // narrowest landscape phone we target. 375x812 rotated is 812 wide, and an
+  // iPhone with a notch takes 59 px off each side in landscape.
+  const clear = 812 - 59 * 2 - TOUCH_RESERVE.landscape.w * 2;
+  ok('the cluster fits between the two thumb corners on a 812x375 phone',
+    clear >= 208, `${clear} px clear, cluster is 208`);
+
+  const c = createInstruments(new Node_('div'), { layout: 'compact' });
+  const css = c.root.children.find((n) => n.tagName === 'style').textContent;
+  ok('the compact stylesheet keeps off the landscape corners',
+    css.includes(`${TOUCH_RESERVE.landscape.h}px`), 'landscape reserve appears in the CSS');
+  ok('and off the portrait bottom',
+    css.includes(`${TOUCH_RESERVE.portrait.h}px`), 'portrait reserve appears in the CSS');
+  ok('every safe-area edge is honoured',
+    ['safe-area-inset-top', 'safe-area-inset-bottom', 'safe-area-inset-left',
+      'safe-area-inset-right'].every((k) => css.includes(k)));
+  ok('the compact HUD takes no pointer events at all',
+    /\.ki\d+-hud \{[^}]*pointer-events: none/.test(css) &&
+    /\.ki\d+-w \{[^}]*pointer-events: none/.test(css));
+  ok('the breakpoint is a viewport query, never a user agent',
+    /max-width|max-height/.test(COMPACT_QUERY) && !/agent|iphone|android/i.test(COMPACT_QUERY),
+    COMPACT_QUERY);
 }
 
 console.log(

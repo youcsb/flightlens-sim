@@ -63,6 +63,46 @@
  * checkable at a glance: sit on the ground and the panel should read KBFI at
  * 0.0 NM and 47.5167 / -122.2913. Fly to 47.6204 / -122.3491 and the Space
  * Needle is underneath you.
+ *
+ * ---------------------------------------------------------------------------
+ * TWO LAYOUTS, ONE SET OF NUMBERS
+ * ---------------------------------------------------------------------------
+ * The row above is the DESKTOP layout. It needs about 1,100 CSS px of width
+ * before the 15 px numerals on the airspeed dial stop being readable, and it
+ * eats a 210 px band along the bottom of the window. A phone in landscape has
+ * 375 px of height in total. Shrinking seven round dials to 40 px each does not
+ * produce a small panel, it produces seven illegible smudges — every dial's
+ * information is carried by a needle ANGLE against a printed scale, and both
+ * the scale and the angle stop resolving at the same time.
+ *
+ * So the small-screen layout is a different instrument, not a smaller one:
+ * MOVING TAPES. A tape carries its number in a fixed box and its rate in the
+ * scale sliding past, which is the arrangement that survives being 66 px wide,
+ * and it is what every glass cockpit built since 1990 uses for exactly this
+ * reason. The five a pilot cannot fly without get one each —
+ *
+ *   airspeed (left tape) · attitude (bottom-centre ball) · altitude (right
+ *   tape) · heading (top tape) · vertical speed (bar beside the altitude)
+ *
+ * — and the rest is demoted rather than deleted: turn rate and slip fold into
+ * the attitude ball (a slip bar under the roll pointer), the tachometer becomes
+ * a bar with a redline, radio altitude sits under the altimeter where a real
+ * one does, and the stall warning is promoted OUT of the panel into a banner
+ * across the top, because on a phone it has to be visible without looking down.
+ * Dropped entirely: the Hobbs meter, the Kollsman window, three greens on a
+ * fixed-gear aeroplane, and lat/lon — none of them is flown by.
+ *
+ * `layout: 'auto'` picks by viewport, not by user agent (see COMPACT_QUERY),
+ * and re-picks when the window crosses the threshold. The smoothed values in
+ * `d` survive the swap, so rotating the phone does not make a needle jump.
+ *
+ * ---------------------------------------------------------------------------
+ * WHERE THE THUMBS GO
+ * ---------------------------------------------------------------------------
+ * The compact HUD is `pointer-events: none` in its entirety and it keeps out of
+ * the two bottom corners, which belong to the touch controls. See
+ * TOUCH_RESERVE below for the exact rectangles — they are exported so the
+ * acceptance check can assert nothing has crept into them.
  */
 
 import {
@@ -162,6 +202,82 @@ const TUBE_HALF_SPAN = 9.5;
 
 // --- flap detents, degrees (C172) -----------------------------------------
 const FLAP_DETENTS = [0, 10, 20, 30];
+
+// ---------------------------------------------------------------------------
+// COMPACT HUD geometry. SVG user units; each compact widget is its OWN svg
+// with its own viewBox, because they sit at four different screen edges and a
+// single viewBox would force one aspect ratio on all of them.
+//
+// The two tapes and the heading strip are drawn at FULL length and rendered
+// with preserveAspectRatio="...slice", so a short landscape window CROPS the
+// scale instead of scaling it down. That is the whole trick: the numerals stay
+// the same physical size on a 375 px-tall phone as on a 812 px-tall one, and
+// what shrinks is how many knots of scale you can see at once.
+// ---------------------------------------------------------------------------
+
+/** Airspeed / altitude tape: drawn length, and the y of the reading line. */
+const C_TAPE_H = 220;
+const C_TAPE_CY = 110;
+/** Airspeed tape width, and SVG units per knot (220 units = 68.8 kt). */
+const C_ASI_W = 66;
+const C_ASI_UPK = 3.2;
+/** Altitude widget width: 70 of tape, then the VSI column. */
+const C_ALT_W = 92;
+const C_ALT_TAPE_W = 70;
+/** SVG units per foot (220 units = 1,833 ft). */
+const C_ALT_UPF = 0.12;
+/** VSI: full scale (+-2000 fpm) reaches this far from the reading line. */
+const C_VSI_HALF = 56;
+/** Heading strip: drawn width, height, and units per degree (300 = 72 deg). */
+const C_HDG_W = 300;
+const C_HDG_H = 46;
+const C_HDG_UPD = 4.1667;
+/** The bottom-centre cluster: attitude ball plus the demoted indicators. */
+const C_CLU_W = 208;
+const C_CLU_H = 124;
+/** Attitude ball centre and radius inside the cluster. */
+const C_AI_CX = 56;
+const C_AI_CY = 60;
+const C_AI_R = 52;
+/** Units of ball travel per degree of pitch. +-20 deg fits inside the glass. */
+const C_AI_PPD = 1.6;
+/** Slip bar: how far it slides at full deflection. */
+const C_SLIP_TRAVEL = 13;
+
+/**
+ * The media query that chooses the layout. VIEWPORT, never user agent — a
+ * desktop window dragged narrow has exactly the problem a phone has, and
+ * `?tier=phone` on a desktop must be measurable (MODULES.md §2.18 makes the
+ * same argument for the budgets).
+ *
+ * 820 px of width is where the seven-dial strip's 15 px numerals fall below
+ * ~9 px; 460 px of height is where the 210 px panel band starts eating a third
+ * of the windscreen. An iPhone in landscape (812x375, or 844x390 on a 14 Pro)
+ * fails the height test; in portrait it fails the width test.
+ */
+const COMPACT_QUERY = '(max-width: 820px), (max-height: 460px)';
+
+/**
+ * THE THUMB ZONES, in CSS px, measured INSIDE the safe-area insets from the
+ * bottom-left and bottom-right corners. Nothing this module or overlay.js
+ * draws may enter them: they belong to the touch controls.
+ *
+ * Landscape is the tighter case and it is the one that binds — a 375 px-tall
+ * window has room for a 200 px-tall control zone and a 46 px heading strip and
+ * not much else, so the tapes are pushed up against the top and the cluster is
+ * squeezed into the clear width between the two corners. Portrait has height to
+ * spare, so the whole bottom third goes to the controls.
+ *
+ * BOTH NUMBERS ARE MEASURED AGAINST THE SHIPPED TOUCH LAYER, not guessed. At
+ * 667x375 its joystick occupies (14, 194) 113x113 and its throttle (577, 177)
+ * 76x130 — both inside a 200x200 corner, and NOT inside the 170 this reserved
+ * first, which is why the height is 200. At 375x812 its topmost control is at
+ * y = 569, which is 243 px off the bottom and inside the portrait 260.
+ */
+const TOUCH_RESERVE = Object.freeze({
+  landscape: Object.freeze({ w: 200, h: 200 }),
+  portrait: Object.freeze({ w: 200, h: 260 }),
+});
 
 // ---------------------------------------------------------------------------
 // Palette. Deliberately not pure white on pure black — a real instrument face
@@ -688,6 +804,374 @@ function stripContent(u) {
 }
 
 // ---------------------------------------------------------------------------
+// THE COMPACT HUD — five widgets, each its own <svg>.
+//
+// Every one of them is `pointer-events: none` and none of them may enter the
+// TOUCH_RESERVE rectangles. The CSS at the bottom of this section is where that
+// is actually enforced; these functions only draw.
+// ---------------------------------------------------------------------------
+
+/** A translucent readout box the width of a tape, centred on the reading line. */
+function cReadout(w) {
+  return (
+    `<rect x="0" y="-16" width="${w}" height="32" fill="#05070a" fill-opacity="0.94"` +
+    ` stroke="${CYAN}" stroke-width="1.2"/>`
+  );
+}
+
+/**
+ * Airspeed tape. The V-speed arcs from the round dial survive as a coloured
+ * band down the outer edge — the same numbers, in the same order, so a pilot
+ * who has learned the dial reads the tape without being told.
+ */
+function cAirspeed(u) {
+  const y = (kt) => (-kt * C_ASI_UPK).toFixed(2);
+  const band = (lo, hi, x, w, color) =>
+    `<rect x="${x}" y="${y(hi)}" width="${w}" height="${((hi - lo) * C_ASI_UPK).toFixed(2)}"` +
+    ` fill="${color}"/>`;
+
+  let m = '';
+  m += band(V_S0, V_FE, 0, 2.6, '#f0f4f8'); // white flap-operating arc, inboard
+  m += band(V_S1, V_NO, 2.6, 3.4, GREEN);
+  m += band(V_NO, V_NE, 2.6, 3.4, AMBER);
+  m += band(V_NE, 240, 2.6, 3.4, RED);
+  for (let kt = 0; kt <= 240; kt += 5) {
+    const major = kt % 10 === 0;
+    m +=
+      `<line x1="9" y1="${y(kt)}" x2="${major ? 22 : 16}" y2="${y(kt)}"` +
+      ` stroke="${major ? INK : INK_DIM}" stroke-width="${major ? 1.6 : 1.1}"/>`;
+    if (major) m += `<text x="26" y="${y(kt)}" class="t ta-start" font-size="12" fill="${INK}">${kt}</text>`;
+  }
+
+  return (
+    `<defs><clipPath id="${u}-casi"><rect x="0" y="0" width="${C_ASI_W}" height="${C_TAPE_H}"/></clipPath></defs>` +
+    `<g clip-path="url(#${u}-casi)">` +
+    `<g id="${u}-c-asi-tape" transform="translate(0 ${C_TAPE_CY})">${m}</g>` +
+    `</g>` +
+    `<g transform="translate(0 ${C_TAPE_CY})">` +
+    cReadout(C_ASI_W) +
+    `<text x="4" y="-8" class="t ta-start" font-size="7.5" fill="${INK_DIM}" letter-spacing="0.6">KT</text>` +
+    `<text id="${u}-c-asi-v" x="${C_ASI_W - 5}" y="1" class="t tn ta-end" font-size="21"` +
+    ` font-weight="600" fill="#ffffff">0</text>` +
+    `</g>`
+  );
+}
+
+/**
+ * Altitude tape, with the VSI as a bar beside it and the radio altimeter
+ * beneath it — the two things that belong next to an altimeter and nowhere
+ * else. `slice` crops this widget symmetrically about the reading line, so the
+ * VSI's full scale is kept inside +-C_VSI_HALF, which survives the crop.
+ */
+function cAltitude(u) {
+  const y = (ft) => (-ft * C_ALT_UPF).toFixed(2);
+  let m = '';
+  for (let ft = -1000; ft <= 20000; ft += 100) {
+    const major = ft % 500 === 0;
+    m +=
+      `<line x1="0" y1="${y(ft)}" x2="${major ? 14 : 7}" y2="${y(ft)}"` +
+      ` stroke="${major ? INK : INK_DIM}" stroke-width="${major ? 1.6 : 1.1}"/>`;
+    if (major) m += `<text x="18" y="${y(ft)}" class="t tn ta-start" font-size="11" fill="${INK}">${group(ft)}</text>`;
+  }
+
+  let s =
+    `<defs><clipPath id="${u}-calt"><rect x="0" y="0" width="${C_ALT_TAPE_W}" height="${C_TAPE_H}"/></clipPath></defs>` +
+    `<g clip-path="url(#${u}-calt)">` +
+    `<g id="${u}-c-alt-tape" transform="translate(0 ${C_TAPE_CY})">${m}</g>` +
+    `</g>` +
+    `<g transform="translate(0 ${C_TAPE_CY})">` +
+    cReadout(C_ALT_TAPE_W) +
+    `<text x="4" y="-8" class="t ta-start" font-size="7.5" fill="${INK_DIM}" letter-spacing="0.6">FT</text>` +
+    `<text id="${u}-c-alt-v" x="${C_ALT_TAPE_W - 5}" y="1" class="t tn ta-end" font-size="18"` +
+    ` font-weight="600" fill="#ffffff">0</text>` +
+    `</g>`;
+
+  // --- vertical speed ------------------------------------------------------
+  const vx = C_ALT_TAPE_W + 4; // 74
+  s +=
+    `<rect x="${vx + 2}" y="${C_TAPE_CY - C_VSI_HALF}" width="12" height="${C_VSI_HALF * 2}" rx="6"` +
+    ` fill="#05070a" fill-opacity="0.85" stroke="#2a323c" stroke-width="1"/>`;
+  for (const f of [-2000, -1000, 1000, 2000]) {
+    const ty = (C_TAPE_CY - (f / VSI_MAX) * C_VSI_HALF).toFixed(2);
+    s += `<line x1="${vx}" y1="${ty}" x2="${vx + 4}" y2="${ty}" stroke="${INK_DIM}" stroke-width="1.2"/>`;
+  }
+  s += `<line x1="${vx}" y1="${C_TAPE_CY}" x2="${vx + 18}" y2="${C_TAPE_CY}" stroke="${INK}" stroke-width="1.4"/>`;
+  s += `<rect id="${u}-c-vsi-bar" x="${vx + 4}" y="${C_TAPE_CY}" width="8" height="0" fill="${CYAN}"/>`;
+  s += `<text x="${vx + 8}" y="${C_TAPE_CY - C_VSI_HALF - 7}" class="t" font-size="7.5" fill="${INK_DIM}">VS</text>`;
+
+  // --- radio altitude ------------------------------------------------------
+  // Opaque backing, not just text: this block sits ON the tape, and measured
+  // at 2,000 ft AGL the label collided with the tape's own "1,000" numeral —
+  // two numbers in the same 12 px, neither readable, on the one readout that
+  // tells you about the terrain.
+  s +=
+    `<rect x="0" y="${C_TAPE_CY + 18}" width="${C_ALT_TAPE_W}" height="32" rx="4"` +
+    ` fill="#05070a" fill-opacity="0.94" stroke="#2a323c" stroke-width="1"/>`;
+  s += `<text x="4" y="${C_TAPE_CY + 26}" class="t ta-start" font-size="8" fill="${INK_DIM}" letter-spacing="0.8">RADIO ALT</text>`;
+  s +=
+    `<text id="${u}-c-agl" x="${C_ALT_TAPE_W - 20}" y="${C_TAPE_CY + 41}" class="t tn ta-end"` +
+    ` font-size="16" font-weight="600" fill="${GREEN}">0</text>`;
+  s += `<text x="${C_ALT_TAPE_W - 17}" y="${C_TAPE_CY + 42}" class="t ta-start" font-size="8.5" fill="${INK_DIM}">AGL</text>`;
+  return s;
+}
+
+/**
+ * Heading strip. Drawn from -50 to 410 degrees so the +-36 degrees either side
+ * of the lubber line are always populated however the card is wrapped — the
+ * alternative, re-serialising the ticks when the heading crosses north, would
+ * be the one per-frame allocation in this file.
+ */
+function cHeading(u) {
+  const LETTER = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
+  let m = '';
+  for (let h = -50; h <= 410; h += 5) {
+    const x = (h * C_HDG_UPD).toFixed(2);
+    const major = h % 10 === 0;
+    m +=
+      `<line x1="${x}" y1="${major ? 32 : 38}" x2="${x}" y2="${C_HDG_H}"` +
+      ` stroke="${major ? INK : INK_DIM}" stroke-width="${major ? 1.6 : 1.1}"/>`;
+    if (h % 30 === 0) {
+      const w = ((h % 360) + 360) % 360;
+      m += LETTER[w] !== undefined
+        ? `<text x="${x}" y="24" class="t" font-size="15" font-weight="700" fill="${INK}">${LETTER[w]}</text>`
+        : `<text x="${x}" y="24" class="t tn" font-size="13" font-weight="600" fill="${INK}">${w / 10}</text>`;
+    }
+  }
+
+  return (
+    `<defs><clipPath id="${u}-chdg"><rect x="0" y="0" width="${C_HDG_W}" height="${C_HDG_H}"/></clipPath></defs>` +
+    `<g clip-path="url(#${u}-chdg)">` +
+    `<g id="${u}-c-hdg-tape" transform="translate(${C_HDG_W / 2} 0)">${m}</g>` +
+    `</g>` +
+    // Lubber line and the digital repeat, both fixed on the centre.
+    `<line x1="${C_HDG_W / 2}" y1="26" x2="${C_HDG_W / 2}" y2="${C_HDG_H}" stroke="${AMBER}" stroke-width="2"/>` +
+    `<g transform="translate(${C_HDG_W / 2} 0)">` +
+    `<rect x="-34" y="0" width="68" height="21" rx="4" fill="#05070a" fill-opacity="0.94" stroke="${CYAN}" stroke-width="1.2"/>` +
+    `<text id="${u}-c-hdg-v" x="0" y="11" class="t tn" font-size="14" font-weight="600" fill="#ffffff">000°T</text>` +
+    `</g>`
+  );
+}
+
+/**
+ * The bottom-centre cluster: the attitude ball, and everything demoted out of
+ * the six-pack that is still worth a glance. It is 208 units wide because that
+ * is what fits between the two touch corners on a 375 px-tall landscape phone
+ * (see TOUCH_RESERVE) and the width is the binding constraint, not the height.
+ */
+function cCluster(u) {
+  // --- attitude ball -------------------------------------------------------
+  let card = '';
+  card += `<rect x="-300" y="-300" width="600" height="300" fill="url(#${u}-csky)"/>`;
+  card += `<rect x="-300" y="0" width="600" height="300" fill="url(#${u}-cgnd)"/>`;
+  card += `<rect x="-300" y="-1.1" width="600" height="2.2" fill="#ffffff"/>`;
+  for (let p = -20; p <= 20; p += 5) {
+    if (p === 0) continue;
+    const yy = (-p * C_AI_PPD).toFixed(2);
+    const major = p % 10 === 0;
+    const hw = major ? 15 : 7.5;
+    card +=
+      `<line x1="${-hw}" y1="${yy}" x2="${hw}" y2="${yy}" stroke="#ffffff"` +
+      ` stroke-width="${major ? 1.5 : 1.1}" stroke-opacity="${major ? 0.95 : 0.7}"/>`;
+  }
+
+  let ball = '';
+  ball += `<circle r="${C_AI_R + 2}" fill="#0a0d12"/>`;
+  ball += `<g clip-path="url(#${u}-cai)">`;
+  ball += `<g id="${u}-c-ai-card">${card}</g>`;
+  // Roll pointer and slip bar rotate with the aircraft but must NOT take the
+  // pitch translation, so they are siblings of the card, not children of it.
+  ball +=
+    `<g id="${u}-c-ai-roll">` +
+    `<path d="M 0 ${-C_AI_R + 2} L -5 ${-C_AI_R + 11} L 5 ${-C_AI_R + 11} Z" fill="${AMBER}"/>` +
+    `</g>`;
+  ball +=
+    `<g id="${u}-c-slip">` +
+    `<rect x="-8" y="${-C_AI_R + 13}" width="16" height="4" rx="1.4" fill="#ffffff" fill-opacity="0.92"/>` +
+    `</g>`;
+  for (const a of [-60, -30, 30, 60]) ball += tick(C_AI_R, C_AI_R - 7, a, 1.8, '#ffffff');
+  ball += tick(C_AI_R, C_AI_R - 11, 0, 2.4, '#ffffff');
+  ball += `</g>`;
+  ball += `<circle r="${C_AI_R}" fill="none" stroke="#000" stroke-opacity="0.8" stroke-width="2"/>`;
+  ball +=
+    `<g fill="${AMBER}" stroke="#4a2c00" stroke-width="0.6">` +
+    `<rect x="-32" y="-1.6" width="19" height="3.2"/>` +
+    `<rect x="13" y="-1.6" width="19" height="3.2"/>` +
+    `<circle r="2.6"/>` +
+    `</g>`;
+
+  let s =
+    `<defs>` +
+    `<clipPath id="${u}-cai"><circle r="${C_AI_R}"/></clipPath>` +
+    `<linearGradient id="${u}-csky" x1="0" y1="0" x2="0" y2="1">` +
+    `<stop offset="0" stop-color="#0d3f80"/><stop offset="1" stop-color="#4f9ee0"/></linearGradient>` +
+    `<linearGradient id="${u}-cgnd" x1="0" y1="0" x2="0" y2="1">` +
+    `<stop offset="0" stop-color="#9c6631"/><stop offset="1" stop-color="#4a2d15"/></linearGradient>` +
+    `</defs>` +
+    `<g transform="translate(${C_AI_CX} ${C_AI_CY})">${ball}</g>`;
+
+  // --- the demoted column --------------------------------------------------
+  const X = 118;
+  const W = C_CLU_W - X - 4; // 86
+
+  // Power. A bar with the same redline the tachometer carries.
+  s += `<text x="${X}" y="8" class="t ta-start" font-size="8.5" fill="${INK_DIM}" letter-spacing="0.9">RPM</text>`;
+  s += `<text id="${u}-c-rpm-v" x="${X + W}" y="8" class="t tn ta-end" font-size="11.5" fill="${INK}">0</text>`;
+  s += `<rect x="${X}" y="14" width="${W}" height="7" rx="3.5" fill="${OFF}"/>`;
+  s += `<rect id="${u}-c-rpm-bar" x="${X}" y="14" width="0" height="7" rx="3.5" fill="${GREEN}"/>`;
+  s +=
+    `<rect x="${(X + (TACH_REDLINE / TACH_MAX) * W).toFixed(2)}" y="12"` +
+    ` width="1.8" height="11" fill="${RED}"/>`;
+
+  // Flaps.
+  s += `<text x="${X}" y="33" class="t ta-start" font-size="8.5" fill="${INK_DIM}" letter-spacing="0.9">FLAP</text>`;
+  s += `<text id="${u}-c-flap-v" x="${X}" y="46" class="t tn ta-start" font-size="12" fill="${INK}">UP</text>`;
+  for (let i = 0; i < FLAP_DETENTS.length; i++) {
+    s +=
+      `<rect id="${u}-c-flap-${i}" x="${150 + i * 14}" y="30" width="11" height="17" rx="2"` +
+      ` fill="${OFF}" stroke="#000" stroke-opacity="0.5" stroke-width="0.7"/>`;
+  }
+
+  // Weight-on-wheels and brakes.
+  s +=
+    `<g id="${u}-c-lamp-gnd" class="lamp"><rect x="${X}" y="56" width="40" height="19" rx="4" fill="${GREEN}"/>` +
+    `<text x="${X + 20}" y="66" class="t" font-size="10" font-weight="700" fill="#0b0d10">GND</text></g>`;
+  s +=
+    `<g id="${u}-c-lamp-brk" class="lamp"><rect x="${X + 46}" y="56" width="40" height="19" rx="4" fill="${AMBER}"/>` +
+    `<text x="${X + 66}" y="66" class="t" font-size="10" font-weight="700" fill="#0b0d10">BRK</text></g>`;
+
+  // Nearest field — the readout that makes the geography checkable, and the
+  // one thing from the desktop data strip that is worth a phone's pixels.
+  s += `<text x="${X}" y="88" class="t ta-start" font-size="8" fill="${INK_DIM}" letter-spacing="1">NEAREST</text>`;
+  s += `<text id="${u}-c-nrst" x="${X}" y="103" class="t tn ta-start" font-size="14" font-weight="600" fill="${CYAN}">----</text>`;
+  s += `<text id="${u}-c-nrst-sub" x="${X}" y="116" class="t tn ta-start" font-size="9" fill="${INK_DIM}">no airport data</text>`;
+  return s;
+}
+
+/**
+ * The five widgets, as detached DOM. Each is a wrapper div (which carries the
+ * smoked-glass background, the border radius and the crop) around one svg.
+ */
+function buildCompact(u) {
+  const wrap = document.createElement('div');
+  wrap.className = `${u}-hud`;
+
+  const svgs = [];
+  const add = (cls, vb, w, h, inner, par = 'xMidYMid slice') => {
+    const box = document.createElement('div');
+    box.className = `${u}-w ${cls}`;
+    box.innerHTML =
+      `<svg viewBox="0 0 ${vb}" width="${w}" height="${h}" preserveAspectRatio="${par}"` +
+      ` xmlns="http://www.w3.org/2000/svg" aria-hidden="true">${inner}</svg>`;
+    wrap.appendChild(box);
+    const svg = box.firstElementChild;
+    if (svg) svgs.push(svg);
+    return box;
+  };
+
+  add(`${u}-w-hdg`, `${C_HDG_W} ${C_HDG_H}`, C_HDG_W, C_HDG_H, cHeading(u));
+  add(`${u}-w-asi`, `${C_ASI_W} ${C_TAPE_H}`, C_ASI_W, C_TAPE_H, cAirspeed(u));
+  add(`${u}-w-alt`, `${C_ALT_W} ${C_TAPE_H}`, C_ALT_W, C_TAPE_H, cAltitude(u));
+  add(`${u}-w-clu`, `${C_CLU_W} ${C_CLU_H}`, C_CLU_W, C_CLU_H, cCluster(u), 'xMidYMid meet');
+
+  // The stall banner is plain DOM: it is a word on a red field that blinks, and
+  // an SVG for that would cost a viewBox and buy nothing.
+  const stall = document.createElement('div');
+  stall.className = `${u}-w ${u}-w-stall`;
+  stall.textContent = 'STALL';
+  wrap.appendChild(stall);
+
+  return { wrap, svgs, stall };
+}
+
+/**
+ * Compact-layout stylesheet. THIS is where the thumb zones are honoured, and
+ * every offset below is derived from TOUCH_RESERVE rather than eyeballed:
+ *
+ *   landscape  the tapes stop 170 px above the bottom safe edge, and the
+ *              cluster lives in the 208 px of clear width between the two
+ *              200 px-wide corners
+ *   portrait   nothing at all in the bottom 260 px
+ *
+ * `env(safe-area-inset-*)` needs `viewport-fit=cover` on the viewport meta to
+ * be anything but zero; overlay.js sets that (it owns the page chrome), and a
+ * zero inset is a correct answer on a device without a notch.
+ */
+function compactStyleSheet(u) {
+  const L = TOUCH_RESERVE.landscape;
+  const P = TOUCH_RESERVE.portrait;
+  const sl = 'env(safe-area-inset-left, 0px)';
+  const sr = 'env(safe-area-inset-right, 0px)';
+  const st = 'env(safe-area-inset-top, 0px)';
+  const sb = 'env(safe-area-inset-bottom, 0px)';
+  return `
+.${u}-root.${u}-compact {
+  position: absolute; inset: 0; width: auto; bottom: 0; left: 0;
+  transform: none; pointer-events: none; user-select: none;
+  -webkit-user-select: none; z-index: 20;
+}
+.${u}-hud { position: absolute; inset: 0; pointer-events: none; }
+.${u}-w {
+  position: absolute; pointer-events: none;
+  background: rgba(8,11,15,0.52);
+  border: 1px solid rgba(150,175,205,0.20);
+  border-radius: 8px; overflow: hidden;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.45);
+}
+/* The svg FILLS its wrapper and crops (preserveAspectRatio slice). This rule
+   has to come after .${u}-root svg { height: auto }, which would otherwise
+   stretch the tape instead of cropping it. */
+.${u}-w svg { display: block; width: 100%; height: 100%; }
+.${u}-w-hdg  { top: calc(${st} + 6px); left: 50%; transform: translateX(-50%);
+               width: min(${C_HDG_W}px, calc(100vw - ${sl} - ${sr} - 24px)); height: ${C_HDG_H}px; }
+.${u}-w-asi  { left: calc(${sl} + 8px);  width: ${C_ASI_W}px; }
+.${u}-w-alt  { right: calc(${sr} + 8px); width: ${C_ALT_W}px; }
+.${u}-w-clu  { left: 50%; transform: translateX(-50%);
+               width: ${C_CLU_W}px; height: ${C_CLU_H}px;
+               bottom: calc(${sb} + 6px); }
+.${u}-w-stall {
+  left: 50%; transform: translateX(-50%); top: calc(${st} + 58px);
+  display: none; padding: 4px 18px 5px;
+  background: ${RED}; border-color: #ff9a95; border-radius: 6px;
+  color: #ffffff; font: 700 17px/1.15 "Helvetica Neue", Helvetica, Arial, sans-serif;
+  letter-spacing: 0.22em; text-indent: 0.22em;
+}
+.${u}-w-stall.on { display: block; }
+.${u}-w-stall.blink { animation: ${u}-blink 0.62s steps(1, end) infinite; }
+
+/* LANDSCAPE — the primary orientation. Both tapes are pinned under the heading
+   strip and stop ${L.h}px above the bottom safe edge, which is the touch zone. */
+@media (orientation: landscape) {
+  .${u}-w-asi, .${u}-w-alt {
+    top: calc(${st} + 58px);
+    height: calc(100vh - ${st} - ${sb} - 58px - ${L.h}px);
+    max-height: ${C_TAPE_H}px; min-height: 104px;
+  }
+}
+/* PORTRAIT — 375 px of width is not enough for the heading strip AND the
+   overlay's menu button AND the autopilot annunciator on one row, so the strip
+   drops to a second row and everything below it moves down with it. Height is
+   the one thing portrait has to spare, so the whole bottom ${P.h}px goes to
+   the touch controls and the tapes still run their full ${C_TAPE_H} units. */
+@media (orientation: portrait) {
+  .${u}-w-hdg { top: calc(${st} + 46px); }
+  .${u}-w-stall { top: calc(${st} + 104px); }
+  .${u}-w-asi, .${u}-w-alt {
+    top: calc(${st} + 100px);
+    height: calc(100vh - ${st} - ${sb} - 100px - ${P.h}px - ${C_CLU_H}px - 20px);
+    max-height: ${C_TAPE_H}px; min-height: 104px;
+  }
+  .${u}-w-clu { bottom: calc(${sb} + ${P.h}px + 8px); }
+}
+/* A short landscape window cannot afford the nearest-field block; the cluster
+   scales down as a whole rather than dropping a row, because a row that is
+   sometimes there is worse than one that never is. */
+@media (orientation: landscape) and (max-height: 340px) {
+  .${u}-w-clu { width: 178px; height: 106px; }
+}
+`;
+}
+
+// ---------------------------------------------------------------------------
 // defs — gradients and clips, defined once and shared by all seven faces.
 // ---------------------------------------------------------------------------
 
@@ -869,6 +1353,33 @@ function pad3(n) {
 
 let instanceSeq = 0;
 
+/**
+ * Which layout does this viewport want? VIEWPORT, not user agent — see the
+ * note on COMPACT_QUERY. Returns 'panel' when there is no window at all, which
+ * is what `scripts/check-instruments.mjs` runs against.
+ *
+ * @param {'auto'|'panel'|'compact'} [pref]
+ */
+function pickLayout(pref) {
+  if (pref === 'panel' || pref === 'compact') return pref;
+  if (typeof window === 'undefined') return 'panel';
+  // `?hud=compact` forces the small layout on a desktop, which is the only way
+  // to measure it without a phone — the same escape hatch `?tier=phone` is.
+  try {
+    const q = /[?&]hud=(compact|panel)\b/.exec(window.location ? window.location.search : '');
+    if (q) return q[1];
+  } catch {
+    /* location can throw in a sandboxed frame; the media query still works */
+  }
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia(COMPACT_QUERY).matches ? 'compact' : 'panel';
+  }
+  const w = window.innerWidth || 0;
+  const h = window.innerHeight || 0;
+  if (!w || !h) return 'panel';
+  return w <= 820 || h <= 460 ? 'compact' : 'panel';
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -885,74 +1396,157 @@ let instanceSeq = 0;
  * state inside it. The documented contract `update(state)` is unchanged and
  * calling it that way is fully supported.
  */
-export function createInstruments(container) {
+export function createInstruments(container, opts = {}) {
   const u = 'ki' + ++instanceSeq;
 
   const root = document.createElement('div');
   root.className = `${u}-root instruments`;
 
   const style = document.createElement('style');
-  style.textContent = styleSheet(u);
+  style.textContent = styleSheet(u) + compactStyleSheet(u);
   root.appendChild(style);
+
+  (container || document.body).appendChild(root);
+
+  /** 'panel' | 'compact'. Set by applyLayout(), which also builds the DOM. */
+  let layout = null;
+  /** The svg roots of the current layout — one for the panel, four compact. */
+  let svgs = [];
+  /** The wrapper the current layout hangs off, so a swap can remove it. */
+  let body = null;
+  /** Element handles for the current layout. Rebuilt on every swap. */
+  let el = {};
+
+  const $ = (id) => {
+    for (let i = 0; i < svgs.length; i++) {
+      const n = svgs[i].querySelector(`#${u}-${id}`);
+      if (n) return n;
+    }
+    return null;
+  };
 
   // -------------------------------------------------------------------------
   // Build the whole panel as one string and parse it once. Everything after
   // this point mutates a handful of attributes; nothing re-serialises.
   // -------------------------------------------------------------------------
-  const markup =
-    `<svg viewBox="0 0 ${PANEL_W} ${PANEL_H}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">` +
-    defs(u) +
-    // Panel backing: a soft outer edge, the metal, then a top highlight.
-    `<rect x="6" y="6" width="${PANEL_W - 12}" height="${PANEL_H - 12}" rx="16" fill="#000" opacity="0.35"/>` +
-    `<rect x="8" y="8" width="${PANEL_W - 16}" height="${PANEL_H - 16}" rx="14" fill="url(#${u}-panel)" stroke="#39424e" stroke-width="1"/>` +
-    `<rect x="9" y="9" width="${PANEL_W - 18}" height="1.2" rx="0.6" fill="#ffffff" opacity="0.09"/>` +
-    instrument(u, 0, airspeedFace(u)) +
-    instrument(u, 1, attitudeFace(u)) +
-    instrument(u, 2, altimeterFace(u)) +
-    instrument(u, 3, turnFace(u)) +
-    instrument(u, 4, headingFace(u)) +
-    instrument(u, 5, vsiFace(u)) +
-    instrument(u, 6, tachFace(u)) +
-    stripContent(u) +
-    `</svg>`;
+  function buildPanel() {
+    const markup =
+      `<svg viewBox="0 0 ${PANEL_W} ${PANEL_H}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">` +
+      defs(u) +
+      // Panel backing: a soft outer edge, the metal, then a top highlight.
+      `<rect x="6" y="6" width="${PANEL_W - 12}" height="${PANEL_H - 12}" rx="16" fill="#000" opacity="0.35"/>` +
+      `<rect x="8" y="8" width="${PANEL_W - 16}" height="${PANEL_H - 16}" rx="14" fill="url(#${u}-panel)" stroke="#39424e" stroke-width="1"/>` +
+      `<rect x="9" y="9" width="${PANEL_W - 18}" height="1.2" rx="0.6" fill="#ffffff" opacity="0.09"/>` +
+      instrument(u, 0, airspeedFace(u)) +
+      instrument(u, 1, attitudeFace(u)) +
+      instrument(u, 2, altimeterFace(u)) +
+      instrument(u, 3, turnFace(u)) +
+      instrument(u, 4, headingFace(u)) +
+      instrument(u, 5, vsiFace(u)) +
+      instrument(u, 6, tachFace(u)) +
+      stripContent(u) +
+      `</svg>`;
 
-  const holder = document.createElement('div');
-  holder.innerHTML = markup;
-  const svgEl = holder.firstElementChild;
-  root.appendChild(svgEl);
+    const holder = document.createElement('div');
+    holder.innerHTML = markup;
+    const svgEl = holder.firstElementChild;
+    root.appendChild(svgEl);
+    svgs = [svgEl];
+    body = svgEl;
 
-  (container || document.body).appendChild(root);
+    el = {
+      asi: $('asi-n'),
+      aiCard: $('ai-card'),
+      altH: $('alt-h'),
+      altK: $('alt-k'),
+      altTk: $('alt-tk'),
+      altBaro: $('alt-baro'),
+      tcPlane: $('tc-plane'),
+      tcBall: $('tc-ball'),
+      hiCard: $('hi-card'),
+      hiTrue: $('hi-true'),
+      hiMag: $('hi-mag'),
+      vsi: $('vsi-n'),
+      tach: $('tach-n'),
+      hobbs: $('tach-hobbs'),
+      lampStall: $('lamp-stall'),
+      lampGnd: $('lamp-gnd'),
+      lampBrk: $('lamp-brk'),
+      gear: [$('gear-0'), $('gear-1'), $('gear-2')],
+      gearTxt: $('gear-txt'),
+      flap: [$('flap-0'), $('flap-1'), $('flap-2'), $('flap-3')],
+      flapTxt: $('flap-txt'),
+      agl: $('agl'),
+      nrst: $('nrst'),
+      nrstSub: $('nrst-sub'),
+      pos: $('pos'),
+      msl: $('msl'),
+    };
+  }
 
-  const $ = (id) => svgEl.querySelector(`#${u}-${id}`);
+  function buildCompactLayout() {
+    const built = buildCompact(u);
+    root.appendChild(built.wrap);
+    svgs = built.svgs;
+    body = built.wrap;
 
-  const el = {
-    asi: $('asi-n'),
-    aiCard: $('ai-card'),
-    altH: $('alt-h'),
-    altK: $('alt-k'),
-    altTk: $('alt-tk'),
-    altBaro: $('alt-baro'),
-    tcPlane: $('tc-plane'),
-    tcBall: $('tc-ball'),
-    hiCard: $('hi-card'),
-    hiTrue: $('hi-true'),
-    hiMag: $('hi-mag'),
-    vsi: $('vsi-n'),
-    tach: $('tach-n'),
-    hobbs: $('tach-hobbs'),
-    lampStall: $('lamp-stall'),
-    lampGnd: $('lamp-gnd'),
-    lampBrk: $('lamp-brk'),
-    gear: [$('gear-0'), $('gear-1'), $('gear-2')],
-    gearTxt: $('gear-txt'),
-    flap: [$('flap-0'), $('flap-1'), $('flap-2'), $('flap-3')],
-    flapTxt: $('flap-txt'),
-    agl: $('agl'),
-    nrst: $('nrst'),
-    nrstSub: $('nrst-sub'),
-    pos: $('pos'),
-    msl: $('msl'),
-  };
+    el = {
+      asiTape: $('c-asi-tape'),
+      asiV: $('c-asi-v'),
+      altTape: $('c-alt-tape'),
+      altV: $('c-alt-v'),
+      vsiBar: $('c-vsi-bar'),
+      agl: $('c-agl'),
+      hdgTape: $('c-hdg-tape'),
+      hdgV: $('c-hdg-v'),
+      aiCard: $('c-ai-card'),
+      aiRoll: $('c-ai-roll'),
+      slip: $('c-slip'),
+      rpmBar: $('c-rpm-bar'),
+      rpmV: $('c-rpm-v'),
+      flap: [$('c-flap-0'), $('c-flap-1'), $('c-flap-2'), $('c-flap-3')],
+      flapTxt: $('c-flap-v'),
+      lampGnd: $('c-lamp-gnd'),
+      lampBrk: $('c-lamp-brk'),
+      stall: built.stall,
+      nrst: $('c-nrst'),
+      nrstSub: $('c-nrst-sub'),
+    };
+  }
+
+  /**
+   * Swap layouts. The smoothed values in `d` are deliberately NOT reset, so
+   * rotating a phone (or dragging a desktop window across the breakpoint)
+   * re-draws the same readings rather than snapping a needle from zero.
+   */
+  function applyLayout(next) {
+    if (next === layout) return layout;
+    if (body && typeof body.remove === 'function') body.remove();
+    layout = next;
+    if (next === 'compact') buildCompactLayout();
+    else buildPanel();
+    root.classList.toggle(`${u}-compact`, next === 'compact');
+    return layout;
+  }
+
+  applyLayout(pickLayout(opts.layout));
+
+  // Re-pick when the viewport crosses the threshold. matchMedia rather than a
+  // resize listener: it fires once on the crossing instead of sixty times
+  // during a drag, and it also catches an orientation change that keeps the
+  // area the same.
+  let mq = null;
+  const onMq = () => applyLayout(pickLayout(opts.layout));
+  if (
+    opts.layout !== 'panel' &&
+    opts.layout !== 'compact' &&
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function'
+  ) {
+    mq = window.matchMedia(COMPACT_QUERY);
+    if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onMq);
+    else if (typeof mq.addListener === 'function') mq.addListener(onMq);
+  }
 
   // -------------------------------------------------------------------------
   // Displayed (smoothed) values. These are what the needles actually show; the
@@ -1086,6 +1680,21 @@ export function createInstruments(container) {
 
     hobbsSec += dt;
 
+    if (layout === 'compact') drawCompact(state, brakeRaw, hasFlap);
+    else drawPanel(state, brakeRaw, hasFlap);
+
+    // --- nearest airport ---------------------------------------------------
+    // Shared: both layouts carry the readout, and it is the one thing on the
+    // panel that costs more than an attribute write.
+    nrstTimer -= dt;
+    if (nrstTimer <= 0) {
+      nrstTimer = NRST_INTERVAL;
+      updateNearest(state.lat, state.lon);
+    }
+  }
+
+  /** The seven-dial strip. */
+  function drawPanel(state, brakeRaw, hasFlap) {
     // --- airspeed ----------------------------------------------------------
     setAttr(el.asi, 'transform', `rotate(${asiAngle(d.kt).toFixed(2)})`);
 
@@ -1194,13 +1803,6 @@ export function createInstruments(container) {
     setText(el.agl, group(Math.max(d.aglFt, 0)));
     setAttr(el.agl, 'fill', d.aglFt < 200 ? RED : d.aglFt < 1000 ? AMBER : GREEN);
 
-    // --- nearest airport ---------------------------------------------------
-    nrstTimer -= dt;
-    if (nrstTimer <= 0) {
-      nrstTimer = NRST_INTERVAL;
-      updateNearest(state.lat, state.lon);
-    }
-
     // --- position ----------------------------------------------------------
     if (Number.isFinite(state.lat) && Number.isFinite(state.lon)) {
       const la = state.lat;
@@ -1215,6 +1817,87 @@ export function createInstruments(container) {
     }
     // Damped, so the digits and the three hands are reading the same altitude.
     setText(el.msl, `MSL ${group(d.altFt)} FT`);
+  }
+
+  /**
+   * The compact HUD. Same smoothed values, different glass: what was a needle
+   * angle on the panel is a tape offset here, and the digital repeat in the
+   * middle of each tape is the primary reading rather than a cross-check.
+   */
+  function drawCompact(state, brakeRaw, hasFlap) {
+    // --- airspeed ----------------------------------------------------------
+    setAttr(el.asiTape, 'transform', `translate(0 ${(C_TAPE_CY + d.kt * C_ASI_UPK).toFixed(2)})`);
+    setText(el.asiV, String(Math.max(0, Math.round(d.kt))));
+    const stalled = !!state.stalled;
+    const warning = stalled || !!state.stallWarning;
+    setAttr(el.asiV, 'fill', stalled ? '#ff8f8f' : warning ? AMBER : '#ffffff');
+
+    // --- altitude ----------------------------------------------------------
+    setAttr(el.altTape, 'transform', `translate(0 ${(C_TAPE_CY + d.altFt * C_ALT_UPF).toFixed(2)})`);
+    setText(el.altV, group(d.altFt));
+
+    // --- vertical speed ----------------------------------------------------
+    // One rect, grown from the reading line. Two attribute writes beats a
+    // rotating needle here: at 12 units wide a needle is a smudge.
+    const vh = (clamp(d.vsFpm, -VSI_MAX, VSI_MAX) / VSI_MAX) * C_VSI_HALF;
+    setAttr(el.vsiBar, 'y', (C_TAPE_CY - Math.max(vh, 0)).toFixed(2));
+    setAttr(el.vsiBar, 'height', Math.abs(vh).toFixed(2));
+
+    // --- radio altitude ----------------------------------------------------
+    setText(el.agl, group(Math.max(d.aglFt, 0)));
+    setAttr(el.agl, 'fill', d.aglFt < 200 ? RED : d.aglFt < 1000 ? AMBER : GREEN);
+
+    // --- heading -----------------------------------------------------------
+    // The strip is drawn from -50 to 410 degrees, so the translate has to be
+    // computed from a WRAPPED heading or it walks off the drawn range. Same
+    // convention as the round card: true on the tape, and it says so.
+    const h = wrapDeg(d.hdg);
+    setAttr(el.hdgTape, 'transform', `translate(${(C_HDG_W / 2 - h * C_HDG_UPD).toFixed(2)} 0)`);
+    setText(el.hdgV, `${pad3(Math.round(h))}°T`);
+
+    // --- attitude ----------------------------------------------------------
+    setAttr(
+      el.aiCard,
+      'transform',
+      `rotate(${(-d.roll).toFixed(2)}) translate(0 ${(d.pitch * C_AI_PPD).toFixed(2)})`,
+    );
+    setAttr(el.aiRoll, 'transform', `rotate(${(-d.roll).toFixed(2)})`);
+    // The slip bar slides along the AIRCRAFT's lateral axis, so it is rotated
+    // first and translated second — the opposite order puts it on the horizon.
+    setAttr(
+      el.slip,
+      'transform',
+      `rotate(${(-d.roll).toFixed(2)}) translate(${(d.ball * C_SLIP_TRAVEL).toFixed(2)} 0)`,
+    );
+
+    // --- power -------------------------------------------------------------
+    const rpmFrac = clamp(d.rpm / TACH_MAX, 0, 1);
+    setAttr(el.rpmBar, 'width', (rpmFrac * (C_CLU_W - 122)).toFixed(2));
+    setAttr(el.rpmBar, 'fill', d.rpm > TACH_REDLINE ? RED : d.rpm >= TACH_GREEN_LO ? GREEN : CYAN);
+    setText(el.rpmV, group(d.rpm));
+
+    // --- flaps -------------------------------------------------------------
+    if (hasFlap) {
+      const detent = Math.round(clamp(d.flap, 0, 1) * (FLAP_DETENTS.length - 1));
+      for (let i = 0; i < el.flap.length; i++) {
+        setAttr(el.flap[i], 'fill', i > detent ? OFF : i === 0 ? INK_DIM : CYAN);
+      }
+      setAttr(el.flapTxt, 'fill', detent > 0 ? CYAN : INK);
+      setText(el.flapTxt, detent === 0 ? 'UP' : `${FLAP_DETENTS[detent]}°`);
+    } else {
+      for (const f of el.flap) setAttr(f, 'fill', '#1c222a');
+      setAttr(el.flapTxt, 'fill', INK_DIM);
+      setText(el.flapTxt, '--');
+    }
+
+    // --- annunciators ------------------------------------------------------
+    setClassOn(el.lampGnd, 'on', !!state.onGround);
+    setClassOn(el.lampBrk, 'on', brakeRaw !== null && brakeRaw > 0.02);
+    // The stall warning is promoted out of the cluster and across the top:
+    // on a phone the pilot is looking at the windscreen, not at the panel, and
+    // a 19 px lamp in the corner is not an alert.
+    setClassOn(el.stall, 'on', warning);
+    setClassOn(el.stall, 'blink', stalled);
   }
 
   /** Nearest field: ident, distance, bearing. Degrades to `----`. */
@@ -1240,8 +1923,23 @@ export function createInstruments(container) {
   }
 
   function dispose() {
+    if (mq) {
+      if (typeof mq.removeEventListener === 'function') mq.removeEventListener('change', onMq);
+      else if (typeof mq.removeListener === 'function') mq.removeListener(onMq);
+      mq = null;
+    }
     root.remove();
   }
 
-  return { update, dispose, root };
+  return {
+    update,
+    dispose,
+    root,
+    /** 'panel' | 'compact'. For the acceptance check and the console. */
+    getLayout: () => layout,
+    /** Force a layout at run time; pass 'auto' to hand it back to the query. */
+    setLayout: (name) => applyLayout(pickLayout(name)),
+  };
 }
+
+export { COMPACT_QUERY, TOUCH_RESERVE, pickLayout };
