@@ -290,6 +290,98 @@ function flyRecording(flight, ap, seconds, pilot = {}) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// JITTERY FRAME TIMES. The gap that let the SECOND round of jitter ship.
+//
+// Every test above runs at a perfectly regular DT = 1/60, and a browser does
+// not. main.js's dtFor() returns raw wall-clock deltas, terrain page-ins and GC
+// pauses produce real spikes, and the autopilot's damping term differentiates
+// attitude by that dt. Divide a small number by a jittery one and the quotient
+// is noise — which leaves the controller as elevator judder that a fixed-step
+// harness cannot see. Reported from a browser, invisible here, until now.
+//
+// The deltas below are deterministic (a fixed LCG, no Math.random) so a failure
+// is reproducible.
+// ---------------------------------------------------------------------------
+console.log('\nautopilot — jittery frame times (browser conditions)');
+
+/** Deterministic pseudo-random in [0,1). */
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+/**
+ * Frame deltas that look like a real browser: a 60 Hz baseline with jitter,
+ * plus occasional big spikes standing in for a terrain page-in or a GC pause.
+ */
+function jitteryDt(rng) {
+  const r = rng();
+  if (r < 0.03) return 0.033 + rng() * 0.05; // a spike: 33-83 ms
+  return 1 / 60 + (rng() - 0.5) * 0.008; // 12.6-20.6 ms
+}
+
+{
+  const rng = makeRng(20260807);
+  const flight = airborne(0, 3000);
+  const ap = createAutopilot();
+  ap.toggle(flight.state);
+
+  const step = (n) => {
+    for (let i = 0; i < n; i += 1) {
+      const dt = jitteryDt(rng);
+      const inputs = { pitch: 0, roll: 0, yaw: 0, throttle: 0.65, flaps: 0, brakes: 0, gear: 1 };
+      ap.update(dt, flight.state, inputs);
+      flight.step(dt, inputs, GROUND_M);
+      lastElev = inputs.pitch;
+      elevSeries.push(inputs.pitch);
+    }
+  };
+  let lastElev = 0;
+  const elevSeries = [];
+  step(2700); // settle
+  elevSeries.length = 0;
+  step(7200); // record
+
+  let lo = Infinity, hi = -Infinity;
+  for (const s of [flight.state]) void s;
+  // Elevator judder is the thing the pilot FEELS. Measure how much the command
+  // moves frame to frame, not just where the aeroplane ended up.
+  let sumAbsDelta = 0, maxDelta = 0;
+  for (let i = 1; i < elevSeries.length; i += 1) {
+    const dv = Math.abs(elevSeries[i] - elevSeries[i - 1]);
+    sumAbsDelta += dv;
+    if (dv > maxDelta) maxDelta = dv;
+    lo = Math.min(lo, elevSeries[i]);
+    hi = Math.max(hi, elevSeries[i]);
+  }
+  const meanDelta = sumAbsDelta / Math.max(1, elevSeries.length - 1);
+
+  ok(
+    'elevator does not judder frame to frame',
+    meanDelta < 0.01,
+    `mean |Δelevator| ${meanDelta.toFixed(5)} per frame`,
+  );
+  ok(
+    'no single-frame elevator slam',
+    maxDelta < 0.12,
+    `worst Δ ${maxDelta.toFixed(4)}`,
+  );
+  ok(
+    'elevator command stays in a narrow band',
+    hi - lo < 0.35,
+    `band ${(hi - lo).toFixed(3)}`,
+  );
+  ok(
+    'and it still holds altitude under jitter',
+    near(flight.state.altitudeFt, ap.altitudeBug, 150),
+    `alt ${flight.state.altitudeFt.toFixed(0)} vs bug ${ap.altitudeBug}`,
+  );
+}
+
 {
   // Smooth THROUGH a turn, which is where the load-factor feed-forward earns
   // its place: the aeroplane must not sag and then over-correct.

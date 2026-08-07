@@ -99,6 +99,18 @@ const K_PITCH_D = 0.055;
 const K_PITCH_I = 0.020;
 const PITCH_I_CLAMP = 0.55;
 
+/** Time constant for the rate low-pass, seconds. See pitchRateF below. */
+const RATE_TAU = 0.08;
+
+/**
+ * Floor on the differentiation interval, seconds.
+ *
+ * A very short frame makes (delta / dt) explode even when the attitude barely
+ * moved, because the numerator is dominated by float noise at that scale. The
+ * floor bounds the amplification; the low-pass then cleans up what is left.
+ */
+const RATE_MIN_DT = 1 / 240;
+
 /**
  * Airspeed protection, knots.
  *
@@ -173,6 +185,23 @@ export function createAutopilot() {
   let prevRollDeg = 0;
   let haveRates = false;
 
+  /**
+   * Smoothed rates. THE RAW DIFFERENCE IS NOT USABLE AS A D TERM.
+   *
+   * (attitude - prevAttitude) / dt divides a small number by a jittery one. In
+   * the headless harness dt is a perfectly regular 1/60 and the quotient is
+   * clean, which is precisely why the first fix measured as smooth and was
+   * still visibly jittery in a browser: real frame deltas vary, and a terrain
+   * page-in or a GC pause produces a spike that the division AMPLIFIES. That
+   * noise goes straight out of the damping term as elevator judder.
+   *
+   * An exponential moving average over RATE_TAU rejects the per-frame noise
+   * while passing the real rate — the phugoid it has to damp has a period of
+   * many seconds, so an 80 ms filter costs nothing that matters.
+   */
+  let pitchRateF = 0;
+  let rollRateF = 0;
+
   /** Why we last disengaged, for the HUD to show. */
   let lastReason = '';
 
@@ -180,6 +209,8 @@ export function createAutopilot() {
     bankI = 0;
     pitchI = 0;
     haveRates = false;
+    pitchRateF = 0;
+    rollRateF = 0;
   }
 
   function disengage(why) {
@@ -271,8 +302,21 @@ export function createAutopilot() {
       // history, so the rates are zero for exactly one step.
       const pitchDeg = state.pitchDeg ?? 0;
       const rollDeg = state.rollDeg ?? 0;
-      const pitchRate = haveRates ? (pitchDeg - prevPitchDeg) / d : 0;
-      const rollRate = haveRates ? (rollDeg - prevRollDeg) / d : 0;
+
+      // Differentiate over a floored interval, then LOW-PASS. Both halves
+      // matter: the floor bounds the amplification a very short frame causes,
+      // and the filter removes the frame-to-frame noise that survives it.
+      const dRate = Math.max(d, RATE_MIN_DT);
+      const rawPitchRate = haveRates ? (pitchDeg - prevPitchDeg) / dRate : 0;
+      const rawRollRate = haveRates ? (rollDeg - prevRollDeg) / dRate : 0;
+
+      // Frame-rate-independent EMA: the same time constant whatever dt is.
+      const a = haveRates ? 1 - Math.exp(-d / RATE_TAU) : 1;
+      pitchRateF += (rawPitchRate - pitchRateF) * a;
+      rollRateF += (rawRollRate - rollRateF) * a;
+      const pitchRate = pitchRateF;
+      const rollRate = rollRateF;
+
       prevPitchDeg = pitchDeg;
       prevRollDeg = rollDeg;
       haveRates = true;
