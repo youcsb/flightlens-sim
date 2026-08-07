@@ -1,10 +1,14 @@
 /**
  * bake-dem.mjs — download real elevation tiles into public/dem/.
  *
- *   node scripts/bake-dem.mjs [--zoom=11] [--skip-detail] [--force]
+ *   node scripts/bake-dem.mjs [--levels=11,13,14] [--force]
  *
- * Bakes two levels by default: z=11 over the whole region and a z=13 inset over
- * Seattle. Re-runs skip anything already on disk, so it is cheap to repeat.
+ * Bakes THREE levels by default:
+ *   z=11  whole region, 238 tiles    — the pinned base (see BASE_ZOOM)
+ *   z=13  whole region, 3,380 tiles  — the paged working layer (see MID_ZOOM)
+ *   z=14  Seattle inset, 560 tiles   — the paged approach layer (see FINE_ZOOM)
+ *
+ * Re-runs skip anything already on disk, so it is cheap to repeat.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS SCRIPT EXISTS AT ALL
@@ -54,19 +58,22 @@
  *   - Size varies a lot with terrain: a flat ocean tile is ~5 kB, the Mount
  *     Rainier tile (11/331/721) is 145 kB. Budget from the measured totals
  *     below, not from an assumed average.
- *   - Tile counts and coverage for our bbox:
- *       z=9   20 tiles    207 m/px
- *       z=10  72 tiles    104 m/px
- *       z=11  238 tiles    52 m/px   <- BASE. Mount Rainier reads correctly.
- *       z=12  891 tiles    26 m/px
- *       z=13  3380 tiles   13 m/px   <- far too many for the full region
- *     The Seattle DETAIL inset (47.35..47.75, -122.5..-122.1) at z=13 is only
- *     ~140 tiles, which is the cheap way to get crisp ground near the airports.
- *   - Layers are additive at runtime: bake z=11 over everything AND z=13 over
- *     the inset, and elevation.js prefers the finer one where it exists.
+ *   - Tile counts and coverage for our bbox (recounted this round):
+ *       z=9      20 tiles   207 m/px
+ *       z=10     72 tiles   104 m/px
+ *       z=11    238 tiles    51.8 m/px  <- BASE, pinned resident
+ *       z=12    891 tiles    25.9 m/px
+ *       z=13  3,380 tiles    12.95 m/px <- MID, region-wide, paged
+ *       z=14 13,158 tiles     6.47 m/px <- region-wide is ~1.1 GB. Inset only.
+ *       z=15 51,712 tiles     3.24 m/px <- see the z=15 note under FINE_ZOOM
+ *     The Seattle inset (47.35..47.75, -122.5..-122.1) is 560 tiles at z=14.
+ *   - Layers are additive at runtime and elevation.js pages the fine ones in
+ *     and out around the aircraft; only z=11 stays resident for the whole
+ *     flight. See src/geo/elevation.js § PAGING.
  */
 
 import { existsSync, statSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import {
   PUBLIC_DIR,
@@ -82,35 +89,50 @@ import {
 const SOURCE = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium';
 
 /**
- * Base level: the whole region.
+ * ---------------------------------------------------------------------------
+ * THE RESOLUTION BUDGET — why these three levels and not others
+ * ---------------------------------------------------------------------------
+ * Round 1 shipped z=11 region-wide plus a z=13 Seattle inset, and the geography
+ * critic's headline finding was that 51.8 m/px covered ~95% of the region while
+ * the terrain mesh's finest node draws at 512 m / 64 cells = 8 m. The mesh was
+ * interpolating a grid 6.5x coarser than it drew: Rainier, the Olympics, the
+ * whole Cascade front, Tacoma and Everett were all soft.
  *
- * WHY 11 AND NOT 12. The choice is a resolution budget, and the budget is
- * better spent unevenly than uniformly.
+ * So the base layer moves to z=13 REGION-WIDE (12.95 m/px, a 4x linear
+ * improvement), which is the resolution GeoFS gets from Cesium World Terrain,
+ * and the inset moves to z=14.
  *
- *   z=10   72 tiles   104 m/px   Rainier's summit gets ~40 samples across its
- *                                cone. It reads as a lump, not a mountain.
- *   z=11  238 tiles    52 m/px   <- BASE. Enough to resolve Rainier's ridges and
- *                                glacial valleys, the Duwamish valley walls, and
- *                                a Puget Sound coastline that matches a map.
- *   z=12  891 tiles    26 m/px   4x the bytes of z=11 for detail that is below
- *                                one screen pixel at any altitude you would
- *                                cruise the region at.
+ * MEASURED, not assumed. For each pair I downloaded the child tile and its
+ * parent, bilinearly upsampled the parent, and took the RMS of the difference —
+ * i.e. how much information the finer level actually carries that the coarser
+ * one does not:
  *
- * The thing z=11 is genuinely too coarse for is the last 500 ft of an approach,
- * where 52 m/px is a third of a runway length. But that only matters within a
- * few km of the airports — so instead of paying z=12 over 40,000 km^2 of
- * saltwater and Cascade foothills nobody lands on, we pay z=13 (13 m/px) over
- * the 1,200 km^2 Seattle inset that actually contains KBFI, KSEA and downtown.
- * ~140 tiles buys 4x the base resolution exactly where the wheels touch.
+ *   place       z13 -> z14            z14 -> z15
+ *   KSEA        RMS 0.287 m  max 3.2  RMS 0.046 m  max 1.2
+ *   KBFI        RMS 0.280 m  max 3.4  RMS 0.058 m  max 1.2
+ *   downtown    (z13 tile has a void) RMS 0.184 m  max 2.6
+ *   Cascades    RMS 0.394 m  max 3.1  RMS 0.197 m  max 1.1
  *
- * elevation.js samples layers finest-first, so the two levels compose with no
- * seam handling and no caller awareness. Total ~380 tiles.
+ * z=14 is real: 3.4 m of vertical that z=13 does not have, on the ground the
+ * wheels touch. z=15 is not — 5 cm RMS over the airports is upsampling, which
+ * is exactly what you expect when the underlying source is 3DEP 1/3 arc-second
+ * (~10 m). Baking 4,048 z=15 tiles to gain 5 cm would be paying for a number
+ * that is smaller than the source's own vertical accuracy. NOT BAKED, on
+ * purpose. If 3DEP ever publishes 1/9 arc-second here, re-run this probe first.
  */
+
+/** Pinned base: the whole region, permanently resident. 238 tiles, ~29 MB. */
 const BASE_ZOOM = 11;
 
-/** Optional detail level over Seattle — see the header for the tile count. */
-const DETAIL_ZOOM = 13;
-const DETAIL_BBOX = {
+/** Paged working layer: the whole region at 12.95 m/px. 3,380 tiles. */
+const MID_ZOOM = 13;
+
+/**
+ * Paged approach layer: 6.47 m/px over the Seattle inset. 560 tiles.
+ * Region-wide z=14 would be 13,158 tiles and roughly 1.1 GB — see the header.
+ */
+const FINE_ZOOM = 14;
+const FINE_BBOX = {
   south: 47.35,
   north: 47.75,
   west: -122.5,
@@ -119,10 +141,11 @@ const DETAIL_BBOX = {
 
 /**
  * Parallel downloads. S3 would tolerate far more, but this is somebody else's
- * free public bucket and a cold bake is only ~380 tiles; 8 sockets finishes in
- * well under a minute and cannot be mistaken for abuse.
+ * free public bucket. A cold bake is now ~4,200 tiles rather than ~380, so 10
+ * sockets finishes in a couple of minutes and still cannot be mistaken for
+ * abuse. Re-runs skip what is on disk and cost seconds.
  */
-const CONCURRENCY = 8;
+const CONCURRENCY = 10;
 
 /** Transient-failure policy: 3 attempts, 400 ms / 800 ms / 1600 ms backoff. */
 const MAX_ATTEMPTS = 3;
@@ -185,6 +208,7 @@ async function bakeLevel(bbox, zoom, force) {
   let absent = 0;
   let bytes = 0;
   let done = 0;
+  const tStart = Date.now();
 
   const results = await mapLimit(wanted, CONCURRENCY, async ({ x, y }) => {
     const rel = `dem/${zoom}/${x}/${y}.png`;
@@ -214,11 +238,13 @@ async function bakeLevel(bbox, zoom, force) {
     }
 
     done++;
-    if (done % 50 === 0 || done === wanted.length) {
+    if (done % 250 === 0 || done === wanted.length) {
+      const secs = (Date.now() - tStart) / 1000;
       console.log(
         `    ${done}/${wanted.length}  ` +
           `(${downloaded} new, ${cached} cached, ${absent} absent, ` +
-          `${(bytes / 1048576).toFixed(1)} MB)`,
+          `${(bytes / 1048576).toFixed(1)} MB, ` +
+          `${(done / Math.max(secs, 0.001)).toFixed(0)} tiles/s)`,
       );
     }
     return outcome;
@@ -232,22 +258,57 @@ async function bakeLevel(bbox, zoom, force) {
   return { zoom, tileSize: 256, bbox, tiles };
 }
 
+/**
+ * The three levels, coarsest first. `paged` is advisory metadata for the
+ * runtime: it says this level is too big to hold decoded and must be streamed.
+ * elevation.js decides its own policy, but writing the intent into the manifest
+ * means a future bake that quietly doubles a level cannot silently blow the
+ * runtime's memory cap without the manifest disagreeing with it.
+ */
+const LEVELS = [
+  { zoom: BASE_ZOOM, bbox: REGION_BBOX, paged: false },
+  { zoom: MID_ZOOM, bbox: REGION_BBOX, paged: true },
+  { zoom: FINE_ZOOM, bbox: FINE_BBOX, paged: true },
+];
+
 async function main() {
   const args = parseArgs();
-  const zoom = args.zoom ? Number(args.zoom) : BASE_ZOOM;
   const force = Boolean(args.force);
 
-  console.log(`Baking DEM from ${SOURCE}`);
-
-  const levels = [];
-  levels.push(await bakeLevel(REGION_BBOX, zoom, force));
-
-  // The inset is on by default — z=11 alone is too coarse under the wheels on
-  // short final, which is precisely where the user will be looking. Pass
-  // --skip-detail for a quick base-only bake.
-  if (!args['skip-detail']) {
-    levels.push(await bakeLevel(DETAIL_BBOX, DETAIL_ZOOM, force));
+  // --levels=11,13 bakes a subset. --zoom=N is kept as an alias for the old
+  // single-level invocation so anything scripted against it still works.
+  let wanted = LEVELS;
+  if (args.levels) {
+    const keep = new Set(String(args.levels).split(',').map(Number));
+    wanted = LEVELS.filter((l) => keep.has(l.zoom));
+  } else if (args.zoom) {
+    wanted = LEVELS.filter((l) => l.zoom === Number(args.zoom));
   }
+
+  console.log(`Baking DEM from ${SOURCE}`);
+  const t0 = Date.now();
+
+  // Existing levels are preserved when only a subset is baked, so a partial
+  // re-run cannot amputate the manifest and leave the runtime with no base.
+  /** @type {Array<object>} */
+  let levels = [];
+  const prior = resolve(PUBLIC_DIR, 'dem/manifest.json');
+  if (existsSync(prior)) {
+    try {
+      levels = JSON.parse(await readFile(prior, 'utf8')).levels ?? [];
+    } catch {
+      levels = [];
+    }
+  }
+
+  for (const spec of wanted) {
+    const level = await bakeLevel(spec.bbox, spec.zoom, force);
+    level.paged = spec.paged;
+    const at = levels.findIndex((l) => l.zoom === spec.zoom);
+    if (at >= 0) levels[at] = level;
+    else levels.push(level);
+  }
+  levels.sort((a, b) => a.zoom - b.zoom);
 
   await writeJson('dem/manifest.json', {
     generated: new Date().toISOString(),
@@ -255,6 +316,12 @@ async function main() {
     encoding: 'terrarium',
     levels,
   });
+
+  const total = levels.reduce((n, l) => n + l.tiles.length, 0);
+  console.log(
+    `\n${total} tiles across ${levels.length} levels in ` +
+      `${((Date.now() - t0) / 1000).toFixed(1)} s`,
+  );
 }
 
 main().catch((err) => {

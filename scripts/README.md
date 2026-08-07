@@ -47,8 +47,13 @@ both files in the same commit.**
 ```
 public/
   dem/
-    manifest.json          { generated, source, encoding, levels:[{zoom,tileSize,bbox,tiles:["x/y",...]}] }
+    manifest.json          { generated, source, encoding,
+                             levels:[{zoom,tileSize,bbox,paged,tiles:["x/y",...]}] }
     11/321/709.png         verbatim Terrarium bytes — never re-encode
+                           `paged:true` means the level is too big to hold
+                           decoded and elevation.js streams it. Advisory: the
+                           runtime sets its own policy, but a bake that doubles
+                           a level should say so here.
   data/
     airports.json          { generated, source, bbox, airports:[...] }
     landmarks.json         { generated, source, landmarks:[...] }
@@ -65,8 +70,18 @@ Probed live before this scaffold was written:
 - **DEM.** 256×256, 8-bit RGB. `elevation_m = (R*256 + G + B/256) - 32768`.
   Tile size varies hugely with terrain — an ocean tile is ~5 kB, the Mount
   Rainier tile is 145 kB. Region tile counts: z9 = 20, z10 = 72, **z11 = 238
-  (52 m/px, the base level)**, z12 = 891, z13 = 3380. The Seattle inset at z13
-  is only ~140 tiles.
+  (51.8 m/px, the pinned base)**, z12 = 891, **z13 = 3,380 (12.95 m/px, the
+  paged working layer)**, z14 = 13,158 region-wide but **560 over the Seattle
+  inset (6.47 m/px)**, z15 = 51,712.
+
+  **z=15 is deliberately not baked.** Measured by downloading each child tile,
+  bilinearly upsampling its parent and taking the RMS of the difference — i.e.
+  the information the finer level actually adds: z13→z14 is 0.28 m RMS / 3.4 m
+  peak over the airports, which is real; z14→z15 is 0.05 m RMS / 1.2 m peak,
+  which is upsampling. The underlying source is 3DEP 1/3 arc-second (~10 m), so
+  there is nothing below z14 to find. Re-run that probe before adding z15.
+
+  Current bake: **4,178 tiles, 402.6 MB, ~63 s cold at concurrency 10.**
 - **Airports.** 266 in the bbox, 246 runways — but only ~46 runways carry real
   endpoint coordinates. `le_heading_degT` is frequently *magnetic*: KBFI
   publishes 140 where the true heading is 150.2. KSEA's endpoints are rounded

@@ -100,6 +100,13 @@ the mesh instead would make ground contact *change when LOD changes*, which is
 far worse. Fix it with more triangles near the camera, never by changing the
 sampler.
 
+**Paging does not weaken this.** The elevation field is now streamed (§2.4), so
+what it returns at a point can improve as tiles arrive — but it improves for
+*both* callers at once, because there is still only one sampler. The pager's job
+is to make sure the change never happens under the wheels: it prefetches along
+the flight path and fades each tile in over 1.5 s. Measured worst-case ground
+movement from a page-in, flying KBFI to Rainier: **0.0000 m**.
+
 ### 1.5 Geographic truth vs. procedural texture
 
 Real: terrain **shape**, airport **positions**, runway **headings and lengths**,
@@ -237,52 +244,115 @@ from those endpoints agree exactly. Do not substitute haversine.
 ### 2.4 `src/geo/elevation.js` — the ground surface
 
 ```js
-SEA_LEVEL_M    // 0
-WATER_LEVEL_M  // 0.5 — salt water only, see below
-DEM_ZOOM       // 11, base level: 238 tiles, ~52 m/px
-DETAIL_ZOOM    // 13, optional Seattle inset, ~13 m/px
-DETAIL_BBOX    // {south:47.35, north:47.75, west:-122.5, east:-122.1}
+SEA_LEVEL_M         // 0
+WATER_LEVEL_M       // 0.5 — salt water only, see below
+DEM_ZOOM            // 11, PINNED base: 238 tiles, 51.8 m/px, whole region
+DETAIL_ZOOM         // 13, PAGED working layer: 3,380 tiles, 12.95 m/px, whole region
+FINE_ZOOM           // 14, PAGED approach layer: 560 tiles, 6.47 m/px
+DETAIL_BBOX         // {south:47.35, north:47.75, west:-122.5, east:-122.1} — FINE_ZOOM's box
+RESIDENT_CAP_BYTES  // 96 MiB. Hard ceiling on decoded elevation. Asserted.
 
-loadRegion(bbox?, zoom?) -> Promise<void>   // ADDITIVE, call once per level
+loadRegion(bbox?, zoom?)   -> Promise<void>   // ADDITIVE, one call per level
+loadDetailLayers(baseZoom?) -> Promise<void>  // every finer level in the manifest
+setViewer(x, z, vx?, vz?, dtMs?) -> void      // PER FRAME. Drives paging.
+warmAt(lat, lon)  -> Promise<void>            // page in around a point, then wait
+flushPaging()     -> Promise<void>            // drain everything. NOT per-frame.
 isLoaded() -> boolean
 getRegionStats() -> {loaded, layers, tilesLoaded, tilesMissing, voidsRepaired,
-                     minElevationM, maxElevationM}
+                     minElevationM, maxElevationM, residentBytes,
+                     peakResidentBytes, residentCapBytes, residentTiles,
+                     pageIns, evictions, capViolations, pendingLoads}
 
 getElevation(lat, lon) -> metres MSL        // bilinear, never NaN, never throws
 getElevationLocal(x, z) -> metres MSL       // allocation-free
-getNormalLocal(x, z, epsM?) -> {x, y, z}    // unit, +Y up
+getNormalLocal(x, z, epsM?) -> {x, y, z}    // unit, +Y up. epsM default 15.
 fillHeightGrid(x0, z0, dx, dz, nx, nz, out?) -> Float32Array
 isWater(lat, lon) -> boolean
 isInRegion(lat, lon) -> boolean
 decodeTerrarium(r, g, b) -> metres          // (R*256 + G + B/256) - 32768
+getLayerElevation(zoom, lat, lon) -> {height, weight, resident}   // diagnostics
+setTileProvider({fetchPixels?, manifest?})  -> void               // see below
 ```
 
-**Layers.** `loadRegion()` is additive. Each call adds a layer at some zoom over
-some bbox; sampling consults layers from highest zoom down and uses the first
-with a loaded tile. Bake z=11 over the region for Mount Rainier's shape *and*
-z=13 over Seattle for crisp ground near the airports — no other module needs to
-know which layer answered.
+**Three layers, and only one of them is resident.** 4,178 tiles are baked.
+Decoded, z=13 alone is 443 MB, which cannot be held. So:
+
+| zoom | tiles | m/px | coverage | residency |
+|---|---|---|---|---|
+| 11 | 238 | 51.8 | whole region | **pinned**, 29.75 MiB, never evicted |
+| 13 | 3,380 | 12.95 | whole region | paged, 30 km radius, 288-tile budget |
+| 14 | 560 | 6.47 | Seattle inset | paged, 9 km radius, 128-tile budget |
+
+Peak resident is **81.8 MiB** against a 96 MiB cap, measured by
+`npm run check:elevation`. The full derivation is in `elevation.js § PAGING`;
+the four rules that bind other modules are:
+
+1. **`getElevation` never blocks and never awaits.** It reads only decoded
+   tiles. A tile that has not arrived is a miss, not a wait.
+2. **A miss falls to the next COARSER layer, never to zero.** That is the whole
+   reason z=11 is pinned: inside the region there is always an answer. A 0 m
+   return over the Cascades is a 2 km cliff, and the flight model would
+   correctly destroy the aeroplane on it.
+3. **Someone must call `setViewer()` every frame** or the fine layers never
+   follow the aircraft. `world/terrain.js#update()` does, from the camera. It is
+   on the rAF path *and* the `window.sim.tick()` path.
+4. **Teleports must `await warmAt(lat, lon)` before reading the ground there.**
+   `main.js#gotoPlace` does. Without it you land on the 51.8 m/px base and the
+   terrain morphs underneath you afterwards.
+
+**Layers BLEND, they do not switch.** Round 1 returned the first layer that had
+a tile, which made every layer boundary a step — the critic saw the inset as "a
+hard rectangle whose edge is a visible ledge". Sampling now folds finest to
+coarsest spending a weight budget, and the weight is the product of three fades:
+distance inside the layer's own bbox (3 km band), distance from the viewer
+(fades out at 0.65–0.85 of the paging radius, well inside the guaranteed
+coverage), and a 1.5 s per-tile ramp after decode so a tile arriving behind a
+teleport cannot move the ground in one frame. A layer at weight 1 short-circuits
+the fold, so the common case costs what it always did. Measured: **0.48 m of
+step at the inset edge against 12.76 m of ordinary terrain roughness** on the
+same transect.
+
+None of this touches §1.4. The mesh (`fillHeightGrid`) and the collision surface
+(`getElevationLocal`) call the same sampler, so whatever the blend says at a
+given instant, both agree to the centimetre.
+
+**Storage is Int16 quarter-metres, not Float32.** That halves resident bytes,
+which doubles the radius a budget can cover, and costs 0.25 m of quantisation on
+a source whose own vertical accuracy is ±3 m. Do not "fix" it to Float32.
 
 **Sampling crosses tile seams.** Bilinear interpolation happens in global pixel
 space, not per-tile, which is what stops the terrain showing a grid of creases.
 
 **`getElevation` is total.** Outside the region, before loading, on bad input:
-returns `SEA_LEVEL_M`. It is called every physics step and must never be able
-to trip over a gap in the data.
+returns `SEA_LEVEL_M`. It is called several times per wheel per substep and must
+never be able to trip over a gap in the data.
 
-**The source has voids, and they are repaired at decode.** Terrarium ships
-scattered holes: 3,652 pixels across our 378 baked tiles, including a -14,492 m
-spike near Hood Canal, a -497 m scanline in the tideflats at 47.4880/-122.3660,
-and a 78-pixel blob reading -2,437 m at 47.3828/-122.3897 — on the KSEA
-approach. Untreated, each is a kilometres-deep needle through the terrain mesh
-and a garbage `altitudeAglFt` for anything flying over it.
+**The source has voids, and they are repaired at decode.** Untreated, each is a
+kilometres-deep needle through the terrain mesh and a garbage `altitudeAglFt`
+for anything flying over it. Every pixel is screened on two independent tests —
+an absolute plausibility band and deviation from the 8-neighbour median (150 m,
+above the steepest real Cascade terrain at every zoom) — then neighbour-filled.
 
-`loadTile()` therefore screens every pixel on two independent tests — an
-absolute plausibility band, and deviation from the 8-neighbour median (150 m,
-measured to sit above the steepest real Cascade terrain at both zooms) — then
-neighbour-fills whatever fails. `voidsRepaired` reports the count. Do not add
-flood-fill propagation between pixels: it is redundant against the band test
-and it walks up steep faces. See the note in `elevation.js`.
+The band is `[-60, 5000]` m and **both limits are measured, not guessed**. Round
+1 used `[-500, 9000]` and 144 voids survived inside it, the worst reading
+-497.8 m. Bucketing every negative pixel in all 4,178 tiles by depth, and
+marking those that jump more than 20 m to a neighbour, gives a categorical
+boundary that lands in the same place at all three zooms: real smooth
+bathymetry stops in `[-50, -40)`, and **every pixel below -60 m is
+discontinuous, without exception**. Terrarium carries nearshore bathymetry only
+here — the main Puget Sound basin is a flat zero, not its true -280 m — so there
+is no real data below -60 to lose. The ceiling likewise: the highest real ground
+is Rainier at 4,393 m, and 32,767 m is the all-ones no-data sentinel, which
+`9000` let straight through. Minimum decoded sample is now exactly -60.0 m.
+
+Do not add flood-fill propagation between pixels: it is redundant against the
+band test and it walks up steep faces. See the note in `elevation.js`.
+
+**`setTileProvider` is not a test backdoor.** The browser path reads tiles
+through fetch + canvas, which needs a DOM, so the paging policy, the byte
+accounting and the eviction could not otherwise be asserted anywhere. It swaps
+the pixel source only; `scripts/check-elevation.mjs` runs the shipping module
+against the real baked tiles in Node.
 
 **Water.** `isWater()` finds *salt* water only. Terrarium gives freshwater lakes
 their real surface elevation — Lake Washington reads ~5 m, not 0 — so lakes need
@@ -329,10 +399,35 @@ drawn on a fitted plane, but that plane is capped at a small lift, so anywhere
 the DEM lacks an airport's earthworks the ground poked through and the runway
 rendered in pieces. `buildDeckProfile` raises the deck locally to
 `max(plane, terrain + 0.25 m)`. A runway whose plane already clears the ground
-is left bit-identical (median bend across the region: **9 cm**; KBFI: 2.4 cm);
-only two runways bend more than 5 m, worst being KSEA 16R/34L at **12.9 m**,
-whose Miller Creek embankment is simply not in the source DEM. Flush beats flat
-— the DEM is the collision surface (§1.4).
+is left bit-identical (median bend across the region: **9 cm**; KBFI: 2.4 cm).
+Flush beats flat — the DEM is the collision surface (§1.4).
+
+**KSEA 16R/34L IS NOT AN ELEVATION BUG, and raising the DEM resolution proved
+it rather than fixing it.** Round 1 measured a 12.9 m hump there at 51.8 m/px
+and hoped 12.95 m/px would resolve it. Re-measured against the surveyed
+threshold elevations at the new resolution (`npm run check:elevation`):
+
+| runway | worst deck-above-DEM |
+|---|---|
+| 16L/34R | **0.1 m** |
+| 16C/34C | 11.7 m, and only in the last 10% at the south threshold |
+| 16R/34L | **55.7 m**, at 28% along from the north threshold |
+
+The two plateau runways are essentially perfect, which is the strongest
+available evidence that the DEM's georeferencing and vertical datum are right.
+16R/34L is the 2008 third runway, and it crosses the Miller Creek valley on a
+man-made MSE retaining wall. 3DEP's bare-earth terrain does not contain that
+earthwork, so the finer the DEM gets, the better it resolves the *natural
+ravine* the wall spans and the larger the gap to the deck becomes. 12.9 m was a
+51.8 m/px smoothing of a real 55.7 m ravine.
+
+**This is now airports.js's problem, not elevation.js's.** Faking the fill in
+the DEM would be inventing geography (§1.5). The embankment is airport
+*infrastructure* and belongs in the runway deck: `buildDeckProfile` currently
+lifts the deck where terrain pokes *through* it and does nothing where the
+terrain falls *away*, so 16R/34L will render on a plane with a 55 m canyon
+under it. Skirting the deck down to the terrain would draw the retaining wall
+that is actually there.
 
 **`headingDeg` is TRUE, not magnetic.** The upstream `le_heading_degT` column
 frequently is not: KBFI publishes 140 where its own endpoints give 150.13 and
@@ -401,7 +496,7 @@ opts = {
   loadDem = true,
   exaggeration = 1,      // KEEP AT 1. Anything else makes the terrain a lie.
   seaLevelM = SEA_LEVEL_M,
-  detail = true,         // load the z13 Seattle inset as a second layer
+  detail = true,         // load every finer DEM level the manifest declares
   water = true,          // draw the sea plane and the freshwater lake quads
   landcover = true,      // load the baked NLCD rasters and let them drive albedo
   lodQuality = 1,        // scales the CDLOD screen-error budget
@@ -734,6 +829,12 @@ source. Summary:
 `npm run bake` is **not** part of `npm run build` — baking hits the network and
 takes minutes; the build stays fast and offline.
 
+The DEM bake is **4,178 tiles / 402.6 MB** across three levels and takes about
+63 s cold at concurrency 10. It is gitignored; the manifest is not, so the tile
+list and the zoom levels stay under review. Re-runs skip what is on disk, so
+adding a level is cheap. `node scripts/bake-dem.mjs --levels=13` bakes a subset
+without amputating the other levels from the manifest.
+
 `scripts/lib/util.mjs` duplicates `REGION_BBOX` and `ORIGIN` from
 `geo/coords.js` because there is no import path from a Node script into the
 browser bundle. **Change one, change the other.**
@@ -763,3 +864,8 @@ Cheap, specific, and each one falsifies a whole class of bug.
    MAGNETIC; do not "fix" these to 160.
 8. **No landmark outside the region.** Console shows no `[landmarks] dropping…`
    warnings; if it does, a Q-ID is wrong.
+9. **Memory is flat over a long flight.** `window.sim.demStats()` reports
+   `peakResidentBytes` ≈ 82 MiB and `capViolations: 0`. Fly for ten minutes and
+   fetch it again: the peak must not climb. The DEM on disk is 402 MB and the
+   pager is the only thing standing between that and the tab. `capViolations`
+   above zero is a paging bug, never a tuning problem.

@@ -43,7 +43,7 @@
 import * as THREE from 'three';
 
 import { setOrigin, DEFAULT_ORIGIN, distanceBetween, bearingBetween } from './geo/coords.js';
-import { getRegionStats } from './geo/elevation.js';
+import { getRegionStats, warmAt } from './geo/elevation.js';
 import { loadAirports, buildRunwayMeshes, getSpawn } from './geo/airports.js';
 import { placeLandmarks } from './geo/landmarks.js';
 import { createTerrain } from './world/terrain.js';
@@ -171,7 +171,7 @@ async function boot() {
   setOrigin(DEFAULT_ORIGIN.lat, DEFAULT_ORIGIN.lon);
 
   // 2. Terrain loads the DEM and is the gate for every ground query below.
-  overlay.setLoadingText('loading 378 elevation tiles…');
+  overlay.setLoadingText('loading elevation tiles…');
   await nextFrame(); // let the loading screen actually paint before we block
   const terrain = await createTerrain(scene, {});
 
@@ -286,12 +286,22 @@ async function boot() {
     };
   }
 
-  gotoPlace = function gotoPlaceImpl(i) {
+  gotoPlace = async function gotoPlaceImpl(i) {
     const p = PLACES[i];
     if (!p) return;
     placeIndex = i;
 
     const r = resolvePlace(p);
+
+    // Page the fine DEM in at the destination BEFORE anything reads the ground
+    // there. The z=13 and z=14 layers follow the aircraft (elevation.js
+    // § PAGING) and hold nothing where it has not been, so without this the
+    // reset below would place the aeroplane on the 51.8 m/px pinned base and
+    // the terrain would then morph under it as the real data arrived. A few
+    // hundred milliseconds inside a teleport is not something anyone can see.
+    // §1.6: a paging failure degrades the view, it does not cancel a teleport.
+    await warmAt(r.lat, r.lon).catch(() => {});
+
     flight.reset(r.lat, r.lon, r.headingDeg, r.placement);
 
     // The lever is part of the situation. Arriving at 3,000 ft with the
@@ -526,6 +536,13 @@ async function boot() {
     input,
     sound,
     gotoPlace,
+    /**
+     * DEM paging diagnostics — acceptance check 9. The tiles on disk total
+     * 402 MB and only a bounded working set is ever decoded, so the two numbers
+     * that matter are `peakResidentBytes` (must stay flat over a long flight)
+     * and `capViolations` (must be 0).
+     */
+    demStats: () => getRegionStats(),
     /** Run n frames of exactly dt seconds each, through the real loop. */
     tick(dt = 1 / 60, n = 1) {
       const h = Math.min(Math.max(dt, 0), 0.1);

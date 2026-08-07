@@ -2,9 +2,9 @@ node_modules/
 dist/
 .DS_Store
 
-# Baked DEM tiles: 378 PNGs, 38.9 MB, reproducible with `npm run bake:dem`.
-# Too big for the repo, and they are a pure function of the bake script plus the
-# bbox in the manifest. The manifest itself IS tracked (see the negation below)
-# so the tile list and zoom levels stay under review.
+# Baked DEM tiles: 4,178 PNGs, 402.6 MB, reproducible with `npm run bake:dem`
+# in about a minute. Far too big for the repo, and they are a pure function of
+# the bake script plus the bbox in the manifest. The manifest itself IS tracked
+# (see the negation below) so the tile list and zoom levels stay under review.
 public/dem/**/*.png
 !public/dem/manifest.json

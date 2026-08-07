@@ -83,13 +83,13 @@
 import * as THREE from 'three';
 import {
   loadRegion,
+  loadDetailLayers,
+  setViewer,
   getElevationLocal,
   fillHeightGrid,
   isLoaded as demLoaded,
   SEA_LEVEL_M,
   DEM_ZOOM,
-  DETAIL_ZOOM,
-  DETAIL_BBOX,
   WATER_LEVEL_M,
 } from '../geo/elevation.js';
 import { REGION_BBOX, llToLocal } from '../geo/coords.js';
@@ -106,8 +106,10 @@ import { clamp } from '../core/units.js';
  *           has no global segment count. See `grid` if you need to tune density.
  * @property {{south:number,north:number,west:number,east:number}} [bbox] DEM region.
  * @property {number} [zoom]         Base DEM zoom to load. Default DEM_ZOOM (11).
- * @property {boolean} [detail]      Also load DETAIL_ZOOM over DETAIL_BBOX, so the
- *           ground around KBFI/KSEA/downtown is 13 m/px instead of 52. Default true.
+ * @property {boolean} [detail]      Also load every finer level the DEM manifest
+ *           declares — z=13 region-wide at 12.95 m/px and z=14 over the Seattle
+ *           inset at 6.47 m/px. These are paged, not resident. Default true.
+ *           With it off the whole region is the 51.8 m/px pinned base.
  * @property {boolean} [loadDem]     Set false to skip loading (tests). Default true.
  * @property {number} [exaggeration] Vertical scale. KEEP AT 1 — anything else makes
  *           the terrain a lie. Exposed only for debugging.
@@ -364,6 +366,9 @@ vec3 tSrgb(vec3 c) { return c * c * (c * 0.305306011 + 0.682171111) + c * 0.0125
 // ---------------------------------------------------------------------------
 
 const _camPos = new THREE.Vector3();
+/** Previous camera position + timestamp, for the DEM pager's velocity lead. */
+const _camPrev = new THREE.Vector3();
+let _camPrevMs = -1;
 const _probe = new Float32Array(81);
 /** Hoisted so evictStale()'s sort does not allocate a comparator per frame. */
 const byLastUsed = (a, b) => a.lastUsed - b.lastUsed;
@@ -394,11 +399,17 @@ export async function createTerrain(scene, opts = {}) {
     : Promise.resolve(null);
 
   if (cfg.loadDem) {
+    // The base layer is PINNED: every tile, decoded, before the first frame.
+    // It is the floor that makes a paging miss survivable (elevation.js
+    // § PAGING, property 2), so it is the one thing worth blocking boot on.
     await loadRegion(cfg.bbox, cfg.zoom);
     if (cfg.detail) {
-      // Additive second layer. elevation.js samples finest-first, so this just
-      // sharpens the ground around the airports with no seam handling here.
-      await loadRegion(DETAIL_BBOX, DETAIL_ZOOM);
+      // Every finer level the manifest declares — currently z=13 region-wide
+      // and z=14 over the Seattle inset. These are PAGED: this awaits only a
+      // small warm-up disc around the spawn and the rest streams in behind
+      // setViewer() below. Asking the manifest rather than naming the zooms
+      // means adding a level to bake-dem.mjs needs no change here.
+      await loadDetailLayers(cfg.zoom);
     }
   }
   const landcover = await landcoverPromise;
@@ -602,6 +613,32 @@ export async function createTerrain(scene, opts = {}) {
   function update(camera) {
     if (!camera) return;
     camera.getWorldPosition(_camPos);
+
+    // Drive the DEM pager. The fine elevation layers are far too big to hold
+    // resident (elevation.js § PAGING), so they follow the camera: this is the
+    // one call that tells them where it is and how fast it is going, and the
+    // page-in and decode work is metered inside it. It sits on BOTH the rAF
+    // path and the window.sim.tick() path because both go through update().
+    //
+    // Velocity is differenced here rather than taken from flightModel.state
+    // because terrain.js has no business reading aircraft state — and the
+    // camera is what the LOD is built around anyway.
+    const tNow = performance.now();
+    if (_camPrevMs >= 0) {
+      const dtMs = Math.min(Math.max(tNow - _camPrevMs, 0.1), 200);
+      const inv = 1000 / dtMs;
+      setViewer(
+        _camPos.x,
+        _camPos.z,
+        (_camPos.x - _camPrev.x) * inv,
+        (_camPos.z - _camPrev.z) * inv,
+        dtMs,
+      );
+    } else {
+      setViewer(_camPos.x, _camPos.z, 0, 0, 16.7);
+    }
+    _camPrev.copy(_camPos);
+    _camPrevMs = tNow;
 
     buildDeadline = performance.now() + BUILD_BUDGET_MS;
     selectFrom(_camPos.x, _camPos.y, _camPos.z);
