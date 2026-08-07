@@ -52,26 +52,88 @@
  * single place that happens.
  *
  * ---------------------------------------------------------------------------
- * FOG IS A VISIBILITY BUDGET, NOT A MOOD SETTING
+ * TONE MAPPING, CALIBRATED — WHY THE OLD SKY WAS FLAT
  * ---------------------------------------------------------------------------
- * Mount Rainier is 84 km from the spawn and seeing it is the headline proof
- * that our elevation data is real. FogExp2 attenuates by exp(-(d*density)^2),
- * so density must be chosen against that distance, not by eye at 2 km.
- * Measured (see the table in MODULES.md § 2.8, reproduced from the tuning rig):
+ * Round 1 shipped `exposure: 0.36` with `rayleigh: 3`, and the verdict was "a
+ * flat pale blue-grey with almost no vertical gradient". The Rayleigh and Mie
+ * terms were fine. The exposure was not.
  *
- *   density   5 km    20 km   45 km   84 km (Rainier)   127 km (map corner)
- *   8.0e-5    0.852   0.077   0.000   0.000             0.0000   <- invisible
- *   2.0e-5    0.990   0.852   0.445   0.059             0.0016   <- a ghost
- *   1.1e-5    0.997   0.953   0.783   0.426             0.1420   <- correct
- *   8.0e-6    0.998   0.975   0.878   0.637             0.3562   <- too clear
+ * Preetham's radiance at these settings puts the whole visible dome ABOVE the
+ * ACES curve's knee, where the curve's slope is a fifth of what it is at the
+ * bottom. Worked example, sun at 35 deg, looking anti-solar, per channel BEFORE
+ * the curve: zenith 0.19 / 0.62 / 1.20, horizon 1.35 / 1.38 / 1.39. The model
+ * has a 6.3:1 blue-to-red ratio overhead. ACES at that exposure returns 0.35 /
+ * 0.68 / 0.83 — a 2.4:1 ratio. Five sixths of the colour is destroyed by the
+ * curve, not by the model, and the same compression flattens zenith against
+ * horizon. A flight-sim camera only ever shows the bottom ~30 deg of the dome,
+ * which is exactly where the old calibration was whitest.
  *
- * If you raise the density, re-derive it against 84 km first.
+ * So the constants were re-fitted, not the model. `scripts/check-sky.mjs`
+ * carries the rig: eleven elevations from zenith to 1 deg, weighted toward the
+ * 0-40 deg band a cockpit camera actually frames, scored against measured
+ * clear-day sky colours in sRGB. Mean weighted error:
  *
- * The one refinement on top of a plain FogExp2: haze is not uniform with
- * height. Aerosol scale height is ~2.5 km, so the density is scaled by
- * exp(-cameraY / fogHeightScaleM). At sea level nothing changes (Rainier stays
- * at the 0.426 above); at 3,000 ft the air genuinely clears and the mountain
- * sharpens. Set `fogHeightScaleM: 0` to disable.
+ *   round 1   rayleigh 3    mieCoefficient 0.0025  pow 1.5  exposure 0.36  47.5
+ *   now       rayleigh 1.2  mieCoefficient 0.002   pow 1.2  exposure 0.95  12.7
+ *
+ *   elevation      90    45    25    12     5     1
+ *   round 1      127   122   159   204   229   237   <- 110 units over 89 deg
+ *   now           89    85   115   165   208   231   <- 142 units, and it is
+ *   measured      55    85   125   170   210   232      blue where it should be
+ *
+ * (red channel shown; the full triples are in the harness.) PREETHAM_CONTRAST
+ * is Preetham's undocumented output exponent — three's Sky example hardcodes
+ * 1.5 with no derivation. 1.2 fits measured sky better. It is a single named
+ * constant, shared by the GLSL and the JS, like every other one here.
+ *
+ * ---------------------------------------------------------------------------
+ * AERIAL PERSPECTIVE REPLACES FogExp2 ENTIRELY
+ * ---------------------------------------------------------------------------
+ * `FogExp2` has one scalar density and one colour, so every channel fades at
+ * the same rate toward the same value. Everything far away therefore converges
+ * on one grey. Measured, at the round-1 budget, 94 km:
+ *
+ *   Mount Rainier rock   sRGB 213,214,214   <- the critic's "grey nub"
+ *   Mount Rainier snow   sRGB 241,244,246   <- 28 units of separation, no hue
+ *
+ * That is not what distance does. Distance is *spectral*: Rayleigh extinction
+ * goes as lambda^-4, so blue is stripped from the transmitted image ~5x faster
+ * than red while the in-scattered airlight fills back in blue-first. Distant
+ * dark things go BLUE. Distant bright things (snow) barely move, because they
+ * are already the brightness of the airlight. The mountain separates by hue.
+ *
+ * So three's four fog chunks are replaced, at module scope, with a two-species
+ * airlight model:
+ *
+ *   tau_c   = density * ( betaR_c * I(8000) + aerosol * betaM_c * I(1200) )
+ *   I(H)    = L * exp(-y0/H) * (1 - exp(-dy/H)) / (dy/H)
+ *   result  = mix( airlight, fragment, exp(-tau) )
+ *
+ * I(H) is the exact column density of an exponential atmosphere along the
+ * segment from the camera's altitude to the fragment's — not an approximation,
+ * and it costs two exp() calls. Because it is a function of BOTH endpoints,
+ * valleys haze more than the ridges above them, which `FogExp2` cannot express
+ * at all: it only knows range. Same 94 km shot, same budget:
+ *
+ *   transmittance R/G/B        rock            snow
+ *   summit  0.72 / 0.51 / 0.25  180,199,223     244,245,245
+ *   base    0.58 / 0.36 / 0.14  194,212,232     243,244,245
+ *
+ * Rock is now blue and 60 units below snow in red, the base is hazier than the
+ * summit, and the cone reads as a cone. `fogDensity` is still a visibility
+ * budget and still means "sea-level extinction of the green channel, per
+ * metre"; 8e-6 reproduces the round-1 84 km contrast of ~0.43 as the AVERAGE
+ * over the mountain's height, with real structure either side of it.
+ *
+ * Two notes for anyone touching this. The fragment's world Y arrives through a
+ * varying written in `fog_vertex` — `cameraPosition + mvPosition.xyz *
+ * mat3(viewMatrix)` recovers world space from view space for skinned,
+ * instanced and morphed geometry alike, which reading `modelMatrix` would not.
+ * And the composite happens in DISPLAY-ENCODED space, after
+ * `<colorspace_fragment>`, exactly where three's own fog runs — deliberately,
+ * because `fogColor` is uploaded pre-encoded by `refreshFogUniforms` and doing
+ * the blend in linear would need to know which encoding the renderer picked
+ * for the current target.
  *
  * ---------------------------------------------------------------------------
  * CLOUDS: TWO REPRESENTATIONS OF ONE DECK
@@ -104,22 +166,27 @@
 
 import * as THREE from 'three';
 import { clamp, lerp, damp, DEG_TO_RAD, RAD_TO_DEG } from '../core/units.js';
+import { createShadows } from './shadows.js';
 
 /**
  * @typedef {Object} SkyOpts
  * -- documented in MODULES.md § 2.8 --
  * @property {number} [turbidity]      Atmospheric haze, Preetham T. Default 8.
- * @property {number} [fogDensity]     FogExp2 density at sea level. Default 1.1e-5.
+ * @property {number} [fogDensity]     Aerial-perspective budget: sea-level extinction
+ *           of the GREEN channel, per metre. Red and blue follow from lambda^-4.
+ *           Default 8e-6.
  * @property {number} [timeOfDay]      Initial time, 0..1. Default 0.42.
  * @property {number} [sunDistance]    Sun light placement radius, metres. Default 120000.
  * @property {number} [sunAzimuthDeg]  Compass bearing the sun culminates over. Default 180.
  * @property {number} [dayLengthSec]   Real seconds per in-sim day. Default 0 = frozen.
  *
  * -- additions, all optional, all with working defaults --
- * @property {number} [rayleigh]       Rayleigh scattering multiplier. Default 3.
- * @property {number} [mieCoefficient] Mie scattering multiplier. Default 0.0025.
+ * @property {number} [rayleigh]       Rayleigh scattering multiplier. Default 1.2 (fitted).
+ * @property {number} [mieCoefficient] Mie scattering multiplier. Default 0.002 (fitted).
  * @property {number} [mieDirectionalG] Mie forward-scatter anisotropy. Default 0.76.
- * @property {number} [exposure]       Sky-local tone-map exposure. Default 0.36.
+ * @property {number} [exposure]       Sky-local tone-map exposure. Default 0.95 (fitted).
+ * @property {number} [fogViewBlend]   How far the airlight colour follows the camera's
+ *           heading rather than the horizon average, 0..1. Default 0.7.
  * @property {number} [latitudeDeg]    Latitude for the solar arc. Default 47.5 (Seattle).
  * @property {number} [declinationDeg] Solar declination. Default 0 (equinox) — which
  *           is what makes t=0.25 exactly sunrise and t=0.75 exactly sunset.
@@ -132,13 +199,19 @@ import { clamp, lerp, damp, DEG_TO_RAD, RAD_TO_DEG } from '../core/units.js';
  *           (full moon, opposite the sun, up all night).
  * @property {boolean} [environment]   Generate a PMREM IBL from the sky. Default true.
  * @property {number} [environmentIntensity] scene.environmentIntensity. Default 0.3.
- * @property {number} [fogHeightScaleM] Aerosol scale height. 0 disables. Default 2600.
+ * @property {number} [fogHeightScaleM] IGNORED. The aerial-perspective model integrates
+ *           the real height profile between camera and fragment; this option used to
+ *           approximate that and would now double-count. Kept so callers do not break.
  * @property {boolean} [clouds]        Build the cloud deck. Default true.
  * @property {number} [cloudCoverage]  0 = clear, 1 = overcast. Default 0.62 (broken).
  * @property {number} [cloudBaseM]     Deck base, metres MSL. Default 850 (~2800 ft).
  * @property {number} [cloudTopM]      Deck top, metres MSL. Default 1250.
  * @property {number} [cloudScale]     World metres -> macro-noise units. Default 1/1400.
- * @property {number} [cloudLayers]    Near-field slab count. Default 6.
+ * @property {number} [cloudLayers]    Near-field slab count. Default 8.
+ * @property {number} [cloudShearM]    Downwind lean of the deck's top relative to its
+ *           base, metres. 0 makes the deck a vertical extrusion. Default 900.
+ * @property {number} [cloudSunDepth]  Optical depth per unit macro density along the
+ *           ray to the sun; drives self-shadowing. Default 2.4.
  * @property {number} [cloudRadiusM]   Near-field slab half-width. Default 30000.
  * @property {number} [cloudHandoverM] Distance the near field hands over to the dome.
  *           Default 20000; the fade runs to +4 km.
@@ -146,20 +219,30 @@ import { clamp, lerp, damp, DEG_TO_RAD, RAD_TO_DEG } from '../core/units.js';
  * @property {number} [cloudWindDirDeg] Bearing the deck drifts TOWARD. Default 215.
  * @property {number} [inCloudVisibilityM] Visibility inside cloud. Default 190.
  * @property {boolean} [stars]         Star field + Milky Way band. Default true.
+ * @property {boolean} [shadows]       Cascaded shadow maps. Default true.
+ * @property {string}  [shadowQuality] 'off' | 'low' | 'medium' | 'high'. Default 'high'.
+ * @property {boolean} [aircraftReceivesShadow] Default true.
  */
 
 const DEFAULTS = {
   turbidity: 8,
-  fogDensity: 1.1e-5,
+  // Sea-level extinction of the GREEN channel, per metre. Red and blue follow
+  // from lambda^-4; see AERIAL below. 8e-6 reproduces the round-1 84 km Rainier
+  // contrast of ~0.43 as the average over the mountain's height.
+  fogDensity: 8.0e-6,
   timeOfDay: 0.42,
   sunDistance: 120000,
   sunAzimuthDeg: 180,
   dayLengthSec: 0,
 
-  rayleigh: 3,
-  mieCoefficient: 0.0025,
+  // Re-fitted against measured sky colours — see the header. Weighted sRGB
+  // error 12.7 (was 47.5 at rayleigh 3 / exposure 0.36).
+  rayleigh: 1.2,
+  mieCoefficient: 0.002,
   mieDirectionalG: 0.76,
-  exposure: 0.36,
+  exposure: 0.95,
+  /** How far the fog colour follows the camera's heading, 0..1. See §fog colour. */
+  fogViewBlend: 0.7,
 
   latitudeDeg: 47.5,
   declinationDeg: 0,
@@ -180,7 +263,11 @@ const DEFAULTS = {
   cloudBaseM: 850,
   cloudTopM: 1250,
   cloudScale: 1 / 1400,
-  cloudLayers: 6,
+  cloudLayers: 8,
+  /** Downwind offset of the deck's top relative to its base, metres. */
+  cloudShearM: 900,
+  /** Optical depth per unit of macro density along the ray to the sun. */
+  cloudSunDepth: 2.4,
   cloudRadiusM: 30000,
   cloudHandoverM: 20000,
   cloudWindMs: 7,
@@ -188,6 +275,10 @@ const DEFAULTS = {
   inCloudVisibilityM: 190,
 
   stars: true,
+
+  shadows: true,
+  shadowQuality: 'high',
+  aircraftReceivesShadow: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -208,6 +299,178 @@ const SUN_STEEPNESS = 1.5;
 const SUN_EE = 1000.0;
 /** Scales Preetham's arbitrary radiance units into something exposure can work on. */
 const SKY_RADIANCE_SCALE = 0.04;
+/**
+ * Preetham's output exponent. three's Sky example hardcodes 1.5 with no
+ * derivation; 1.2 fits measured clear-sky colour better (header table). It is
+ * per-channel, so it changes chromaticity as well as contrast — which is the
+ * point. Shared verbatim with the GLSL below.
+ */
+const PREETHAM_CONTRAST = 1.2;
+
+/**
+ * The cloud deck's vertical envelope, as ONE set of numbers used by the GLSL
+ * and by `cloudDensityJs`. They were two copies of the same four literals and
+ * the CPU would have gone on believing in a deck shape the GPU had stopped
+ * drawing.
+ */
+const CLOUD_ENVELOPE = {
+  /** Rounded bottoms: cover ramps in over the first this-much of the deck. */
+  base: 0.18,
+  /** Cover holds full until here, then frays to the top. */
+  top: 0.80,
+  /** Cover outside the envelope, as a fraction of cloudCoverage. */
+  floor: 0.55,
+};
+
+// ---------------------------------------------------------------------------
+// AERIAL PERSPECTIVE — the constants three's fog chunks are rebuilt around.
+// See the header for the derivation and the measured 94 km table.
+// ---------------------------------------------------------------------------
+
+const AERIAL = {
+  /** Rayleigh extinction relative to green. lambda^-4 at 680/550/450 nm. */
+  betaR: [
+    TOTAL_RAYLEIGH[0] / TOTAL_RAYLEIGH[1],
+    1,
+    TOTAL_RAYLEIGH[2] / TOTAL_RAYLEIGH[1],
+  ],
+  /** Aerosol extinction relative to green. Angstrom exponent ~1.3, not ^-4. */
+  betaM: [0.76, 1.0, 1.29],
+  /**
+   * Aerosol extinction at sea level as a multiple of the green Rayleigh term.
+   * Fixed, not driven by `turbidity`: turbidity scales the whole budget in JS
+   * instead, so this stays a compile-time constant and the chunk can be
+   * installed once, at module load, before any material compiles.
+   */
+  aerosolRatio: 0.8,
+  /** Scale heights, metres. Molecular air and the aerosol boundary layer. */
+  hR: 8000,
+  hM: 1200,
+  /** Below this the density integral is clamped; Puget Sound is not a canyon. */
+  floorM: -400,
+  /** Haze seen looking DOWN is lit ground haze, dimmer than the sky. */
+  groundHaze: 0.82,
+};
+
+/**
+ * Replaces three's four fog chunks, globally and exactly once.
+ *
+ * This is at MODULE scope on purpose. `main.js` builds the terrain before it
+ * builds the sky (bootstrap order, §3), and a chunk swapped inside
+ * `createSky()` would be a race against whichever material compiled first.
+ * Importing this file is enough; nothing has to be called in the right order.
+ *
+ * The chunks stay `#ifdef USE_FOG`-guarded, so every material that opted out of
+ * fog — the sky dome, the cloud slabs, all of three's depth and shadow
+ * materials — is untouched and compiles to exactly the same code as before.
+ */
+const _aerialFixed = (v) => v.toFixed(6);
+
+/**
+ * The airlight model, as one GLSL function, emitted from `AERIAL` so the fog
+ * chunk, the sky dome and the cloud shaders cannot drift apart. Every caller
+ * gets the same curve for the same range and the same pair of altitudes.
+ */
+const GLSL_AERIAL = /* glsl */ `
+  /**
+   * Per-channel transmittance over a segment of exponential atmosphere.
+   *
+   * Column density of exp(-y/H) between two altitudes, exactly:
+   *   I(H) = L * exp(-y0/H) * ( 1 - exp(-dy/H) ) / ( dy/H )
+   * The (1 - exp(-x))/x factor is 1 - x/2 near zero, which is the branch
+   * below; without it a horizontal ray divides 0 by 0.
+   */
+  vec3 aerialTransmittance( float camY, float fragY, float dist, float density ) {
+    // A density three orders of magnitude above the clear-air budget is sky.js
+    // saying "the camera is inside cloud". Cloud droplets are large enough to
+    // scatter greyly and they fill the volume uniformly, so both the spectral
+    // tilt and the height profile are annulled here rather than rendering a
+    // wavelength-sorted, exponentially stratified fog bank inside a cumulus.
+    float grey = smoothstep( 2.0e-4, 2.0e-3, density );
+    vec2 H = mix( vec2( ${AERIAL.hR.toFixed(1)}, ${AERIAL.hM.toFixed(1)} ), vec2( 1.0e7 ), grey );
+
+    float y0 = max( camY, ${AERIAL.floorM.toFixed(1)} );
+    float y1 = max( fragY, ${AERIAL.floorM.toFixed(1)} );
+    vec2 x = ( y1 - y0 ) / H;
+    vec2 small = step( abs( x ), vec2( 1.0e-3 ) );
+    vec2 xSafe = mix( x, vec2( 1.0 ), small );
+    vec2 shape = mix( ( 1.0 - exp( -xSafe ) ) / xSafe, 1.0 - 0.5 * x, small );
+    vec2 column = exp( -y0 / H ) * shape * dist;
+
+    vec3 bR = mix( vec3( ${AERIAL.betaR.map(_aerialFixed).join(', ')} ), vec3( 1.0 ), grey );
+    vec3 bM = mix( vec3( ${AERIAL.betaM.map(_aerialFixed).join(', ')} ), vec3( 1.0 ), grey );
+    vec3 tau = density * ( bR * column.x + ${AERIAL.aerosolRatio.toFixed(4)} * bM * column.y );
+    return exp( -min( tau, vec3( 60.0 ) ) );
+  }
+`;
+
+let aerialInstalled = false;
+
+function installAerialPerspective() {
+  if (aerialInstalled) return;
+  aerialInstalled = true;
+
+  THREE.ShaderChunk.fog_pars_vertex = /* glsl */ `
+    #ifdef USE_FOG
+      varying float vFogDepth;
+      varying float vFogWorldY;
+    #endif
+  `;
+
+  THREE.ShaderChunk.fog_vertex = /* glsl */ `
+    #ifdef USE_FOG
+      // RADIAL distance, not view-space depth: at a 70 deg horizontal field the
+      // two differ by 20% at the screen edge, which on a 94 km mountain is a
+      // visible vertical seam down the middle of the frame.
+      vFogDepth = length( mvPosition.xyz );
+      // World Y recovered from VIEW space. viewMatrix's rotation is orthonormal,
+      // so its transpose is its inverse and ( v * mat3(viewMatrix) ).y is one
+      // dot product. Going through modelMatrix instead would be wrong for
+      // instanced, skinned and morphed geometry, all of which fold their extra
+      // transform into modelViewMatrix and never touch modelMatrix.
+      vFogWorldY = cameraPosition.y + dot( mvPosition.xyz, viewMatrix[ 1 ].xyz );
+    #endif
+  `;
+
+  THREE.ShaderChunk.fog_pars_fragment = /* glsl */ `
+    #ifdef USE_FOG
+      uniform vec3 fogColor;
+      varying float vFogDepth;
+      varying float vFogWorldY;
+      #ifdef FOG_EXP2
+        uniform float fogDensity;
+      #else
+        uniform float fogNear;
+        uniform float fogFar;
+      #endif
+
+      ${GLSL_AERIAL}
+    #endif
+  `;
+
+  THREE.ShaderChunk.fog_fragment = /* glsl */ `
+    #ifdef USE_FOG
+      {
+        #ifdef FOG_EXP2
+          float fogRho = fogDensity;
+        #else
+          // Linear fog is not used here, but a caller may still set one.
+          float fogRho = 1.0 / max( fogFar - fogNear, 1.0 );
+        #endif
+        vec3 fogT = aerialTransmittance( cameraPosition.y, vFogWorldY, vFogDepth, fogRho );
+        // Looking down, the airlight is ground haze lit from above, not sky.
+        // Same 0.82 the dome uses below its horizon, so they meet.
+        float fogEl = ( vFogWorldY - cameraPosition.y ) / max( vFogDepth, 1.0 );
+        vec3 fogAir = fogColor * mix(
+          ${AERIAL.groundHaze.toFixed(3)}, 1.0, smoothstep( -0.25, 0.02, fogEl )
+        );
+        gl_FragColor.rgb = mix( fogAir, gl_FragColor.rgb, fogT );
+      }
+    #endif
+  `;
+}
+
+installAerialPerspective();
 
 // ---------------------------------------------------------------------------
 // GLSL chunks
@@ -282,26 +545,93 @@ const GLSL_NOISE = /* glsl */ `
  *
  * `hNorm` 0 = base, 1 = top. The coverage threshold is lifted at the base and
  * the top, which is what gives the slabs rounded bottoms and domed tops rather
- * than six identical stencils stacked in a pile.
+ * than identical stencils stacked in a pile.
+ *
+ * TWO THINGS MAKE THE STACK READ AS VOLUME RATHER THAN AS A STACK.
+ *
+ * SHEAR. Round 1 sampled the same XZ field at every height, so the deck was a
+ * vertical extrusion — a cookie cutter. Every slab had its holes in exactly the
+ * same place, and flying through it you passed through one silhouette repeated
+ * eight times. `uCloudShear` slides the sample point downwind with height, by
+ * `cloudShearM` metres from base to top. Real stratocumulus leans, because the
+ * wind above the deck is faster than the wind under it, and the lean is what
+ * gives the slabs different silhouettes to interleave.
+ *
+ * SELF-SHADOWING. cloudSunLight() marches two steps from the sample toward
+ * the sun, accumulating MACRO density only. Macro is six sines; the fBm detail
+ * is deliberately not sampled, because shading at cell scale is what reads as
+ * form and sampling the detail would triple the cost of the whole shader for
+ * fluff you cannot see the shadow of. The result is that the sunward faces of
+ * cells are bright and their lee sides are dark, in the right direction, which
+ * is the difference between "billboards" and "clouds".
  */
 const GLSL_CLOUD_DENSITY = /* glsl */ `
   uniform float uCloudCoverage;
   uniform float uCloudScale;
   uniform vec2 uCloudDrift;
+  uniform vec2 uCloudShear;
+  uniform float uCloudSunDepth;
+
+  vec2 cloudSamplePoint( vec2 worldXZ, float hNorm ) {
+    return worldXZ * uCloudScale + uCloudDrift + uCloudShear * hNorm;
+  }
+
+  float cloudCover( float hNorm ) {
+    // THE DECK NEEDS A TOP, NOT A FADE.
+    //
+    // Round 1 rolled the envelope off from hNorm 0.58, which thinned the deck
+    // across its whole upper half. Seen from below that is invisible; seen from
+    // ABOVE it means the brightest, most-lit slabs are also the emptiest, so a
+    // pilot on top of the deck looks down through a bright haze into the cloud's
+    // own shadowed interior. Measured over a covered column from 2,450 m, the
+    // deck rendered sRGB 228,213,200 — dust, not cloud tops.
+    //
+    // Cells narrow toward their tops, they do not dissolve. Holding full cover
+    // to 0.80 and rolling off only over the last 20% of the deck
+    // leaves one wispy slab fraying at the very top and a solid, sunlit surface
+    // immediately under it.
+    float envelope = smoothstep( 0.0, ${CLOUD_ENVELOPE.base.toFixed(3)}, hNorm )
+      * ( 1.0 - smoothstep( ${CLOUD_ENVELOPE.top.toFixed(3)}, 1.0, hNorm ) );
+    return uCloudCoverage * mix( ${CLOUD_ENVELOPE.floor.toFixed(3)}, 1.0, envelope );
+  }
 
   float cloudDensity( vec2 worldXZ, float hNorm, float detail ) {
-    vec2 p = worldXZ * uCloudScale + uCloudDrift;
-    float macro = cloudMacro( p ) * 0.5 + 0.5;          // 0..1
-    float fluff = fbm2( p * 3.7 ) - 0.5;                 // -0.5..0.5
+    vec2 p = cloudSamplePoint( worldXZ, hNorm );
+    float macro = cloudMacro( p ) * 0.5 + 0.5;              // 0..1
+    // The detail offset per height is what stops the fluff extruding too.
+    float fluff = fbm2( p * 3.7 + hNorm * 5.3 ) - 0.5;      // -0.5..0.5
     float field = clamp( macro + fluff * 0.34 * detail, 0.0, 1.0 );
-
-    // Vertical envelope: full coverage through the middle of the deck, thinner
-    // at the base and the top.
-    float envelope = smoothstep( 0.0, 0.30, hNorm ) * ( 1.0 - smoothstep( 0.58, 1.0, hNorm ) );
-    float cover = uCloudCoverage * mix( 0.55, 1.0, envelope );
-
-    float thr = 1.0 - cover;
+    float thr = 1.0 - cloudCover( hNorm );
     return smoothstep( thr, thr + 0.20, field );
+  }
+
+  /** Macro-only density. The light march's inner loop; must stay cheap. */
+  float cloudDensityMacro( vec2 worldXZ, float hNorm ) {
+    float macro = cloudMacro( cloudSamplePoint( worldXZ, hNorm ) ) * 0.5 + 0.5;
+    float thr = 1.0 - cloudCover( hNorm );
+    return smoothstep( thr, thr + 0.20, macro );
+  }
+
+  /**
+   * Transmittance of the deck between this sample and the sun. 1 = full sun.
+   * thicknessM is the deck's real thickness, so the vertical step converts
+   * metres to hNorm and a high sun escapes in one step while a low sun grinds
+   * along the layer — which is why the deck goes dramatic at dusk on its own.
+   */
+  float cloudSunLight( vec2 worldXZ, float hNorm, vec3 sunDir, float thicknessM ) {
+    const float STEP_M = 240.0;
+    vec2 dXZ = sunDir.xz * STEP_M;
+    float dH = sunDir.y * STEP_M / max( thicknessM, 1.0 );
+    float occ = 0.0;
+    for ( int i = 1; i <= 2; i ++ ) {
+      float fi = float( i );
+      float h = hNorm + dH * fi;
+      // Outside the deck contributes nothing; smoothed so the term does not
+      // pop as the sun crosses an integer number of steps' worth of deck.
+      float inside = smoothstep( -0.06, 0.02, h ) * ( 1.0 - smoothstep( 0.98, 1.06, h ) );
+      occ += cloudDensityMacro( worldXZ + dXZ * fi, clamp( h, 0.0, 1.0 ) ) * inside;
+    }
+    return exp( -uCloudSunDepth * occ * 0.5 );
   }
 `;
 
@@ -366,8 +696,11 @@ const SKY_FRAG = /* glsl */ `
   const float RAYLEIGH_ZENITH = ${RAYLEIGH_ZENITH_LENGTH.toFixed(1)};
   const float MIE_ZENITH = ${MIE_ZENITH_LENGTH.toFixed(1)};
   const float SKY_SCALE = ${SKY_RADIANCE_SCALE.toFixed(6)};
+  const float SKY_CONTRAST = ${PREETHAM_CONTRAST.toFixed(4)};
+  const float GROUND_HAZE = ${AERIAL.groundHaze.toFixed(3)};
 
   ${GLSL_TONEMAP}
+  ${GLSL_AERIAL}
   ${GLSL_CLOUD_MACRO}
   ${GLSL_NOISE}
   ${GLSL_CLOUD_DENSITY}
@@ -395,11 +728,26 @@ const SKY_FRAG = /* glsl */ `
     vec3 betaMTheta = uBetaM * hgPhase( cosTheta, uMieG );
     vec3 ratio = ( betaRTheta + betaMTheta ) / ( uBetaR + uBetaM );
 
-    vec3 Lin = pow( uSunE * ratio * ( 1.0 - Fex ), vec3( 1.5 ) );
+    vec3 Lin = pow( uSunE * ratio * ( 1.0 - Fex ), vec3( SKY_CONTRAST ) );
     // Near the horizon the (1 - Fex) form saturates to white; Preetham's fix is
     // to cross-fade to the transmitted form, which is what puts the red back
     // into a low sun.
-    float horizonBlend = clamp( pow( 1.0 - uSunDir.y, 5.0 ), 0.0, 1.0 );
+    //
+    // GATED BY AZIMUTH, which Preetham does not do. His crossfade is a function
+    // of the sun's ELEVATION only, so at dusk it reddens the sky behind you as
+    // hard as the sky in front, and the anti-solar horizon came out sRGB
+    // 98,78,52 — mud. What actually reddens is sunlight that has crossed the
+    // long low path, and only air along that line of sight is lit by it; the
+    // eastern horizon at sunset is lit from higher up and stays cool. Measured
+    // effect at the sun elevation the constants were fitted at (35 deg):
+    // horizonBlend is 0.014 there, so this term is inert all day and only has
+    // an opinion in the half hour either side of sunset.
+    vec2 sunAzD = uSunDir.xz;
+    vec2 viewAzD = dir.xz;
+    float towardSun = dot( sunAzD, viewAzD )
+      / max( length( sunAzD ) * length( viewAzD ), 1.0e-6 ) * 0.5 + 0.5;
+    float horizonBlend = clamp( pow( 1.0 - uSunDir.y, 5.0 ), 0.0, 1.0 )
+      * mix( 0.15, 1.0, towardSun * towardSun );
     Lin *= mix( vec3( 1.0 ), pow( uSunE * ratio * Fex, vec3( 0.5 ) ), horizonBlend );
     return Lin;
   }
@@ -469,10 +817,23 @@ const SKY_FRAG = /* glsl */ `
   // edge of a disc. Faded IN beyond uCloudHandover, where the near-field slabs
   // fade OUT — the two sum to 1 across the overlap.
   vec4 distantDeck( vec3 dir, float camY ) {
-    float mid = ( uCloudBase + uCloudTop ) * 0.5;
+    // YOU SEE THE SURFACE FACING YOU, NOT THE MIDDLE.
+    //
+    // Round 1 intersected the deck's mid-plane and shaded that sample. From
+    // below that is roughly right. From ABOVE it is the cloud's own interior:
+    // the sunward march at hNorm 0.5 has the whole upper half of the deck
+    // between it and the sun, so it came back 87% occluded and the far deck
+    // rendered as a flat dull sheet while the near slabs a few kilometres away
+    // showed white tops. Two representations of one deck, disagreeing.
+    //
+    // Intersect and sample the surface the viewer is actually looking at.
+    float above = smoothstep( uCloudBase, uCloudTop, camY );
+    float sampleH = mix( 0.12, 0.88, above );
+    float planeY = mix( uCloudBase, uCloudTop, sampleH );
+    float thickness = max( uCloudTop - uCloudBase, 1.0 );
     float dy = dir.y;
     if ( abs( dy ) < 1e-4 ) return vec4( 0.0 );
-    float t = ( mid - camY ) / dy;
+    float t = ( planeY - camY ) / dy;
     if ( t <= 0.0 ) return vec4( 0.0 );
     // Clamped well inside the fog budget: at 120 km the deck is already 82%
     // haze, and a shorter ray keeps the macro sines' arguments small enough
@@ -486,21 +847,26 @@ const SKY_FRAG = /* glsl */ `
     // and that is the only reason the two representations of the deck line up
     // across the hand-over band.
     vec2 hit = cameraPosition.xz + dir.xz * t;
-    float d = cloudDensity( hit, 0.5, 0.55 );
+    float d = cloudDensity( hit, sampleH, 0.55 );
     float a = d * uCloudOpacity * handIn;
     if ( a <= 0.001 ) return vec4( 0.0 );
 
-    // Above the deck you see sunlit tops; below it, grey bases.
-    float above = smoothstep( uCloudBase, uCloudTop, camY );
-    vec3 c = mix( uCloudShadow, uCloudLit, mix( 0.12, 1.0, above ) );
+    // The same sunward march the near slabs use, at the same hNorm the near
+    // slab at this height would use — so the cell that is bright at 18 km is
+    // still the bright one at 22 km when the hand-over swaps which shader draws
+    // it, and the deck does not change colour across the seam.
+    float sunT = cloudSunLight( hit, sampleH, uSunDir, thickness );
+    float lit = sunT * mix( 0.28, 1.0, smoothstep( 0.0, 0.85, sampleH ) );
+    vec3 c = mix( uCloudShadow, uCloudLit, lit );
 
     // Silver lining where the deck is between you and the sun.
     float toSun = max( dot( dir, uSunDir ), 0.0 );
     c += uCloudLit * pow( toSun, 14.0 ) * 0.45 * ( 1.0 - d * 0.6 );
 
-    // Aerial perspective on the deck itself, same budget as scene.fog.
-    float f = 1.0 - exp( -pow( t * uFogDensity, 2.0 ) );
-    c = mix( c, uFogColor, f );
+    // Aerial perspective on the deck itself, same model and same budget as
+    // scene.fog — the deck is at a known altitude, so this is exact.
+    vec3 T = aerialTransmittance( camY, planeY, t, uFogDensity );
+    c = mix( uFogColor, c, T );
     return vec4( c, a );
   }
 
@@ -508,8 +874,23 @@ const SKY_FRAG = /* glsl */ `
     vec3 dir = normalize( vDir );
     float camY = cameraPosition.y;
 
+    // THE DOME IS EVALUATED WITH ITS ELEVATION FLOORED AT THE HORIZON.
+    //
+    // Preetham is undefined for dir.y < 0 — its air-mass term divides by a
+    // cosine that has gone negative — so round 1 flooded the whole lower
+    // hemisphere with a single flat uFogColor * 0.82. That is also what wiped
+    // out the limb glow: the last 1.5 deg above the horizon was mixed 92% into
+    // uFogColor, an AZIMUTHAL AVERAGE, so the one band of sky where a low sun
+    // actually shows warm was the one band guaranteed to be grey.
+    //
+    // Flooring the sample direction instead keeps the model's azimuth
+    // dependence everywhere: below the horizon you get the colour of the sky at
+    // the horizon in THAT compass direction, darkened to ground haze. Costs
+    // nothing — same single preetham() call.
+    vec3 sampleDir = normalize( vec3( dir.x, max( dir.y, 0.0 ), dir.z ) );
+
     vec3 Fex;
-    vec3 Lin = preetham( dir, Fex );
+    vec3 Lin = preetham( sampleDir, Fex );
 
     // Solar disc, added pre-tone-map so it blows out to white when the sun is
     // high and reddens on its own at sunset.
@@ -531,16 +912,19 @@ const SKY_FRAG = /* glsl */ `
 
     col += twilight( dir );
 
-    // Meet the terrain exactly. scene.fog fades distant geometry to uFogColor,
-    // so the last degree of sky above the horizon has to arrive at the same
-    // value or there is a visible seam all the way round.
-    float toHorizon = 1.0 - smoothstep( -0.004, 0.026, dir.y );
-    col = mix( col, uFogColor, toHorizon * 0.92 );
     // Below the horizon: haze over ground we are not drawing (the terrain patch
-    // is finite, and beyond ~90 km there is nothing). Slightly darker than the
-    // horizon, as ground haze is.
-    float below = 1.0 - smoothstep( -0.09, -0.004, dir.y );
-    col = mix( col, uFogColor * 0.82, below );
+    // is finite, and beyond ~127 km there is nothing). col already holds the
+    // horizon's colour for this azimuth, so all that is left is to darken it to
+    // ground haze — the same GROUND_HAZE factor the fog chunk applies to
+    // downward-looking rays, which is what makes the two meet where the terrain
+    // patch ends. There is no mix toward an averaged fog colour any more: the
+    // aerial-perspective fog reaches uFogColor asymptotically, never abruptly,
+    // so there is no hard value for the dome to match.
+    // Low edge FIRST. smoothstep(a, b, x) is UNDEFINED in GLSL for a >= b and
+    // most desktop drivers do the sensible thing anyway, which is exactly how
+    // that bug ships. check-sky.mjs greps for it.
+    float below = 1.0 - smoothstep( -0.055, 0.0, dir.y );
+    col *= mix( 1.0, GROUND_HAZE, below );
 
     if ( uClouds > 0.5 ) {
       vec4 deck = distantDeck( dir, camY );
@@ -609,7 +993,9 @@ const CLOUD_FRAG = /* glsl */ `
   uniform float uSelfFadeM;    // dissolve within this many metres of the camera's altitude
   uniform float uHandover;
   uniform float uWhiteout;
+  uniform float uDeckThickness;
 
+  ${GLSL_AERIAL}
   ${GLSL_CLOUD_MACRO}
   ${GLSL_NOISE}
   ${GLSL_CLOUD_DENSITY}
@@ -638,17 +1024,29 @@ const CLOUD_FRAG = /* glsl */ `
     float a = d * uLayerAlpha * handOut * selfFade * ( 1.0 - uWhiteout );
     if ( a <= 0.002 ) discard;
 
-    // Tops catch the sun, bases are grey. uLayerH does the vertical shading and
-    // it is the same number the density envelope used, so lighting and shape
-    // agree.
-    vec3 c = mix( uCloudShadow, uCloudLit, smoothstep( 0.1, 0.95, uLayerH ) );
+    // SHADING. Round 1 shaded purely by uLayerH, which is a constant across the
+    // whole slab — so every slab was one flat tone and the deck read as eight
+    // sheets of paper. The march toward the sun is what varies within a slab:
+    // a cell's sunward flank is lit and its lee side is in its own shadow, and
+    // because both are functions of world XZ they line up between slabs into a
+    // single three-dimensional form.
+    float sunT = cloudSunLight( vWorld.xz, uLayerH, uSunDir, uDeckThickness );
+    // uLayerH still carries the base-to-top gradient; the deck's own bulk
+    // shadows its underside whatever the sun is doing.
+    float lit = sunT * mix( 0.28, 1.0, smoothstep( 0.0, 0.85, uLayerH ) );
+    vec3 c = mix( uCloudShadow, uCloudLit, lit );
 
     vec3 view = normalize( vWorld - cameraPosition );
     float toSun = max( dot( view, uSunDir ), 0.0 );
     c += uCloudLit * pow( toSun, 10.0 ) * 0.28 * ( 1.0 - d * 0.7 );
 
-    float f = 1.0 - exp( -pow( dist * uFogDensity, 2.0 ) );
-    c = mix( c, uFogColor, f );
+    // Thin edges are optically thin: they transmit rather than reflect, so they
+    // brighten toward the sun instead of darkening. Cheap, and it is what makes
+    // the ragged rim of a cell read as vapour rather than as a cut-out.
+    c += uCloudLit * ( 1.0 - smoothstep( 0.0, 0.45, d ) ) * 0.18 * sunT;
+
+    vec3 T = aerialTransmittance( cameraPosition.y, vWorld.y, length( vWorld - cameraPosition ), uFogDensity );
+    c = mix( uFogColor, c, T );
 
     gl_FragColor = vec4( c, a );
 
@@ -662,6 +1060,24 @@ const CLOUD_FRAG = /* glsl */ `
 
 /** Module-scope scratch. §1.8: nothing here allocates per frame. */
 const _fex = [0, 0, 0];
+/**
+ * The SUN ray's extinction, kept apart from `_fex`.
+ *
+ * `_fex` is evalSky's own scratch — every call to it, and there are a dozen per
+ * relight between the horizon ring and the view-direction airlight, overwrites
+ * `_fex` with the extinction along whatever VIEW ray it was just asked about.
+ * applyLighting computed the sun's extinction into `_fex`, then derived the fog
+ * colour (twelve evalSky calls), then read `_fex` again for the cloud colour.
+ * It was reading the extinction along a 2.5 deg horizon ray, divided by the
+ * sun ray's maximum. Measured with the sun 36 deg up, `cloudLit` came out sRGB
+ * 0.668 / 0.506 / 0.453 — dull orange — which is why the cloud deck rendered as
+ * a tan sheet at every time of day. It should be 1.000 / 0.933 / 0.815.
+ *
+ * Aliased module scratch is the cost of the no-allocation rule (§1.8); the
+ * defence is that anything read across a call to another function in this file
+ * gets its own array.
+ */
+const _sunFex = [0, 0, 0];
 const _lin = [0, 0, 0];
 const _acc = [0, 0, 0];
 const _dir = [0, 0, 0];
@@ -711,14 +1127,96 @@ function evalSky(dx, dy, dz, sunX, sunY, sunZ, betaR, betaM, sunE, mieG, out) {
   const cosTheta = dx * sunX + dy * sunY + dz * sunZ;
   const rPhase = rayleighPhaseJs(cosTheta * 0.5 + 0.5);
   const mPhase = hgPhaseJs(cosTheta, mieG);
-  const horizonBlend = clamp(Math.pow(1 - sunY, 5), 0, 1);
+  // Azimuth gate — mirrors preetham() in SKY_FRAG exactly. See the comment there.
+  const towardSun =
+    (dx * sunX + dz * sunZ) /
+      Math.max(Math.hypot(sunX, sunZ) * Math.hypot(dx, dz), 1e-6) * 0.5 + 0.5;
+  const horizonBlend =
+    clamp(Math.pow(1 - sunY, 5), 0, 1) * lerp(0.15, 1, towardSun * towardSun);
   for (let i = 0; i < 3; i++) {
     const ratio = (betaR[i] * rPhase + betaM[i] * mPhase) / (betaR[i] + betaM[i]);
-    const lin = Math.pow(sunE * ratio * (1 - _fex[i]), 1.5);
+    const lin = Math.pow(sunE * ratio * (1 - _fex[i]), PREETHAM_CONTRAST);
     const alt = Math.pow(Math.max(0, sunE * ratio * _fex[i]), 0.5);
     out[i] = lin * (1 - horizonBlend + alt * horizonBlend);
   }
   return out;
+}
+
+const _sampleOut = [0, 0, 0];
+
+/**
+ * The dome's colour in one direction, tone-mapped — the same `evalSky` +
+ * `acesToneMap` pair the fog colour and the GLSL both go through, so a harness
+ * that scores this is scoring what gets drawn.
+ *
+ * Not a per-frame path: it rebuilds the scattering coefficients on every call.
+ *
+ * @param {number[]} dir unit view direction, scene axes
+ * @param {number[]} sunDir unit direction toward the sun
+ * @param {Partial<SkyOpts>} [opts] overrides on DEFAULTS
+ * @param {number[]} [out] length-3 scratch
+ * @returns {number[]} display-linear RGB, 0..1
+ */
+export function sampleSky(dir, sunDir, opts = {}, out = _sampleOut) {
+  const cfg = { ...DEFAULTS, ...opts };
+  const betaR = TOTAL_RAYLEIGH.map((v) => v * cfg.rayleigh);
+  const mieC = 0.434 * (0.2 * cfg.turbidity * 1e-17) * cfg.mieCoefficient;
+  const betaM = MIE_CONST.map((k) => mieC * k);
+  const sunE = sunIntensity(sunDir[1]);
+  // The dome floors the sample elevation at the horizon; mirror that here or
+  // the harness would score a region the shader never evaluates.
+  const y = Math.max(dir[1], 0);
+  const n = Math.hypot(dir[0], y, dir[2]) || 1;
+  evalSky(
+    dir[0] / n, y / n, dir[2] / n,
+    sunDir[0], sunDir[1], sunDir[2],
+    betaR, betaM, sunE, cfg.mieDirectionalG, out,
+  );
+  for (let i = 0; i < 3; i++) {
+    out[i] = acesToneMap(out[i] * SKY_RADIANCE_SCALE * cfg.exposure);
+  }
+  return out;
+}
+
+/**
+ * The exact CPU mirror of `aerialTransmittance()` in GLSL, for the harness and
+ * for anyone who needs to know how much contrast is left at a given range.
+ * Same constants, same branch. Clear-air path only — the in-cloud grey-out is a
+ * shader concern.
+ *
+ * @param {number} camY viewer altitude, metres MSL
+ * @param {number} fragY target altitude, metres MSL
+ * @param {number} dist slant range, metres
+ * @param {number} density sea-level green extinction, per metre
+ * @param {number[]} out length-3 scratch, filled with R/G/B transmittance
+ */
+export function aerialTransmittanceJs(camY, fragY, dist, density, out) {
+  // Including the in-cloud grey-out, or this is not a mirror — and the one
+  // number anybody checks against it (in-cloud visibility) lives on that branch.
+  const grey = smoothstep01(2.0e-4, 2.0e-3, density);
+  const y0 = Math.max(camY, AERIAL.floorM);
+  const y1 = Math.max(fragY, AERIAL.floorM);
+  const H = [lerp(AERIAL.hR, 1e7, grey), lerp(AERIAL.hM, 1e7, grey)];
+  const column = [0, 0];
+  for (let k = 0; k < 2; k++) {
+    const x = (y1 - y0) / H[k];
+    const shape = Math.abs(x) <= 1e-3 ? 1 - 0.5 * x : (1 - Math.exp(-x)) / x;
+    column[k] = Math.exp(-y0 / H[k]) * shape * dist;
+  }
+  for (let i = 0; i < 3; i++) {
+    const bR = lerp(AERIAL.betaR[i], 1, grey);
+    const bM = lerp(AERIAL.betaM[i], 1, grey);
+    const tau = density * (bR * column[0] + AERIAL.aerosolRatio * bM * column[1]);
+    out[i] = Math.exp(-Math.min(tau, 60));
+  }
+  return out;
+}
+
+/** Module-scope smoothstep. The one inside createSky closes over nothing either. */
+function smoothstep01(e0, e1, x) {
+  if (e1 === e0) return x < e0 ? 0 : 1;
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
+  return t * t * (3 - 2 * t);
 }
 
 /**
@@ -760,6 +1258,7 @@ function cloudMacroJs(px, py) {
  *   isInCloud: () => boolean,
  *   setCloudCoverage: (c: number) => void,
  *   group: THREE.Group,
+ *   shadows: ReturnType<typeof createShadows> | null,
  *   dispose: () => void,
  * }}
  */
@@ -773,6 +1272,16 @@ export function createSky(scene, renderer, opts = {}) {
   const betaR = TOTAL_RAYLEIGH.map((v) => v * cfg.rayleigh);
   const mieC = 0.434 * (0.2 * cfg.turbidity * 1e-17) * cfg.mieCoefficient;
   const betaM = MIE_CONST.map((k) => mieC * k);
+  /**
+   * sqrt of the luminance the sun ray keeps with the sun overhead — the
+   * brightest this atmosphere ever gets. Used to normalise the cloud-top
+   * brightness so it is 1.0 at the zenith and falls off exactly as the
+   * DirectionalLight does. Constant for the life of the sky.
+   */
+  const zenithLum = (() => {
+    const f = extinctionJs(1, betaR, betaM, [0, 0, 0]);
+    return Math.max(Math.sqrt(0.2126 * f[0] + 0.7152 * f[1] + 0.0722 * f[2]), 1e-3);
+  })();
 
   const group = new THREE.Group();
   group.name = 'sky';
@@ -807,6 +1316,28 @@ export function createSky(scene, renderer, opts = {}) {
   const sunDirection = new THREE.Vector3(0, 1, 0);
   /** Unit vector FROM the scene TOWARD the moon. */
   const moonDirection = new THREE.Vector3(0, -1, 0);
+
+  // -------------------------------------------------------------------------
+  // Shadows. Owned here because a shadow-casting cascade IS a light (§1.7) and
+  // because the cascades have to point along the sun, which is this module's
+  // one job.
+  //
+  // The cascade lights are added to the scene AFTER sunLight and moonLight but
+  // that does not decide their uniform index: WebGLLights sorts shadow casters
+  // to the front, so the carriers are always 0..N-1 and the sun is always N.
+  // shadows.js's shader patch depends on exactly that. See its header.
+  //
+  // `sunDirection` is handed over BY REFERENCE — applyLighting() rewrites it in
+  // place every time the sun moves, so the cascades follow the sun with no
+  // per-frame plumbing and shadows lengthen through dusk on their own.
+  // -------------------------------------------------------------------------
+  const shadows = cfg.shadows
+    ? createShadows(scene, renderer, {
+        quality: cfg.shadowQuality,
+        sunDirection,
+        aircraftReceives: cfg.aircraftReceivesShadow,
+      })
+    : null;
 
   // -------------------------------------------------------------------------
   // Fog. Colour is rewritten from the model every time the sun moves.
@@ -853,6 +1384,10 @@ export function createSky(scene, renderer, opts = {}) {
     uCloudCoverage: { value: cfg.cloudCoverage },
     uCloudScale: { value: cfg.cloudScale },
     uCloudDrift: { value: new THREE.Vector2(0, 0) },
+    // Downwind lean, expressed in the same scaled units cloudMacro takes so it
+    // adds straight onto the drift.
+    uCloudShear: { value: new THREE.Vector2(0, 0) },
+    uCloudSunDepth: { value: cfg.cloudSunDepth },
 
     uWhiteout: { value: 0 },
     uWhiteoutColor: { value: new THREE.Color(0.86, 0.88, 0.9) },
@@ -896,9 +1431,26 @@ export function createSky(scene, renderer, opts = {}) {
   if (cfg.clouds && cfg.cloudLayers > 0) {
     const n = Math.max(1, Math.round(cfg.cloudLayers));
     const thickness = Math.max(1, cfg.cloudTopM - cfg.cloudBaseM);
-    // Enough per-slab alpha that a fully covered column stacks to opaque:
-    // 1 - (1 - a)^n ~= 0.99.
-    const perLayerAlpha = 1 - Math.pow(0.01, 1 / n);
+    // OPACITY OF ONE SLAB, FROM THE OPTICAL DEPTH IT STANDS IN FOR.
+    //
+    // Round 1 solved 1 - (1 - a)^n = 0.99 for a — "enough that a full column
+    // stacks to opaque" — which gave 0.44 at eight layers. That is the right
+    // answer to the wrong question. It makes the STACK opaque and leaves each
+    // slab thin, so a viewer above the deck sees the lit top surface at 44%
+    // over the deck's own shadowed interior. Measured, looking down at a
+    // covered column from 2,450 m: terrain at sRGB 164,202,229 came out
+    // 185,201,220 — the clouds read as a warm dusty veil laid over the ground
+    // instead of as cloud tops, because more than half of every pixel was the
+    // inside of the cloud.
+    //
+    // A slab is not a thin sample, it is a real slice of the deck. Its opacity
+    // is what its own thickness attenuates: Beer-Lambert on stratocumulus,
+    // extinction 3*LWC / (2*rho_water*r_eff) = 0.045 /m for 0.3 g/m^3 at a
+    // 10 um effective radius. At 550 m over eight slabs that is 69 m per slab,
+    // tau = 3.1, and a cell core is opaque — which is exactly what a cell core
+    // is. `d` still scales it, so edges and thin cloud stay translucent.
+    const CLOUD_EXTINCTION_PER_M = 0.045;
+    const perLayerAlpha = 1 - Math.exp(-CLOUD_EXTINCTION_PER_M * (thickness / n));
     for (let i = 0; i < n; i++) {
       const h = n === 1 ? 0.5 : i / (n - 1);
       const y = cfg.cloudBaseM + h * thickness;
@@ -913,12 +1465,15 @@ export function createSky(scene, renderer, opts = {}) {
           uCloudCoverage: uniforms.uCloudCoverage,
           uCloudScale: uniforms.uCloudScale,
           uCloudDrift: uniforms.uCloudDrift,
+          uCloudShear: uniforms.uCloudShear,
+          uCloudSunDepth: uniforms.uCloudSunDepth,
           uWhiteout: uniforms.uWhiteout,
           uLayerY: { value: y },
           uLayerH: { value: h },
           uLayerAlpha: { value: perLayerAlpha },
           uSelfFadeM: { value: Math.max(20, thickness / n) },
           uHandover: { value: cfg.cloudHandoverM },
+          uDeckThickness: { value: thickness },
         },
         vertexShader: CLOUD_VERT,
         fragmentShader: CLOUD_FRAG,
@@ -1004,6 +1559,13 @@ export function createSky(scene, renderer, opts = {}) {
     Math.sin(cfg.cloudWindDirDeg * DEG_TO_RAD),
     -Math.cos(cfg.cloudWindDirDeg * DEG_TO_RAD),
   );
+  // The deck leans downwind by cloudShearM metres from base to top, converted
+  // once into the scaled units cloudMacro takes. Fixed for the life of the sky:
+  // it is the shape of the deck, not a per-frame animation.
+  uniforms.uCloudShear.value.set(
+    driftDir.x * cfg.cloudShearM * cfg.cloudScale,
+    driftDir.y * cfg.cloudShearM * cfg.cloudScale,
+  );
 
   const _c = new THREE.Color();
 
@@ -1019,12 +1581,18 @@ export function createSky(scene, renderer, opts = {}) {
    * @returns {number} 0..1
    */
   function cloudDensityJs(x, z, hNorm) {
-    const px = x * cfg.cloudScale + uniforms.uCloudDrift.value.x;
-    const py = z * cfg.cloudScale + uniforms.uCloudDrift.value.y;
+    // The shear term is part of `cloudSamplePoint` in GLSL and must be here too,
+    // or the CPU would think it was in clear air while the shader drew cloud —
+    // and the white-out would fire in the wrong place by up to cloudShearM.
+    const shear = uniforms.uCloudShear.value;
+    const px = x * cfg.cloudScale + uniforms.uCloudDrift.value.x + shear.x * hNorm;
+    const py = z * cfg.cloudScale + uniforms.uCloudDrift.value.y + shear.y * hNorm;
     const macro = cloudMacroJs(px, py) * 0.5 + 0.5;
+    // CLOUD_ENVELOPE, not a second copy of the literals. See cloudCover() in GLSL.
     const envelope =
-      smoothstepJs(0, 0.3, hNorm) * (1 - smoothstepJs(0.58, 1, hNorm));
-    const cover = uniforms.uCloudCoverage.value * lerp(0.55, 1, envelope);
+      smoothstepJs(0, CLOUD_ENVELOPE.base, hNorm) *
+      (1 - smoothstepJs(CLOUD_ENVELOPE.top, 1, hNorm));
+    const cover = uniforms.uCloudCoverage.value * lerp(CLOUD_ENVELOPE.floor, 1, envelope);
     const thr = 1 - cover;
     return smoothstepJs(thr, thr + 0.2, macro);
   }
@@ -1080,8 +1648,73 @@ export function createSky(scene, renderer, opts = {}) {
   }
 
   /**
-   * Averages the sky over the horizon ring. This is the colour distant terrain
-   * has to fade into, so it is measured, not chosen.
+   * The horizon ring average, already tone-mapped. Written by `applyLighting`
+   * (sun-driven, rare), read by `refreshFogColor` (camera-driven, per frame).
+   */
+  const ringFog = [0.8, 0.85, 0.88];
+  let cachedSunE = 0;
+  let cachedNight = 0;
+  /** Unit horizontal heading the camera is looking along. */
+  const viewAz = new THREE.Vector3(0, 0, -1);
+
+  /**
+   * THE FOG COLOUR FOLLOWS THE CAMERA'S HEADING, NOT JUST THE SUN.
+   *
+   * `scene.fog` has one colour for the whole frame, so the airlight distant
+   * terrain fades into has to be a single value. Round 1 used the azimuthal
+   * average of the horizon, and that is precisely what made a low sun's warm
+   * limb impossible: look west at sunset and the mountains 60 km away were
+   * tinted with the average of a copper western sky and a slate eastern one,
+   * which is grey. The dome above them was orange. The seam was the whole
+   * point of the fog colour existing.
+   *
+   * So the airlight is sampled from the model in the direction the camera is
+   * actually pointing, at 2.5 deg elevation, and blended `fogViewBlend` of the
+   * way from the ring average toward it. Full commitment (1.0) makes a
+   * mountain on the left edge of a 70 deg frame take the colour of the sky in
+   * the middle; the ring average damps that. 0.7 keeps the warm limb and keeps
+   * the swing under a couple of sRGB units per degree of yaw.
+   *
+   * One evalSky per frame — about 40 flops, no allocation (§1.8).
+   */
+  function refreshFogColor() {
+    const ex = cfg.exposure;
+    // 2.5 deg above the horizon, along the camera's heading.
+    const cEl = 0.99904, sEl = 0.04362;
+    evalSky(
+      viewAz.x * cEl, sEl, viewAz.z * cEl,
+      _sun[0], _sun[1], _sun[2],
+      betaR, betaM, cachedSunE, cfg.mieDirectionalG, _tmp,
+    );
+    const k = clamp(cfg.fogViewBlend, 0, 1);
+    let fr = lerp(ringFog[0], acesToneMap(_tmp[0] * SKY_RADIANCE_SCALE * ex), k);
+    let fg = lerp(ringFog[1], acesToneMap(_tmp[1] * SKY_RADIANCE_SCALE * ex), k);
+    let fb = lerp(ringFog[2], acesToneMap(_tmp[2] * SKY_RADIANCE_SCALE * ex), k);
+
+    // Night floor, so distance does not fade to pure black.
+    fr = lerp(fr, 0.020, cachedNight);
+    fg = lerp(fg, 0.026, cachedNight);
+    fb = lerp(fb, 0.045, cachedNight);
+
+    fogColor.setRGB(fr, fg, fb);
+    // scene.fog gets it HERE, not only from the render hook. Publishing the fog
+    // colour from onBeforeRender alone left it at its constructor value until
+    // the first frame was drawn — and terrain.js reads scene.fog.color for the
+    // sea's grazing-angle reflection, so the water spent the whole load screen
+    // and the first frame reflecting a sky that did not exist yet.
+    if (scene.fog) {
+      if (whiteout > 0.001) {
+        scene.fog.color.copy(fogColor).lerp(uniforms.uWhiteoutColor.value, whiteout);
+      } else {
+        scene.fog.color.copy(fogColor);
+      }
+    }
+  }
+
+  /**
+   * Averages the sky over the horizon ring. The stable half of the fog colour:
+   * it is what the airlight is at the edges of the frame, where the camera is
+   * not looking.
    */
   function horizonAverage(sunE, out) {
     _acc[0] = _acc[1] = _acc[2] = 0;
@@ -1136,11 +1769,11 @@ export function createSky(scene, renderer, opts = {}) {
     // Colour is the atmosphere's transmittance along the sun ray, from the same
     // betas the sky uses. That is why the light goes orange at precisely the
     // moment the sky does, with nothing tuned by hand.
-    extinctionJs(Math.max(sunY, 0), betaR, betaM, _fex);
-    const fexMax = Math.max(_fex[0], _fex[1], _fex[2], 1e-6);
-    const lum = 0.2126 * _fex[0] + 0.7152 * _fex[1] + 0.0722 * _fex[2];
+    extinctionJs(Math.max(sunY, 0), betaR, betaM, _sunFex);
+    const fexMax = Math.max(_sunFex[0], _sunFex[1], _sunFex[2], 1e-6);
+    const lum = 0.2126 * _sunFex[0] + 0.7152 * _sunFex[1] + 0.0722 * _sunFex[2];
     const belowFade = clamp((sunY + 0.015) / 0.05, 0, 1);
-    sunLight.color.setRGB(_fex[0] / fexMax, _fex[1] / fexMax, _fex[2] / fexMax);
+    sunLight.color.setRGB(_sunFex[0] / fexMax, _sunFex[1] / fexMax, _sunFex[2] / fexMax);
     sunLight.intensity = cfg.sunIntensity * Math.sqrt(clamp(lum, 0, 1)) * belowFade * cloudDim;
     sunLight.position.copy(sunDirection).multiplyScalar(cfg.sunDistance);
 
@@ -1153,27 +1786,27 @@ export function createSky(scene, renderer, opts = {}) {
     uniforms.uMoonBright.value = moonUp * night;
 
     // -- fog colour: the sky the terrain fades into ------------------------
+    // Only the AZIMUTHAL AVERAGE is computed here, because this function runs
+    // when the SUN moves and the fog colour also has to follow the CAMERA.
+    // `refreshFogColor` finishes the job every frame; see it for why.
     horizonAverage(sunE, _lin);
     const ex = cfg.exposure;
-    let fr = acesToneMap(_lin[0] * SKY_RADIANCE_SCALE * ex);
-    let fg = acesToneMap(_lin[1] * SKY_RADIANCE_SCALE * ex);
-    let fb = acesToneMap(_lin[2] * SKY_RADIANCE_SCALE * ex);
+    ringFog[0] = acesToneMap(_lin[0] * SKY_RADIANCE_SCALE * ex);
+    ringFog[1] = acesToneMap(_lin[1] * SKY_RADIANCE_SCALE * ex);
+    ringFog[2] = acesToneMap(_lin[2] * SKY_RADIANCE_SCALE * ex);
 
     // Pull 18% toward the zenith. Preetham's horizon is milk-white; real
     // distance haze is fractionally bluer because you are also seeing sky just
     // above the ridge line you are looking at.
     evalSky(0, 1, 0, _sun[0], _sun[1], _sun[2], betaR, betaM, sunE, cfg.mieDirectionalG, _tmp);
-    fr = lerp(fr, acesToneMap(_tmp[0] * SKY_RADIANCE_SCALE * ex), 0.18);
-    fg = lerp(fg, acesToneMap(_tmp[1] * SKY_RADIANCE_SCALE * ex), 0.18);
-    fb = lerp(fb, acesToneMap(_tmp[2] * SKY_RADIANCE_SCALE * ex), 0.18);
+    for (let i = 0; i < 3; i++) {
+      ringFog[i] = lerp(ringFog[i], acesToneMap(_tmp[i] * SKY_RADIANCE_SCALE * ex), 0.18);
+    }
 
-    // Night floor, so distance does not fade to pure black.
-    fr = lerp(fr, 0.020, night);
-    fg = lerp(fg, 0.026, night);
-    fb = lerp(fb, 0.045, night);
-
-    fogColor.setRGB(fr, fg, fb);
-    if (scene.fog) scene.fog.color.setRGB(fr, fg, fb);
+    cachedSunE = sunE;
+    cachedNight = night;
+    refreshFogColor();
+    const fr = fogColor.r, fg = fogColor.g, fb = fogColor.b;
 
     // -- hemisphere fill ---------------------------------------------------
     // Sky half takes the actual zenith colour; ground half is a dim bounce off
@@ -1199,9 +1832,16 @@ export function createSky(scene, renderer, opts = {}) {
     // -- cloud shading -----------------------------------------------------
     // Derived from the tone-mapped sun and sky so the deck cannot disagree with
     // the light hitting the ground under it.
-    const litAmount = 0.10 + 0.90 * clamp(sunY * 3.0, 0, 1);
+    // BRIGHTNESS OF A SUNLIT CLOUD TOP = HOW MUCH SUN THERE IS.
+    //
+    // Round 1 used its own ramp, 0.10 + 0.90 * clamp(sunY * 3), which is a
+    // second opinion about the strength of the sunlight and disagreed with the
+    // first one three lines above. Use the sun light's own falloff, normalised
+    // against the sun at the zenith, so a cloud top and the ground under it are
+    // lit by the same number and dusk dims them together.
+    const litAmount = clamp((Math.sqrt(clamp(lum, 0, 1)) * belowFade) / zenithLum, 0, 1);
     cloudLit
-      .setRGB(_fex[0] / fexMax, _fex[1] / fexMax, _fex[2] / fexMax)
+      .setRGB(_sunFex[0] / fexMax, _sunFex[1] / fexMax, _sunFex[2] / fexMax)
       .lerp(_c.setRGB(1, 1, 1), 0.45)
       .multiplyScalar(litAmount);
     cloudLit.lerp(_c.setRGB(0.055, 0.065, 0.10), night);
@@ -1250,30 +1890,63 @@ export function createSky(scene, renderer, opts = {}) {
       m.renderOrder = 900 + (aboveDeck ? i : n - 1 - i);
     }
 
-    // Aerosols are concentrated in the lowest couple of kilometres, so the fog
-    // budget thins with altitude. At sea level this is a no-op.
+    // The airlight colour follows where the camera is pointing. getWorldDirection
+    // writes into the target; no allocation (§1.8).
+    camera.getWorldDirection(viewAz);
+    viewAz.y = 0;
+    if (viewAz.lengthSq() < 1e-8) viewAz.set(0, 0, -1);
+    else viewAz.normalize();
+    refreshFogColor();
+
+    // NOTE ON `fogHeightScaleM`: it is now INERT, and deliberately so. It used
+    // to scale a single FogExp2 density by exp(-camY/H) as a stand-in for the
+    // fact that haze thins with altitude. The aerial-perspective model
+    // integrates the real profile between the camera's altitude and the
+    // fragment's, so applying the old factor as well would count the same
+    // physics twice — and get it wrong, because the old form knew nothing about
+    // where the fragment was. The option is kept so existing callers do not
+    // break; it does nothing.
     if (scene.fog) {
       let density = cfg.fogDensity;
-      if (cfg.fogHeightScaleM > 0) {
-        density *= Math.exp(-Math.max(0, camPos.y) / cfg.fogHeightScaleM);
-      }
       const w = whiteout;
       if (w > 0.001) {
-        // exp(-(d*rho)^2) = 0.05 at the stated visibility.
-        const inCloud = Math.sqrt(3) / Math.max(20, cfg.inCloudVisibilityM);
+        // Target transmittance 0.05 at the stated in-cloud visibility. The
+        // chunk goes grey and un-stratified at this magnitude, so both species
+        // contribute their full length: tau = rho * L * (1 + aerosolRatio).
+        const inCloud =
+          3 / (Math.max(20, cfg.inCloudVisibilityM) * (1 + AERIAL.aerosolRatio));
         density = lerp(density, inCloud, w);
       }
       scene.fog.density = density;
       uniforms.uFogDensity.value = density;
-      if (w > 0.001) {
-        scene.fog.color.copy(fogColor).lerp(uniforms.uWhiteoutColor.value, w);
-      } else if (!scene.fog.color.equals(fogColor)) {
-        scene.fog.color.copy(fogColor);
-      }
+      // The colour was already published by refreshFogColor() above, whiteout
+      // blend included.
     }
   }
 
   skyDome.onBeforeRender = (_renderer, _scene, camera) => syncToCamera(camera);
+
+  /**
+   * The cascades have to be fitted with the LIVE camera, and they have to be
+   * fitted BEFORE WebGLShadowMap runs — a frame-late shadow camera is a shadow
+   * that lags the aeroplane across the runway.
+   *
+   * `scene.onBeforeRender` is the only hook that lands in that window:
+   * WebGLRenderer#render calls it after `scene.updateMatrixWorld()` and
+   * `camera.updateMatrixWorld()` and before `projectObject()` /
+   * `shadowMap.render()`. Using it means main.js needs no shadow-specific line
+   * at all — `renderer.render(scene, cameras.active)` is the whole integration.
+   *
+   * The previous handler is chained rather than replaced; nothing sets one
+   * today, but this module is not the scene's owner.
+   */
+  const prevSceneBeforeRender = scene.onBeforeRender;
+  scene.onBeforeRender = function (rendererRef, sceneRef, camera, target) {
+    if (prevSceneBeforeRender) {
+      prevSceneBeforeRender.call(this, rendererRef, sceneRef, camera, target);
+    }
+    if (shadows) shadows.update(camera);
+  };
 
   /**
    * @param {number} dt Frame delta in SECONDS. Advances the clock when
@@ -1386,6 +2059,8 @@ export function createSky(scene, renderer, opts = {}) {
   }
 
   function dispose() {
+    shadows?.dispose();
+    scene.onBeforeRender = prevSceneBeforeRender || function () {};
     skyDome.onBeforeRender = () => {};
     skyMaterial.dispose();
     skyDome.geometry.dispose();
@@ -1423,6 +2098,13 @@ export function createSky(scene, renderer, opts = {}) {
     isInCloud,
     setCloudCoverage,
     group,
+    /**
+     * The cascaded-shadow handle, or null when `opts.shadows === false`.
+     * Additive; not part of the MODULES.md § 2.8 shape. Carries
+     * `setQuality('off'|'low'|'medium'|'high')`, `setEnabled(bool)` and
+     * `getStats()`.
+     */
+    shadows,
     dispose,
   };
 }

@@ -591,12 +591,16 @@ createSky(scene, renderer, opts?) -> {
   sunLight,                    // THREE.DirectionalLight  (read-only to others)
   ambientLight,                // THREE.HemisphereLight   (read-only to others)
   sunDirection,                // THREE.Vector3, unit, scene -> sun
+  shadows,                     // the §2.15 handle, or null when opts.shadows=false
 }
 ```
 
 ```ts
-opts = { turbidity = 8, fogDensity = 1.1e-5, timeOfDay = 0.42,
-         sunDistance = 120000, sunAzimuthDeg = 180, dayLengthSec = 0 }
+opts = { turbidity = 8, fogDensity = 8e-6, timeOfDay = 0.42,
+         sunDistance = 120000, sunAzimuthDeg = 180, dayLengthSec = 0,
+         rayleigh = 1.2, mieCoefficient = 0.002, exposure = 0.95,
+         fogViewBlend = 0.7, cloudLayers = 8, cloudShearM = 900,
+         shadows = true, shadowQuality = 'high', aircraftReceivesShadow = true }
 ```
 
 This module owns `scene.background`, `scene.fog` and **every light**. No other
@@ -604,15 +608,123 @@ module may add one. `sunLight` / `ambientLight` are exposed so others can read
 the sun direction (lens flare, water specular, shadow framing) — read them, do
 not reparent them or change their intensity; both are rewritten every frame.
 
-**Fog density is a visibility budget, not a mood setting.** `FogExp2` attenuates
-by `exp(-(d·density)²)`, and Mount Rainier is 84 km out:
+Two additional named exports, for harnesses and tools, not for the render loop:
+`sampleSky(dir, sunDir, opts?, out?)` returns the dome's tone-mapped colour in
+one direction, and `aerialTransmittanceJs(camY, fragY, dist, density, out)` is
+the CPU mirror of the fog shader. `npm run check:sky` is built on both.
 
-| density | Rainier |
-|---|---|
-| `8e-5` | attenuated by `exp(-45)` — **invisible**. Renders perfectly, you cannot see it. |
-| `1.1e-5` | ~40% contrast: a pale blue-grey cone above the haze. Correct. |
+**sky.js REPLACES three's four `fog_*` ShaderChunks, globally, at module load.**
+This is the one thing in the codebase that reaches outside its own file, and it
+is here because `scene.fog` is this module's to define (§1.7) and because every
+fogged material in the scene has to agree about what distance does. The chunks
+stay `#ifdef USE_FOG`-guarded, so anything with `fog: false` — the sky dome, the
+cloud slabs, all of three's depth and shadow materials — compiles unchanged.
 
-If you raise it, re-derive against 84 km first.
+Consequences you must know about:
+
+- **`fog_vertex` writes a second varying, `vFogWorldY`,** and redefines
+  `vFogDepth` as RADIAL distance rather than `-mvPosition.z`. Any hand-written
+  `ShaderMaterial` that includes `<fog_vertex>` must also include
+  `<fog_pars_vertex>`, as three's own materials do.
+- **The composite runs in display-encoded space,** after
+  `<colorspace_fragment>`, exactly where three's own fog runs.
+- Adding a material with `fog: true` is enough to opt in. There is nothing to
+  call and no uniform to set.
+
+**Fog density is a visibility budget, not a mood setting.** It is now the
+sea-level extinction of the **green** channel, per metre; red and blue follow
+from λ⁻⁴, and a second aerosol species with a 1.2 km scale height rides on top
+of the 8 km molecular one. Because the model integrates the column between the
+CAMERA's altitude and the FRAGMENT's, range alone no longer determines haze —
+valleys haze more than the ridges above them. Mount Rainier at 94 km, camera at
+600 m, `fogDensity = 8e-6`:
+
+| | transmittance R / G / B | rock | snow |
+|---|---|---|---|
+| summit, 4,390 m | 0.72 / 0.51 / 0.25 | sRGB 175,196,221 | 239,242,245 |
+| base, 900 m | 0.58 / 0.36 / 0.14 | sRGB 190,209,231 | 238,241,244 |
+| round 1, `FogExp2 1.1e-5` | 0.34 flat | sRGB 204,205,205 | 235,239,242 |
+
+The row that matters is the last one: one scalar density gives distant rock a
+**neutral grey** 31 sRGB below snow. Two species with λ⁻⁴ give it a **blue** 64
+below. Distance now reads as distance and not as a wash. If you change the
+density, re-derive against that table — `npm run check:sky` asserts it.
+
+**`fogHeightScaleM` is now inert.** It scaled a single density by
+`exp(-camY/H)`; the model integrates the real profile at both ends and applying
+it as well would count the same physics twice. The option is kept so existing
+callers do not break.
+
+**The airlight colour follows the camera's heading.** `scene.fog.color` is one
+value per frame, so it is sampled from the model 2.5° above the horizon along
+the camera's bearing, blended `fogViewBlend` of the way from the azimuthal
+average. Round 1 used the average alone, which is why a low sun had no warm
+limb: the average of a copper western sky and a slate eastern one is grey.
+Consumers that read `scene.fog.color` — `terrain.js` does, for the sea's
+grazing-angle reflection — now get a value that changes when the pilot turns.
+That is intended.
+
+**sky.js also claims `scene.onBeforeRender`.** It chains any handler already
+there and calls `shadows.update(camera)` from it. That hook is the only place in
+a three render that runs AFTER `scene.updateMatrixWorld()` and
+`camera.updateMatrixWorld()` and BEFORE `projectObject()` and
+`shadowMap.render()` — which is exactly the window a shadow camera has to be
+fitted in. Using it is why §2.15 needs no line in `main.js` at all. If you add
+your own `scene.onBeforeRender`, chain it; do not replace it.
+
+### 2.15 `src/world/shadows.js` — cascaded shadow maps
+
+```js
+createShadows(scene, renderer, opts?) -> {
+  lights,                      // THREE.DirectionalLight[], the cascade carriers
+  update(camera) -> void,      // fit + tag. sky.js calls this, nobody else should
+  setQuality(name) -> void,    // 'off' | 'low' | 'medium' | 'high'
+  getQuality() -> string,
+  setEnabled(on) -> void,
+  getStats() -> object,        // per-cascade extent, texel size, bias, render share
+  dispose() -> void,
+}
+```
+
+**Constructed only by `sky.js`.** A shadow-casting cascade is a light, and §1.7
+says sky.js owns every light. Reach it as `sky.shadows`.
+
+`castShadow` / `receiveShadow` are **not yours to set**. shadows.js traverses the
+scene each frame and tags what it finds, because terrain creates and destroys
+~1,500 meshes as the LOD moves and nothing set once at boot would survive that.
+Its rules: everything under the `sky` group and the two water surfaces neither
+cast nor receive; `terrain-*` receives always and casts only through a
+morph-aware depth material; everything else — the aeroplane, the runways, the
+landmarks, whatever a buildings module adds — casts and receives. **Name your
+meshes** and they will be tagged correctly with no change here.
+
+The cascade lights carry `intensity = 0`. They exist to own a shadow map;
+`sunLight` remains the only source of sunlight, so the contract above is intact.
+
+Four cascades at 'high': 0.35–70 m at 8 cm/texel, 70–300 m at 34 cm, 300–1200 m
+at 1.4 m, 1200–12000 m at 13 m. Past 12 km the sun term is plain N·L. Cascades 2
+and 3 re-render every third frame on opposite phases; a stale cascade is
+incomplete, never wrong (its map and its shadow matrix are frozen together, so a
+point that has left its box reads as lit).
+
+**shadows.js takes terrain.js's vertex morph out of terrain.js's own material at
+run time** rather than copying it — `extractTerrainMorph` calls the surface
+material's `onBeforeCompile` on a probe made of the three `#include` markers it
+patches (`common`, `beginnormal_vertex`, `begin_vertex`) and slices the injected
+text back out. It has to: three's shadow pass draws casters with a
+MeshDepthMaterial that knows nothing about CDLOD morphing, and the morph is a
+function of `cameraPosition`, which in a shadow pass is the LIGHT. If terrain.js
+ever stops patching those three chunks the extraction returns null, terrain
+stops casting, and the console says so. **A hand copy of the morph was the first
+version and it was stale within the hour** — the terrain agent rewrote the morph
+from a cell-size window to a per-node error-driven one in the same session.
+
+Verified by `node scripts/check-shadows.mjs` — 54 assertions, no GPU needed:
+the slice bounding spheres really bound their slices at every fov the sim uses,
+the cascade weights sum to exactly 1 through every seam, a 0.1-texel camera move
+does not move the map at all and a large one lands on a whole number of texels,
+a 360° roll does not resize any cascade, and the extractor refuses rather than
+guesses. **It is not yet in `npm run check:all`** — one line in `package.json`.
 
 ### 2.9 `src/aircraft/model.js` — the visual airframe
 
