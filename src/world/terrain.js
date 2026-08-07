@@ -2055,9 +2055,9 @@ vec3 tRoofColour(float u) {
   c = mix(c, vec3(0.560, 0.550, 0.522), step(0.34, u));  // 0.34  weathered concrete
   c = mix(c, vec3(0.455, 0.470, 0.487), step(0.58, u));  // 0.58  galvanised steel
   c = mix(c, vec3(0.790, 0.795, 0.782), step(0.755, u)); // 0.755 white TPO membrane
-  c = mix(c, vec3(0.335, 0.238, 0.205), step(0.900, u)); // 0.900 oxide red / brick
-  c = mix(c, vec3(0.228, 0.272, 0.322), step(0.950, u)); // 0.950 blue-grey steel
-  c = mix(c, vec3(0.240, 0.292, 0.244), step(0.982, u)); // 0.982 green steel
+  c = mix(c, vec3(0.375, 0.222, 0.172), step(0.885, u)); // 0.885 oxide red / brick
+  c = mix(c, vec3(0.200, 0.262, 0.342), step(0.942, u)); // 0.942 blue-grey steel
+  c = mix(c, vec3(0.222, 0.302, 0.222), step(0.976, u)); // 0.976 green steel
   return c;
 }
 `;
@@ -2292,16 +2292,26 @@ function terrainColourGlsl(lcRegion, lcDetail) {
   // from the table is the right hue and the wrong amount of it: the first cut
   // of this turned Georgetown into a patchwork of red and white rectangles,
   // which is the same failure as a flat grey quilt with the sign flipped.
-  vec3 roofC = mix(lcHard, tSrgb(tRoofColour(roofId)), 0.88);
+  vec3 roofC = mix(lcHard, tSrgb(tRoofColour(roofId)), 0.94);
   lcCol = mix(lcCol, roofC * (0.88 + 0.24 * lotId), roofCover);
 
   // Street trees and back gardens. Without this, everything NLCD calls
   // developed comes out pavement-coloured, and Wallingford from 300 m looks
   // like a car park instead of the tree canopy with roofs in it that it is.
-  vec3 cUrbanTree = tSrgb(vec3(0.128, 0.205, 0.108));
+  vec3 cUrbanTree = tSrgb(vec3(0.115, 0.208, 0.092));
   float treeFrac = lcCanopy * smoothstep(0.30, 0.82, canopy * 0.5 + lotId * 0.5)
                  * (1.0 - street * 0.8) * (1.0 - lcIndustrial * 0.75);
   lcCol = mix(lcCol, cUrbanTree * (0.80 + 0.45 * standId), treeFrac);
+
+  // Per-block hue drift. Real districts are not one material either: a block of
+  // 1920s brick warehouses next to a block of poured concrete next to a block of
+  // painted steel differ in HUE, not only in brightness, and at 610 m a block is
+  // 60 pixels across so the difference is legible. Kept to a few per cent per
+  // channel — this is material variation, not chroma noise.
+  vec3 blockHue = vec3(tHash21(floor(bc) + 7.7),
+                       tHash21(floor(bc) + 13.3),
+                       tHash21(floor(bc) + 21.1)) - 0.5;
+  lcCol *= vec3(1.0) + blockHue * 0.11 * wStreet * fadeBlock;
 
   vec3 asphalt = tSrgb(vec3(0.118, 0.118, 0.124));
   lcCol = mix(lcCol, asphalt * (0.95 + 0.6 * blockId), wStreet * street * 0.42);
