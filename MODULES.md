@@ -577,8 +577,31 @@ createTerrain(scene, opts?) -> Promise<{
   dispose() -> void
 }>
 
-LodStats = { nodes, built, drawn, triangles, finestCellM, byLevel[], tau }
+LodStats = { nodes, built, drawn, triangles, finestCellM, byLevel[], tau,
+             lodQuality, cacheCap, evictSlack, cacheBytes, cacheCapBytes }
 ```
+
+**THE NODE CACHE SCALES WITH THE TIER, and it is the largest single heap term in
+the sim.** `lodQuality` shrinks the working set; it used to leave the *ceiling*
+at a flat 1,400 nodes, so a phone that drew 220 nodes could still accumulate
+1,520 x 131.3 KiB = **195 MiB** of vertex buffers before evicting a byte —
+against a 160 MB heap target for the entire tab. The cap is now
+`1400 * lodQuality^1.35`, floored at 560:
+
+| tier | `lodQuality` | cap + slack | ceiling |
+|---|---|---|---|
+| phone | 0.40 | 560 + 48 | **77.9 MiB** (was 194.9) |
+| tablet | 0.70 | 865 + 74 | 120.4 MiB |
+| desktop | 1.00 | 1,400 + 120 | 194.9 MiB — unchanged |
+
+The exponent is measured, not assumed: peak `drawn` over a KBFI→Rainier transit,
+five parked cameras at four altitudes, and a 360° turn on the Rainier flank was
+767 / 471 / 220 at q = 1 / 0.7 / 0.4, which is q^1.35 to within 1%. q^2 would
+have given the phone 407, and **an undersized cache does not thrash — it
+settles, quietly, on a coarser surface than the tier asked for**, because
+`visit()` will not subdivide a node whose children have been evicted. Measured:
+cap 407 → 178 drawn; cap 450 → 178; cap 500 → 220. `check:terrain` asserts the
+cap changes what is KEPT and never what is SELECTED, at both tiers.
 
 ```ts
 opts = {
@@ -951,6 +974,35 @@ morph-aware depth material; everything else — the aeroplane, the runways, the
 landmarks, whatever a buildings module adds — casts and receives. **Name your
 meshes** and they will be tagged correctly with no change here.
 
+**The one opt-out is `mesh.userData.csmNoCast = true`**, honoured by the tagger.
+It suppresses CASTING only; receiving is still decided here. It exists because a
+module that knows one of its meshes is too far away to cast a visible shadow is
+the only module that can know that — `landmarkModels.js` measured the whole city
+being submitted to all four cascades from 12 km away (1.12 ms of a 9.09 ms
+frame), built far LOD levels with `castShadow = false`, and watched this
+traversal set all 125 of them back to true on the next frame.
+
+**`off` IS A TIER, AND IT MEANS OFF.** At zero cascades `update()` returns
+before the traverse, and `setupMaterial` adds nothing. Both matter on the one
+tier that cannot afford either: before this, a phone-tier scene walked ~500
+objects per frame to set flags that `shadowMap.enabled === false` guarantees
+nobody reads, and 62 materials carried `CSM_CASCADES = 4` with no cascade to
+sample — 20 of the 31 live programs had it in their cache key, and each is a
+first-use main-thread compile on a mobile driver. Measured after: `tagging`
+false, `materialsSetUp` 0, `tagMs` 0, 0 programs carrying the define.
+
+**A cascade is always rendered once, whatever its phase says.** `light.shadow.map`
+is null until three has rendered that cascade, and until then three binds its
+default RGBA texture to the program's `sampler2DShadow` — a signed/unsigned/
+shadow sampler mismatch that the driver rejects with `GL_INVALID_OPERATION` for
+every draw call that reads it. The stagger is what opened the window: cascade 3
+has phase 1, so on frame 0 `0 % 3 === 1` is false and its map does not exist for
+that whole frame. **This was the startup GL_INVALID_OPERATION flood**, and the
+"steady state is clean" observation is exactly what the diagnosis predicts.
+Measured, desktop tier, rebuilding the cascades to reproduce the boot state:
+1282 (`GL_INVALID_OPERATION`) on the next frame before, 0 over three rebuild
+cycles after. `getStats().mapsUnprimed` reports it.
+
 The cascade lights carry `intensity = 0`. They exist to own a shadow map;
 `sunLight` remains the only source of sunlight, so the contract above is intact.
 
@@ -1208,8 +1260,49 @@ srcOf(i)             -> 'published' | 'dsm' | 'derived'
 centroidLatLon(i, out?) -> {lat, lon}       // AREA centroid, not vertex 0
 nearestBuilding(lat, lon, maxDistanceM?) -> {index, distanceM, heightM, areaM2, source} | null
 coversLatLon(lat, lon)  -> boolean
-decodeBuildings(data)   -> BuildingSet       // TEST SEAM, see below
+decodeBuildings(data, policy?) -> BuildingSet   // TEST SEAM, see below
+
+BUILDING_TALL_H_M, BUILDING_MAJOR_H_M, BUILDING_MAJOR_AREA_M2   // 50, 22, 1400
+classifyBuilding(heightM, areaM2) -> 'tall'|'major'|'minor'     // pure
+classOf(i)                        -> 'tall'|'major'|'minor'
+setBuildingBudget(policy|null)    -> boolean    // BOOT-TIME, before loadBuildings
+buildingBudget()                  -> policy|null
 ```
+
+**The size class lives here, not in the extruder,** because it is a property of
+the footprint — `heightM` and `areaM2` are this module's two columns — and the
+LOD that picks a draw distance and the loader that decides whether to decode a
+building at all have to agree on the answer exactly. The thresholds are
+`landmarkModels.js`'s, unchanged; `check:buildings` asserts the two files still
+carry the same digits.
+
+**THE PHONE DOES NOT DECODE WHAT IT WILL NEVER DRAW.** `budgets.buildings`
+(§2.18) gives the phone `minorCutoffM: 0` — not a small distance, a statement
+that the minor class is never drawn. `main.js` hands that object to
+`setBuildingBudget()` next to the tier that produced it, and `decode()` drops
+those rings as it walks them: the rejection rewinds both write cursors, so a
+filtered decode allocates exactly what an unfiltered one does and keeps only
+what it kept, then `slice()`s (never `subarray()` — a view keeps the whole
+backing buffer alive, which is the entire point). Measured, phone tier:
+
+| | full | phone budget |
+|---|---|---|
+| footprints | 23,979 | **6,724** |
+| ring vertices | 224,796 | **96,509** (57% fewer) |
+| decode | 52 ms | 35 ms |
+| extruded meshes / chunks | 258 / 131 | **131 / 125** |
+| city triangles | 625k | **275k** |
+| city vertex buffers | 29.8 MiB | **12.6 MiB** |
+| city build time | 783 ms | **230 ms** |
+
+`meta.filtered` is `null` for a full decode and otherwise says what is missing;
+`meta.provenance` is recounted over the survivors rather than carried over.
+`nearestBuilding` / `coversLatLon` answer over the filtered set, so on a phone
+they answer "nearest MAJOR building". Geography does not move: `check:buildings`
+asserts every survivor keeps its exact anchor and its exact outline.
+
+`decodeBuildings(data)` with no policy always decodes the whole file, whatever a
+browser set on the module — a harness gets the full set unless it asks otherwise.
 
 ```ts
 BuildingSet = {

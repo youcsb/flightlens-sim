@@ -55,6 +55,44 @@
  *     rect uniforms below assume exactly that.
  *
  * ---------------------------------------------------------------------------
+ * § TIERS — the rasters cost 64 MB of a phone's 200 MB tab
+ * ---------------------------------------------------------------------------
+ * MEASURED, desktop, at the default view: the two layers hold 32.0 MiB of
+ * Uint8Array on the JS heap (region 20.0, detail 12.0) and the GPU holds the
+ * same bytes again as RGBA8 textures. 64 MB against an iOS tab ceiling of
+ * ~200 MB is not a detail — core/device.js budgets FORTY megabytes for the
+ * whole GPU/texture/DOM reserve, and land cover alone is 32 of it.
+ *
+ * So a phone builds the same rasters at half linear resolution:
+ *
+ *   layer   desktop           phone            m/texel       bytes
+ *   region  2048 x 2560       1024 x 1280      81.2 -> 162.3  20.0 -> 5.0 MiB
+ *   detail  1536 x 2048        768 x 1024      19.7 ->  39.4  12.0 -> 3.0 MiB
+ *
+ * 32.0 -> 8.0 MiB of heap, and the same again off the GPU. What it costs, and
+ * what it does not:
+ *
+ *   The DETAIL layer barely loses anything real. NLCD is a 30 m survey and the
+ *   baker resampled it UP to 19.7 m; at 39.4 m the raster is coarser than the
+ *   source for the first time, but only by 1.3x, and the shader's noise-jitter
+ *   already dissolves texel boundaries at that scale.
+ *
+ *   The REGION layer genuinely gets coarser: 162 m is 5.4x the source, against
+ *   2.7x today. That is the honest price. It is paid on the FAR field — inside
+ *   the Seattle inset the detail layer answers — where 162 m subtends about
+ *   9 phone pixels at 20 km and 2 at 90 km.
+ *
+ * THE DOWNSAMPLE IS MODAL, NOT AN AVERAGE. Averaging class indices is exactly
+ * the bug the NearestFilter note above is about: the mean of class 6 and class
+ * 9 is class 7, "barren rock", which does not border either of them anywhere in
+ * the real world. `downsampleClassRaster` takes the MAJORITY class of each 2x2
+ * block (ties to the top-left, so it is deterministic), and takes the MAXIMUM
+ * of the road mask, because a road is a one-texel line and any pooling that is
+ * not a max erases the network. Verified per-place by check-geo-mobile.mjs:
+ * Rainier is still ice, Elliott Bay is still water, the Space Needle is still
+ * high-intensity development in the downsampled raster.
+ *
+ * ---------------------------------------------------------------------------
  * NOTHING BLOCKS THE BOOT (§1.6)
  * ---------------------------------------------------------------------------
  * A missing or malformed bake resolves to null and the terrain falls back to
@@ -178,6 +216,150 @@ const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 let warned = false;
 
+// ---------------------------------------------------------------------------
+// § TIERS — the live configuration
+// ---------------------------------------------------------------------------
+
+/**
+ * Linear downsample factor per tier, per layer. 1 is "ship what was baked".
+ * See the § TIERS block in the header for the measurement and the trade.
+ *
+ * The factors are PER LAYER on purpose: the detail layer and the region layer
+ * sit at very different multiples of the 30 m source, so a future round can
+ * coarsen the far field without touching the inset (or the reverse) instead of
+ * having to move one global number.
+ */
+export const LANDCOVER_TIERS = Object.freeze({
+  phone: Object.freeze({ region: 2, detail: 2, sequentialDecode: true }),
+  tablet: Object.freeze({ region: 1, detail: 1, sequentialDecode: false }),
+  desktop: Object.freeze({ region: 1, detail: 1, sequentialDecode: false }),
+});
+
+/** Unknown tier -> desktop, per §1.6: degrade to the full-fat path, never throw. */
+let tierConfig = LANDCOVER_TIERS.desktop;
+
+/**
+ * Choose the tier before `loadLandcover()` runs. Boot-time only — the rasters
+ * are decoded once and the shader samples them for the life of the session, so
+ * there is nothing to re-apply live and pretending otherwise would be hidden
+ * state.
+ *
+ * @param {string|{region?:number, detail?:number, sequentialDecode?:boolean}} tier
+ *        a tier name from LANDCOVER_TIERS, or an explicit override
+ * @returns {{region:number, detail:number, sequentialDecode:boolean}} in force
+ */
+export function configureLandcover(tier) {
+  if (typeof tier === 'string') {
+    const t = LANDCOVER_TIERS[tier];
+    if (!t) {
+      console.warn(`[landcover] unknown tier "${tier}"; keeping the desktop rasters.`);
+      tierConfig = LANDCOVER_TIERS.desktop;
+    } else {
+      tierConfig = t;
+    }
+  } else if (tier && typeof tier === 'object') {
+    const f = (v, dflt) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) && n >= 1 ? n : dflt;
+    };
+    tierConfig = Object.freeze({
+      region: f(tier.region, 1),
+      detail: f(tier.detail, 1),
+      sequentialDecode: !!tier.sequentialDecode,
+    });
+  }
+  return getLandcoverConfig();
+}
+
+/** The configuration in force. A copy — mutating it changes nothing. */
+export function getLandcoverConfig() {
+  return { ...tierConfig };
+}
+
+/**
+ * Halve (or quarter, or …) a baked land-cover raster WITHOUT inventing classes.
+ *
+ * Pure, and exported so `check-geo-mobile.mjs` can run it in Node against the
+ * real baked PNGs and assert that the places whose class is known independently
+ * still come back right.
+ *
+ * Per output texel, over the f x f source block:
+ *   G  the MAJORITY class index. The block is scanned row-major and the first
+ *      class to reach the winning count keeps it, so a tie resolves to the
+ *      top-left texel — deterministic, and the same answer on every machine.
+ *   B  the MAXIMUM road value. Roads are one-texel lines from TIGER/Line
+ *      centrelines; a mean deletes them and a nearest sample cuts them into
+ *      dashes. Max keeps the network connected and keeps the primary/secondary
+ *      distinction (255 beats 160 beats 0).
+ *   R  the NLCD code belonging to the winning texel, so provenance still names
+ *      a real class rather than the average of two.
+ *   A  255.
+ *
+ * @param {Uint8Array|Uint8ClampedArray} src RGBA, w * h * 4
+ * @param {number} w @param {number} h @param {number} f integer >= 1
+ * @returns {{data: Uint8Array, width: number, height: number}}
+ */
+export function downsampleClassRaster(src, w, h, f) {
+  const factor = Math.max(1, Math.floor(f) || 1);
+  if (factor === 1) {
+    return {
+      data: src instanceof Uint8Array ? src : new Uint8Array(src),
+      width: w,
+      height: h,
+    };
+  }
+  const ow = Math.max(1, Math.ceil(w / factor));
+  const oh = Math.max(1, Math.ceil(h / factor));
+  const out = new Uint8Array(ow * oh * 4);
+  // 256 buckets covers every possible byte, so no class can fall outside it.
+  const counts = new Uint16Array(256);
+  const firstCode = new Uint8Array(256);
+  const seen = [];
+
+  for (let oy = 0; oy < oh; oy++) {
+    const y0 = oy * factor;
+    const y1 = Math.min(h, y0 + factor);
+    for (let ox = 0; ox < ow; ox++) {
+      const x0 = ox * factor;
+      const x1 = Math.min(w, x0 + factor);
+
+      let road = 0;
+      seen.length = 0;
+      for (let y = y0; y < y1; y++) {
+        let i = (y * w + x0) * 4;
+        for (let x = x0; x < x1; x++, i += 4) {
+          const cls = src[i + 1];
+          if (counts[cls] === 0) {
+            seen.push(cls);
+            firstCode[cls] = src[i];
+          }
+          counts[cls]++;
+          const b = src[i + 2];
+          if (b > road) road = b;
+        }
+      }
+
+      let best = seen.length ? seen[0] : 0;
+      let bestN = 0;
+      for (let k = 0; k < seen.length; k++) {
+        const c = seen[k];
+        if (counts[c] > bestN) {
+          bestN = counts[c];
+          best = c;
+        }
+      }
+      for (let k = 0; k < seen.length; k++) counts[seen[k]] = 0;
+
+      const o = (oy * ow + ox) * 4;
+      out[o] = firstCode[best];
+      out[o + 1] = best;
+      out[o + 2] = road;
+      out[o + 3] = 255;
+    }
+  }
+  return { data: out, width: ow, height: oh };
+}
+
 /**
  * Decode a baked PNG to raw RGBA bytes.
  *
@@ -186,7 +368,7 @@ let warned = false;
  * that only exists on the GPU cannot answer that. One decode, two consumers —
  * the DataTexture below wraps the same array, so this costs nothing extra.
  */
-async function decodeToRgba(url) {
+async function decodeToRgba(url, factor = 1) {
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
@@ -205,7 +387,24 @@ async function decodeToRgba(url) {
     ctx.drawImage(bitmap, 0, 0);
     bitmap.close?.();
     // Same-origin, so this cannot taint. See scripts/README.md.
-    return { width: w, height: h, data: new Uint8Array(ctx.getImageData(0, 0, w, h).data) };
+    const full = ctx.getImageData(0, 0, w, h).data;
+    // Release the backing store before the downsample allocates. A phone that
+    // is about to be told to hold 8 MiB should not peak at 20 + 20 + a canvas
+    // getting there.
+    canvas.width = 1;
+    canvas.height = 1;
+    // srcWidth/srcHeight are what the manifest is checked against; width/height
+    // are what actually ships. Downsampling reads the ImageData directly rather
+    // than copying it first, so the full-resolution bytes exist exactly once.
+    const small = downsampleClassRaster(full, w, h, factor);
+    return {
+      width: small.width,
+      height: small.height,
+      srcWidth: w,
+      srcHeight: h,
+      factor: Math.max(1, Math.floor(factor) || 1),
+      data: small.data,
+    };
   } catch {
     return null;
   }
@@ -302,45 +501,66 @@ export async function loadLandcover() {
 
   /** @type {Record<string, LandcoverLayer>} */
   const layers = {};
-  await Promise.all(
-    manifest.layers.map(async (spec) => {
-      const img = await decodeToRgba(assetUrl(spec.file));
-      if (!img) {
-        console.warn(`[landcover] ${spec.file} failed to load; skipping that layer.`);
-        return;
-      }
-      if (img.width !== spec.width || img.height !== spec.height) {
-        console.warn(
-          `[landcover] ${spec.file} is ${img.width}x${img.height}, ` +
-            `manifest says ${spec.width}x${spec.height}; skipping that layer.`,
-        );
-        return;
-      }
+  let heapBytes = 0;
 
-      const tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
-      tex.name = `landcover-${spec.name}`;
-      tex.magFilter = THREE.NearestFilter;
-      tex.minFilter = THREE.NearestFilter;
-      tex.generateMipmaps = false;
-      tex.wrapS = THREE.ClampToEdgeWrapping;
-      tex.wrapT = THREE.ClampToEdgeWrapping;
-      tex.flipY = false;
-      tex.colorSpace = THREE.NoColorSpace;
-      tex.anisotropy = 1;
-      tex.needsUpdate = true;
+  const buildLayer = async (spec) => {
+    // Per-layer factor, so the far field can be coarsened without touching the
+    // inset. A layer the tier table does not name ships at full resolution.
+    const factor = Math.max(1, Math.floor(tierConfig[spec.name] ?? 1) || 1);
+    const img = await decodeToRgba(assetUrl(spec.file), factor);
+    if (!img) {
+      console.warn(`[landcover] ${spec.file} failed to load; skipping that layer.`);
+      return;
+    }
+    // The manifest describes the BAKED file, so it is checked against the
+    // decoded source size, not against what the tier chose to keep.
+    if (img.srcWidth !== spec.width || img.srcHeight !== spec.height) {
+      console.warn(
+        `[landcover] ${spec.file} is ${img.srcWidth}x${img.srcHeight}, ` +
+          `manifest says ${spec.width}x${spec.height}; skipping that layer.`,
+      );
+      return;
+    }
 
-      const r = rectFor(spec.bbox);
-      layers[spec.name] = {
-        name: spec.name,
-        texture: tex,
-        rect: r.vec,
-        texelM: new THREE.Vector2(r.spanX / spec.width, r.spanZ / spec.height),
-        width: img.width,
-        height: img.height,
-        data: img.data,
-      };
-    }),
-  );
+    const tex = new THREE.DataTexture(img.data, img.width, img.height, THREE.RGBAFormat);
+    tex.name = `landcover-${spec.name}`;
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.flipY = false;
+    tex.colorSpace = THREE.NoColorSpace;
+    tex.anisotropy = 1;
+    tex.needsUpdate = true;
+
+    // texelM comes off the ACTUAL raster, not the manifest: everything the
+    // shader and the water mask do with it has to describe the bytes that
+    // shipped, or a downsampled layer reports a resolution it does not have.
+    const r = rectFor(spec.bbox);
+    heapBytes += img.data.byteLength;
+    layers[spec.name] = {
+      name: spec.name,
+      texture: tex,
+      rect: r.vec,
+      texelM: new THREE.Vector2(r.spanX / img.width, r.spanZ / img.height),
+      width: img.width,
+      height: img.height,
+      data: img.data,
+      factor,
+      srcWidth: img.srcWidth,
+      srcHeight: img.srcHeight,
+    };
+  };
+
+  if (tierConfig.sequentialDecode) {
+    // One layer at a time. Parallel decode is faster, but it means both
+    // full-resolution ImageDatas — 20 MiB and 12 MiB — exist at once, and on the
+    // tier that asked for this the peak is the number that kills the tab.
+    for (const spec of manifest.layers) await buildLayer(spec);
+  } else {
+    await Promise.all(manifest.layers.map(buildLayer));
+  }
 
   if (!layers.region && !layers.detail) return null;
 
@@ -373,8 +593,15 @@ export async function loadLandcover() {
     `[landcover] ${Object.keys(layers).join(' + ')} from ${
       manifest.sources?.map((s) => s.name).join(', ') || 'unknown source'
     }` +
-      (region ? `, region ${region.texelM.x.toFixed(0)} m/texel` : '') +
-      (detail ? `, detail ${detail.texelM.x.toFixed(0)} m/texel` : ''),
+      (region
+        ? `, region ${region.width}x${region.height} ${region.texelM.x.toFixed(0)} m/texel` +
+          (region.factor > 1 ? ` (1/${region.factor})` : '')
+        : '') +
+      (detail
+        ? `, detail ${detail.width}x${detail.height} ${detail.texelM.x.toFixed(0)} m/texel` +
+          (detail.factor > 1 ? ` (1/${detail.factor})` : '')
+        : '') +
+      `, ${(heapBytes / 1048576).toFixed(1)} MiB resident`,
   );
 
   return {
@@ -383,6 +610,13 @@ export async function loadLandcover() {
     palette,
     manifest,
     classAtLocal,
+    /**
+     * Bytes of raster held on the JS heap, and the same bytes again on the GPU.
+     * Published because "the phone tier is applied" has to be a MEASUREMENT
+     * somewhere, and this is the only place that knows what actually shipped.
+     */
+    heapBytes,
+    config: getLandcoverConfig(),
     /**
      * Is this point open water, per the survey?
      *

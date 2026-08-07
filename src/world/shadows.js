@@ -563,6 +563,8 @@ export function createShadows(scene, renderer, opts = {}) {
         margin: 0,
         texel: 0,
         renders: 0,
+        /** Has this cascade's map been asked for even once? See update(). */
+        primed: false,
       });
     }
   }
@@ -589,6 +591,17 @@ export function createShadows(scene, renderer, opts = {}) {
 
   function setupMaterial(mat) {
     if (!mat || setUp.has(mat)) return;
+    // AT 'off' THERE IS NOTHING TO OPT INTO, AND OPTING IN IS NOT FREE.
+    //
+    // CSM_CASCADES is what selects the patched arm of `lights_fragment_begin`.
+    // Adding it to a material that will never have a cascade to sample still
+    // compiles the blend, the four uCsmSplits comparisons and the cascade loop
+    // into every lit shader in the scene — measured at the phone tier, 62
+    // materials were carrying the define with zero cascades built, and 20 of
+    // the 31 live programs had `CSM_CASCADES,4` in their cache key. On a mobile
+    // driver every one of those is a first-use main-thread compile, which is
+    // the whole reason the phone tier turns shadows off in the first place.
+    if (tier.cascades === 0) return;
     const lit =
       mat.isMeshStandardMaterial ||
       mat.isMeshPhysicalMaterial ||
@@ -730,7 +743,17 @@ export function createShadows(scene, renderer, opts = {}) {
 
     // 3. Everything else — the aeroplane, the runways, the landmarks, whatever
     //    the buildings agent adds. Cast and receive.
-    obj.castShadow = true;
+    //
+    //    THE ONE OPT-OUT: `userData.csmNoCast`. Asked for by name in
+    //    landmarkModels.js, which measured the whole city being submitted to
+    //    all four cascades from 12 km away — 1.12 ms of a 9.09 ms frame, spent
+    //    on shadows falling on ground the camera cannot resolve — built the
+    //    obvious fix (far LOD levels with castShadow = false), and watched this
+    //    traversal set all 125 of them back to true on the next frame. A module
+    //    that knows one of its meshes is too far away to cast a visible shadow
+    //    is the only module that can know that, so it gets to say so. It is a
+    //    request not to CAST; receiving is still decided here.
+    obj.castShadow = obj.userData.csmNoCast !== true;
     obj.receiveShadow = isAircraft(obj) ? aircraftReceives : true;
     for (const m of mats) setupMaterial(m);
   }
@@ -789,6 +812,22 @@ export function createShadows(scene, renderer, opts = {}) {
   function update(camera) {
     if (!camera || !camera.isCamera) return;
 
+    // AT 'off', DO NOTHING AT ALL — not even the tagging pass.
+    //
+    // The traversal used to run before this check, so a phone-tier scene with
+    // zero cascades still walked every object in the graph each frame to set
+    // castShadow flags that `renderer.shadowMap.enabled === false` guarantees
+    // nobody reads, and to hand CSM_CASCADES to every lit material it met. Both
+    // are pure cost on the one tier that cannot afford any. setQuality() calls
+    // untagAll() before it rebuilds, so coming back from 'off' re-tags from
+    // scratch and nothing is left stale.
+    if (tier.cascades === 0) {
+      lastTagMs = 0;
+      lastFitMs = 0;
+      tagged = 0;
+      return;
+    }
+
     const t0 = now();
     tagged = 0;
     scene.traverse(tagObject);
@@ -835,10 +874,38 @@ export function createShadows(scene, renderer, opts = {}) {
       // bands is static geometry; the only thing a stale map gets wrong is a
       // moving object, and the only moving object is the aeroplane, which
       // lives in cascade 0.
-      const due = c.period <= 1 || frames % c.period === c.phase;
-      light.shadow.autoUpdate = live && due;
+      // THE STARTUP GL_INVALID_OPERATION FLOOD, AND WHY IT IS THIS LINE.
+      //
+      // `light.shadow.map` is null until WebGLShadowMap has rendered that
+      // cascade once. Until then three binds its default 2x2 RGBA texture to
+      // the `sampler2DShadow` the program declares, and the driver rejects
+      // EVERY draw call that reads it:
+      //
+      //   GL_INVALID_OPERATION: glDrawElements: Mismatch between texture
+      //   format and sampler type (signed/unsigned/float/shadow)
+      //
+      // The stagger is what opens the window. Cascade 3 has phase 1, so on
+      // frame 0 `0 % 3 === 1` is false, it is not due, its map is not created,
+      // and every draw call of that frame fails. That is exactly the reported
+      // shape: a burst at initialisation only, and a steady-state loop that
+      // returns zero gl.getError() results once every cascade has been through
+      // once. So a cascade that has never been rendered is ALWAYS due, whatever
+      // its phase says, and — see the fall-through below — whatever the sun is
+      // doing. Reproducible on demand: setQuality('off') then setQuality('high')
+      // rebuilds the lights and nulls every map again.
+      //
+      // A `primed` flag rather than reading `shadow.map === null` back: the
+      // rule is "ask for the first render exactly once", which is a decision
+      // this module can make on its own. Reading the map would tie the loop to
+      // whether a renderer ever ran, and the headless harness — which is where
+      // the "no maps at night" rule is asserted — never runs one.
+      const firstMap = c.primed !== true;
+      const due = firstMap || c.period <= 1 || frames % c.period === c.phase;
+      const render = due && (live || firstMap);
+      if (render) c.primed = true;
+      light.shadow.autoUpdate = render;
       light.shadow.intensity = live ? sunFade : 0;
-      if (!live || !due) {
+      if (!due || (!live && !firstMap)) {
         light.shadow.needsUpdate = false;
         if (!live) continue;
         // Splits still have to be written — they describe the cascade, not the
@@ -1009,6 +1076,16 @@ export function createShadows(scene, renderer, opts = {}) {
       taggedObjects: tagged,
       materialsSetUp: setUp.size,
       terrainCasts: tier.terrainCasts,
+      /**
+       * False at 'off': no per-frame scene.traverse, and no material anywhere
+       * carries CSM_CASCADES. This is the phone tier's whole shadow cost, and
+       * it is assertable rather than asserted-by-comment.
+       */
+      tagging: tier.cascades > 0,
+      /** Cascades that have not yet been asked for a first map — see the
+       *  firstMap note in update(). Anything but 0 after the first frame is the
+       *  startup sampler2DShadow mismatch coming back. */
+      mapsUnprimed: cascades.reduce((n, c) => n + (c.primed ? 0 : 1), 0),
       frames,
     };
   }

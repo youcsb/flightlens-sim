@@ -338,6 +338,106 @@ if (demReady) {
   ok('nothing is buried more than 60 m', buried === 0, `${buried}`);
 }
 
+// ---------------------------------------------------------------------------
+// THE SIZE BUDGET. core/device.js publishes `minorCutoffM: 0` for the phone —
+// "the minor class is never drawn at any distance". Until that was applied at
+// DECODE time, those 17,255 footprints were still fetched, decoded, DEM-sampled
+// at every one of their ring vertices, triangulated and uploaded, so a THREE.LOD
+// could switch them off on frame 0 and keep them resident for the flight.
+//
+// This runs LAST because decodeBuildings() replaces the module's live set.
+// ---------------------------------------------------------------------------
+console.log('\nthe phone size budget: what is never drawn is never decoded');
+{
+  // The classifier is the extruder's, and the two have to agree exactly or they
+  // disagree about which buildings exist.
+  const src = readFileSync(resolve(PUBLIC_DIR, '..', 'src/world/landmarkModels.js'), 'utf8');
+  const num = (name) => Number(src.match(new RegExp(`const ${name} = ([\\d.]+)`))?.[1]);
+  ok(
+    'the class thresholds match landmarkModels.js to the digit',
+    num('TALL_H_M') === B.BUILDING_TALL_H_M &&
+      num('MAJOR_H_M') === B.BUILDING_MAJOR_H_M &&
+      num('MAJOR_AREA_M2') === B.BUILDING_MAJOR_AREA_M2,
+    `${B.BUILDING_TALL_H_M} / ${B.BUILDING_MAJOR_H_M} m / ${B.BUILDING_MAJOR_AREA_M2} m2`,
+  );
+
+  // Count what the full set says, then decode again under the phone budget.
+  const cls = { tall: 0, major: 0, minor: 0 };
+  let minorVerts = 0;
+  for (let i = 0; i < set.count; i++) {
+    const c = B.classifyBuilding(set.heightM[i], set.areaM2[i]);
+    cls[c]++;
+    if (c === 'minor') minorVerts += set.ringStart[i + 1] - set.ringStart[i];
+  }
+
+  const phone = B.decodeBuildings(raw, { majorCutoffM: 8000, minorCutoffM: 0 });
+  ok(
+    'the minor class is gone and nothing else is',
+    phone.count === cls.tall + cls.major,
+    `${phone.count.toLocaleString()} of ${set.count.toLocaleString()} kept ` +
+      `(${cls.tall} tall + ${cls.major} major, ${cls.minor.toLocaleString()} minor dropped)`,
+  );
+  ok(
+    'and their ring vertices are gone with them',
+    phone.totalVertices === set.totalVertices - minorVerts,
+    `${phone.totalVertices.toLocaleString()} of ${set.totalVertices.toLocaleString()} ` +
+      `(${((1 - phone.totalVertices / set.totalVertices) * 100).toFixed(0)}% fewer)`,
+  );
+  ok(
+    'the arrays are COPIED, not subarray views — a view keeps the whole buffer',
+    phone.ringE.buffer.byteLength === phone.ringE.byteLength &&
+      phone.anchorLat.buffer.byteLength === phone.anchorLat.byteLength,
+    `${(phone.ringE.buffer.byteLength / 1024).toFixed(0)} KiB backing a ` +
+      `${(phone.ringE.byteLength / 1024).toFixed(0)} KiB array`,
+  );
+  ok('meta.filtered says what is missing', phone.meta.filtered?.dropped === cls.minor);
+  ok(
+    'provenance is recounted over what survived, not carried over',
+    phone.meta.provenance.published + phone.meta.provenance.dsm + phone.meta.provenance.derived ===
+      phone.count,
+    `${phone.meta.provenance.published}p + ${phone.meta.provenance.dsm}m + ` +
+      `${phone.meta.provenance.derived}d`,
+  );
+
+  // GEOGRAPHY IS NOT A TIER SETTING. Every surviving footprint has to be the
+  // same polygon in the same place, to the bit, as it was in the full set.
+  let idx = 0;
+  let moved = 0;
+  let deformed = 0;
+  for (let i = 0; i < set.count; i++) {
+    if (B.classifyBuilding(set.heightM[i], set.areaM2[i]) === 'minor') continue;
+    if (set.anchorLat[i] !== phone.anchorLat[idx] || set.anchorLon[i] !== phone.anchorLon[idx]) {
+      moved++;
+    }
+    const n = set.ringStart[i + 1] - set.ringStart[i];
+    const m = phone.ringStart[idx + 1] - phone.ringStart[idx];
+    if (n !== m) deformed++;
+    else {
+      for (let k = 0; k < n; k++) {
+        if (
+          set.ringE[set.ringStart[i] + k] !== phone.ringE[phone.ringStart[idx] + k] ||
+          set.ringN[set.ringStart[i] + k] !== phone.ringN[phone.ringStart[idx] + k]
+        ) {
+          deformed++;
+          break;
+        }
+      }
+    }
+    idx++;
+  }
+  ok('every surviving building is at exactly the same coordinate', moved === 0, `${moved} moved`);
+  ok('and has exactly the same outline', deformed === 0, `${deformed} deformed`);
+
+  // And the seam stays a seam: no argument means no filter, whatever a browser
+  // may have set on the module.
+  const again = B.decodeBuildings(raw);
+  ok(
+    'decodeBuildings with no policy still decodes the whole file',
+    again.count === set.count && again.meta.filtered === null,
+    `${again.count.toLocaleString()}`,
+  );
+}
+
 console.log(
   failures ? `\n${failures} building check(s) FAILED\n` : '\nall building checks passed\n',
 );

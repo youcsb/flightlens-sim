@@ -475,6 +475,105 @@ head('12. converge() — a teleport lands on the real ground');
   })());
 }
 
+// ---------------------------------------------------------------------------
+// 13. The node cache is the largest heap term in the sim, and it now knows
+//     which tier it is on. The failure this guards is not a slow frame: a cap
+//     under the working set makes visit() refuse to subdivide, and the LOD
+//     settles on a COARSER surface than lodQuality asked for, silently.
+// ---------------------------------------------------------------------------
+head('13. The node cache scales with the tier — and does not cost a node');
+{
+  const s1 = terrain.stats();
+  ok(
+    'desktop keeps the 1,400-node cache it was tuned with',
+    s1.cacheCap === 1400 && s1.evictSlack === 120,
+    `cap ${s1.cacheCap} + ${s1.evictSlack}`,
+  );
+  ok(
+    'and its ceiling is still ~195 MiB of vertex buffers',
+    Math.abs(s1.cacheCapBytes / 1048576 - 194.9) < 1,
+    `${(s1.cacheCapBytes / 1048576).toFixed(1)} MiB`,
+  );
+
+  // A second terrain at the phone tier's lodQuality. Same DEM, same origin.
+  const phoneScene = new THREE.Scene();
+  const phone = await createTerrain(phoneScene, { lodQuality: 0.4 });
+  const ps = phone.stats();
+  ok(
+    'the phone tier gets a smaller cache',
+    ps.cacheCap === 560 && ps.cacheCap < s1.cacheCap,
+    `cap ${ps.cacheCap} at lodQuality ${ps.lodQuality}`,
+  );
+  ok(
+    'which is a 117 MiB smaller ceiling — the biggest single heap cut available',
+    ps.cacheCapBytes < s1.cacheCapBytes - 110 * 1048576,
+    `${(ps.cacheCapBytes / 1048576).toFixed(1)} MiB vs ${(s1.cacheCapBytes / 1048576).toFixed(1)}`,
+  );
+
+  const phoneCam = new THREE.PerspectiveCamera(60, 375 / 812, 0.35, 300000);
+  const parkPhone = (lat, lon, altM, frames = 6) => {
+    const q = C.llToLocal(lat, lon);
+    phoneCam.position.set(q.x, altM, q.z);
+    phoneCam.updateMatrixWorld(true);
+    for (let i = 0; i < frames; i++) phone.update(phoneCam);
+  };
+
+  // THE SELECTION MUST NOT MOVE. Peak drawn over this tour is 220 with the cap
+  // live and 220 with eviction disabled entirely — measured both ways. A cap
+  // of 407 (what the q^1.35 curve alone would give) drops it to 178.
+  let peakDrawn = 0;
+  let peakBuilt = 0;
+  for (let i = 0; i <= 12; i++) {
+    const f = i / 12;
+    parkPhone(KBFI[0] + (RAINIER[0] - KBFI[0]) * f, KBFI[1] + (RAINIER[1] - KBFI[1]) * f, 1500, 3);
+    peakDrawn = Math.max(peakDrawn, phone.stats().drawn);
+    peakBuilt = Math.max(peakBuilt, phone.stats().built);
+  }
+  for (const [lat, lon] of [KBFI, KSEA, ELLIOTT_BAY, CASCADE_CREST, RAINIER]) {
+    for (const alt of [200, 1200, 3400, 6000]) {
+      parkPhone(lat, lon, alt, 8);
+      peakDrawn = Math.max(peakDrawn, phone.stats().drawn);
+      peakBuilt = Math.max(peakBuilt, phone.stats().built);
+    }
+  }
+  ok(
+    'the cap bounds what is KEPT, not what is SELECTED',
+    peakDrawn >= 220,
+    `peak drawn ${peakDrawn} (uncapped: 220)`,
+  );
+  ok(
+    'and it is actually enforced over a full tour',
+    peakBuilt <= ps.cacheCap + ps.evictSlack + 8,
+    `peak built ${peakBuilt} against ${ps.cacheCap} + ${ps.evictSlack}`,
+  );
+
+  // Stationary means stationary. A cache under the working set does not
+  // oscillate visibly frame to frame, but it does hunt; a single value over
+  // 20 frames at the worst camera is the guard.
+  parkPhone(RAINIER[0] + 0.15, RAINIER[1] + 0.15, 3400, 60);
+  const seq = [];
+  for (let i = 0; i < 40; i++) {
+    phone.update(phoneCam);
+    seq.push(phone.stats().drawn);
+  }
+  const seen = new Set(seq);
+  ok(
+    'a parked phone-tier camera selects one node set and holds it',
+    seen.size === 1,
+    `${seq[0]} for 40 frames` + (seen.size === 1 ? '' : ` — saw ${[...seen].join(', ')}`),
+  );
+
+  // §1.4 does not bend for a tier.
+  const rp = C.llToLocal(...RAINIER);
+  ok(
+    'and the ground is still the field at every tier',
+    phone.getHeightAt(rp.x, rp.z) === E.getElevationLocal(rp.x, rp.z) &&
+      phone.getHeightAt(rp.x, rp.z) === terrain.getHeightAt(rp.x, rp.z),
+    `${phone.getHeightAt(rp.x, rp.z).toFixed(2)} m at both tiers`,
+  );
+  phone.dispose();
+}
+
 console.log(`\n       terrain built in ${buildMs} ms\n`);
 if (failures) {
   console.log(`\x1b[31m${failures} terrain check(s) FAILED\x1b[0m\n`);

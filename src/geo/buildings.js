@@ -88,6 +88,98 @@ const SRC_CHAR = { p: SRC_PUBLISHED, m: SRC_DSM, d: SRC_DERIVED };
 let set = null;
 /** @type {Promise<BuildingSet|null>|null} */
 let loadPromise = null;
+/** @type {{minorCutoffM?:number, majorCutoffM?:number}|null} the size budget */
+let budget = null;
+
+// ---------------------------------------------------------------------------
+// SIZE CLASS, AND THE ONE THING A SMALL DEVICE IS ALLOWED TO DROP
+// ---------------------------------------------------------------------------
+
+/**
+ * The three size classes, and they live HERE rather than in the extruder
+ * because they are a property of the footprint, not of the mesh: `heightM` and
+ * `areaM2` are the two columns this module owns, and both consumers — the LOD
+ * that decides a draw distance and the loader that decides whether to decode a
+ * building at all — have to agree on the answer to the millimetre or they
+ * disagree about which buildings exist.
+ *
+ * The numbers are `world/landmarkModels.js`'s, unchanged, and the reasoning is
+ * its: 50 m is what still shows above the haze from Mount Rainier 84 km out;
+ * 22 m / 1,400 m2 is what reads from a few kilometres; the rest is residential
+ * fabric. See MODULES.md §2.17 for the pixel measurements behind each.
+ */
+export const BUILDING_TALL_H_M = 50;
+export const BUILDING_MAJOR_H_M = 22;
+export const BUILDING_MAJOR_AREA_M2 = 1400;
+
+/** @typedef {'tall'|'major'|'minor'} BuildingClass */
+
+/**
+ * Size class of a footprint from its own two measurements. Pure.
+ * @param {number} heightM
+ * @param {number} areaM2
+ * @returns {BuildingClass}
+ */
+export function classifyBuilding(heightM, areaM2) {
+  if (heightM >= BUILDING_TALL_H_M) return 'tall';
+  if (heightM >= BUILDING_MAJOR_H_M || areaM2 >= BUILDING_MAJOR_AREA_M2) return 'major';
+  return 'minor';
+}
+
+/** @param {number} i @returns {BuildingClass} */
+export function classOf(i) {
+  return set ? classifyBuilding(set.heightM[i], set.areaM2[i]) : 'minor';
+}
+
+/**
+ * THE PHONE DOES NOT DECODE WHAT IT WILL NEVER DRAW.
+ *
+ * `core/device.js` publishes `budgets.buildings.minorCutoffM`, and on the phone
+ * tier it is **0** — the minor class has no distance at which it is drawn. A
+ * cutoff of zero is not a small number, it is a statement that those 17,255
+ * footprints are dead weight, and until now they were still fetched, decoded
+ * into typed arrays, DEM-sampled at every one of their 128,287 ring vertices,
+ * triangulated and uploaded, so that a THREE.LOD could switch the result off on
+ * frame 0 and keep it resident for the rest of the flight.
+ *
+ * So the budget is applied HERE, at the one point where dropping a building is
+ * a decode that never happens rather than a mesh that is hidden. Nothing
+ * downstream needs to change: the extruder classifies what it is given, finds
+ * no minor buildings, and builds no minor meshes.
+ *
+ * The policy is the same object `core/device.js` hands out, so this module does
+ * not import it and stays free of any dependency on a tier. Call it BEFORE
+ * `loadBuildings()`; afterwards it has no effect and says so.
+ *
+ * @param {{minorCutoffM?:number, majorCutoffM?:number, maxCount?:number}|null} policy
+ * @returns {boolean} whether it was applied in time to matter
+ */
+export function setBuildingBudget(policy) {
+  if (loadPromise) {
+    console.warn('[buildings] setBuildingBudget() after loadBuildings(); ignored.');
+    return false;
+  }
+  budget = policy || null;
+  return true;
+}
+
+/** The budget in force, or null for "decode everything". */
+export function buildingBudget() {
+  return budget;
+}
+
+/**
+ * Which classes a budget keeps. A class is dropped only when its cutoff is
+ * exactly 0 — "never drawn". Anything else, including `undefined`, keeps it,
+ * because §1.6 says a missing number degrades toward doing the normal thing.
+ */
+function keptClasses(policy) {
+  return {
+    tall: policy?.tallCutoffM !== 0,
+    major: policy?.majorCutoffM !== 0,
+    minor: policy?.minorCutoffM !== 0,
+  };
+}
 
 /**
  * Guard against the one failure that would silently deform every footprint in
@@ -126,13 +218,19 @@ export async function loadBuildings() {
     if (!assertScale(data.scaleLat)) return null;
 
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    set = decode(data);
+    set = decode(data, budget);
     const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const f = set.meta.filtered;
     console.info(
       `[buildings] ${set.count.toLocaleString()} real footprints, ` +
         `${set.totalVertices.toLocaleString()} vertices, decoded in ${(t1 - t0).toFixed(0)} ms — ` +
         `heights: ${set.meta.provenance.published} published, ` +
-        `${set.meta.provenance.dsm} DSM storeys, ${set.meta.provenance.derived} derived`,
+        `${set.meta.provenance.dsm} DSM storeys, ${set.meta.provenance.derived} derived` +
+        (f
+          ? ` | budget kept ${f.keptClasses.join('+')}: ${f.dropped.toLocaleString()} of ` +
+            `${f.sourceCount.toLocaleString()} footprints and ` +
+            `${f.verticesDropped.toLocaleString()} vertices never decoded`
+          : ''),
     );
     return set;
   })();
@@ -150,10 +248,13 @@ export async function loadBuildings() {
  * against the real baked file.
  *
  * @param {object} data Parsed public/data/buildings.json
+ * @param {{minorCutoffM?:number}|null} [policy] The size budget to apply, as
+ *   `setBuildingBudget` would. Defaults to NONE rather than to the module's,
+ *   so a harness always gets the whole file unless it asks otherwise.
  * @returns {BuildingSet}
  */
-export function decodeBuildings(data) {
-  set = decode(data);
+export function decodeBuildings(data, policy = null) {
+  set = decode(data, policy);
   // Satisfy loadBuildings() too, so the shipping consumer path — which goes
   // through fetch, and cannot in Node — resolves to this same set rather than
   // falling back to the procedural city and quietly testing the wrong code.
@@ -166,7 +267,7 @@ export function decodeBuildings(data) {
  * `rings.length`, so there is exactly one allocation per output array and no
  * per-building garbage.
  */
-function decode(data) {
+function decode(data, policy = null) {
   const count = data.count | 0;
   const quantM = data.quantM || 0.25;
   const quantDeg = data.quantDeg || 1e-6;
@@ -190,18 +291,28 @@ function decode(data) {
   const areaM2 = new Float32Array(count);
   const src = new Uint8Array(count);
 
+  // The size budget, if any. `keep` is consulted once per building; when every
+  // class is kept the whole branch collapses to a `true` and the loop below is
+  // byte-for-byte the pass it always was.
+  const keep = keptClasses(policy);
+  const filtering = !(keep.tall && keep.major && keep.minor);
+  const provKept = [0, 0, 0];
+
   let aLat = 0;
   let aLon = 0;
   let rp = 0; // read cursor into rings
   let vp = 0; // write cursor into ringE / ringN
+  let w = 0; // write cursor into the per-building arrays
 
   for (let i = 0; i < count; i++) {
+    // The anchor delta chain is over the SOURCE order and must advance for
+    // every building whether or not it is kept.
     aLat += anchors[i * 2];
     aLon += anchors[i * 2 + 1];
     const lat = aLat * quantDeg;
     const lon = aLon * quantDeg;
-    anchorLat[i] = lat;
-    anchorLon[i] = lon;
+    anchorLat[w] = lat;
+    anchorLon[w] = lon;
 
     // The baker delta-chained from the anchor's own quantised metres, so this
     // has to reconstruct that number exactly, not the pre-rounding one.
@@ -209,7 +320,7 @@ function decode(data) {
     let kn = Math.round((lat * mLat) / quantM);
 
     const n = rings[rp++];
-    ringStart[i] = vp;
+    ringStart[w] = vp;
     const v0 = vp;
     for (let k = 0; k < n; k++) {
       ke += rings[rp++];
@@ -231,24 +342,47 @@ function decode(data) {
       const j = k + 1 < vp ? k + 1 : v0;
       a += ringE[k] * ringN[j] - ringE[j] * ringN[k];
     }
-    areaM2[i] = Math.abs(a) * 0.5;
-    heightM[i] = heights[i] * 0.1;
-    src[i] = SRC_CHAR[srcStr[i]] ?? SRC_DERIVED;
-  }
-  ringStart[count] = vp;
+    const area = Math.abs(a) * 0.5;
+    const h = heights[i] * 0.1;
 
-  const prov = data.provenance || { published: 0, dsm: 0, derived: count };
+    // REJECTION REWINDS BOTH CURSORS. The ring had to be decoded to get its
+    // area, but nothing that was written survives: `vp` goes back to `v0` and
+    // the next building overwrites it in place, so a filtered decode allocates
+    // exactly what an unfiltered one does and keeps only what it kept.
+    if (filtering && !keep[classifyBuilding(h, area)]) {
+      vp = v0;
+      continue;
+    }
+
+    areaM2[w] = area;
+    heightM[w] = h;
+    const s = SRC_CHAR[srcStr[i]] ?? SRC_DERIVED;
+    src[w] = s;
+    provKept[s]++;
+    w++;
+  }
+  ringStart[w] = vp;
+
+  const prov = filtering
+    ? { published: provKept[SRC_PUBLISHED], dsm: provKept[SRC_DSM], derived: provKept[SRC_DERIVED] }
+    : data.provenance || { published: 0, dsm: 0, derived: count };
+
+  // `.slice()` and not `.subarray()`. A subarray keeps the FULL backing
+  // ArrayBuffer alive, which on the phone tier is the entire point of the
+  // exercise sitting in the heap behind a shorter view of it.
+  const cut = (arr, n) => (filtering && n < arr.length ? arr.slice(0, n) : arr);
+
   return {
-    count,
-    totalVertices,
-    anchorLat,
-    anchorLon,
-    ringStart,
-    ringE,
-    ringN,
-    heightM,
-    areaM2,
-    src,
+    count: w,
+    totalVertices: vp,
+    anchorLat: cut(anchorLat, w),
+    anchorLon: cut(anchorLon, w),
+    ringStart: cut(ringStart, w + 1),
+    ringE: cut(ringE, vp),
+    ringN: cut(ringN, vp),
+    heightM: cut(heightM, w),
+    areaM2: cut(areaM2, w),
+    src: cut(src, w),
     bbox: data.bbox,
     meta: {
       generated: data.generated,
@@ -259,6 +393,20 @@ function decode(data) {
       publishedNames: data.publishedNames || [],
       provenance: prov,
       chunkM: data.chunkM || 3000,
+      /**
+       * Null when the whole file was decoded. Present, and honest about what is
+       * missing, when a budget dropped classes — because `count` alone would
+       * otherwise read as "this is how many buildings Seattle has".
+       */
+      filtered: filtering
+        ? {
+            keptClasses: ['tall', 'major', 'minor'].filter((c) => keep[c]),
+            sourceCount: count,
+            sourceVertices: totalVertices,
+            dropped: count - w,
+            verticesDropped: totalVertices - vp,
+          }
+        : null,
     },
   };
 }

@@ -370,11 +370,15 @@ const REVALIDATE_ERR_EPS_M = 0.25;
 const REBUILD_PER_PASS = 3;
 
 /**
- * Built geometries kept alive. 134 KB each (positions and morph as Float32,
- * normals as normalised Int16 — see buildNodeGeometry), so the real ceiling of
- * MAX_CACHED_NODES + EVICT_SLACK is ~199 MB of vertex buffers. Round 1 held
- * 1,100 + 96 fatter nodes at ~188 MB, so the error metric buys 28% more nodes
- * for 6% more memory.
+ * Built geometries kept alive AT lodQuality 1. 134 KB each (positions and morph
+ * as Float32, normals as normalised Int16 — see buildNodeGeometry), so the real
+ * desktop ceiling of MAX_CACHED_NODES + EVICT_SLACK is ~199 MB of vertex
+ * buffers. Round 1 held 1,100 + 96 fatter nodes at ~188 MB, so the error metric
+ * buys 28% more nodes for 6% more memory.
+ *
+ * THIS IS THE DESKTOP ANCHOR, NOT THE RUNTIME CAP. `nodeCacheCap(q)` below
+ * scales it with the tier, because 199 MB of cache on a device with a 160 MB
+ * heap target is a reload mid-flight.
  *
  * THIS MUST EXCEED THE WORKING SET or the LOD never converges, and the failure
  * is not a slow frame, it is a LIMIT CYCLE: evictStale() destroys chunks the
@@ -397,6 +401,84 @@ const MAX_CACHED_NODES = 1400;
  * single frame for the sake of one or two nodes.
  */
 const EVICT_SLACK = 120;
+
+/** Bytes of vertex buffer per built node: 4481 verts x (12 pos + 6 normal +
+ *  12 morph). Used for the cache's own heap accounting — see nodeCacheCap. */
+const NODE_BYTES = NODE_VERTS * (3 * 4 + 3 * 2 + 3 * 4);
+
+/**
+ * THE NODE CACHE IS THE LARGEST SINGLE HEAP TERM IN THE SIM, AND UNTIL NOW IT
+ * DID NOT KNOW WHAT TIER IT WAS ON.
+ *
+ * `lodQuality` shrinks the WORKING set — how many nodes the selector asks for —
+ * but `MAX_CACHED_NODES` is a ceiling on what is KEPT, and it was a flat 1,400.
+ * A phone at lodQuality 0.40 converges at 289 nodes and peaks at 220 drawn, yet
+ * nothing stopped it accumulating the full 1,520 (cap + slack) x 131.3 KiB =
+ * 195 MiB of vertex buffers as it flew — against a 160 MB heap TARGET for the
+ * whole tab. Measured with eviction disabled, the same tour reached 1,073 built
+ * (137.6 MiB) and was still climbing. The cache would never have evicted a byte
+ * before iOS killed the page.
+ *
+ * THE EXPONENT IS MEASURED, NOT ASSUMED. The obvious guess is q^2 — halve the
+ * error tolerance, halve the split distance in both axes. It is wrong, because
+ * `demSpacingAt` and MIN_NODE_SIZE stop the tree before the tolerance does over
+ * most of the region. Peak `stats().drawn` over one KBFI -> Rainier transit,
+ * five parked cameras at four altitudes each, and a 360-degree turn on the
+ * Rainier flank, with eviction disabled:
+ *
+ *      q      peak drawn    vs q=1     q^2      q^1.35
+ *     1.00        767         1.000    1.000     1.000
+ *     0.70        471         0.614    0.490     0.618
+ *     0.40        220         0.287    0.160     0.290
+ *
+ * q^1.35 is the fit to within 1%; q^2 would have handed the phone a cache 27%
+ * smaller than its own peak drawn set, which is the limit cycle above, not a
+ * saving.
+ *
+ * THE TEST FOR "BIG ENOUGH" IS NOT THAT IT DOES NOT THRASH. It is that the cap
+ * changes what the LOD RETAINS and never what it SELECTS. Under-cap the phone
+ * and it does not oscillate — it settles, quietly, on a coarser surface than
+ * the tier asked for, because visit() will not subdivide a node whose children
+ * have been evicted. Re-run of the same tour with the cap live, comparing peak
+ * drawn against the uncapped 220:
+ *
+ *     cap 407 -> 178 drawn    cap 500 -> 220    cap 700 -> 220
+ *     cap 450 -> 178 drawn    cap 550 -> 220    cap 900 -> 220
+ *
+ * so the knee is between 450 and 500, and NODE_CACHE_FLOOR is 560: the knee
+ * plus 12%. The desktop's own 1,400 passes the same test (767 drawn capped and
+ * uncapped), which is what makes it a fair anchor. Above the floor the curve
+ * takes over, and the tablet passes too (471 drawn either way at cap 865):
+ *
+ *     phone   q 0.40 ->   560 nodes + 48 slack =  77.9 MiB   (was 194.9 MiB)
+ *     tablet  q 0.70 ->   865 nodes + 74 slack = 120.4 MiB
+ *     desktop q 1.00 -> 1,400 nodes +120 slack = 194.9 MiB   (unchanged)
+ *
+ * @param {number} q lodQuality, already clamped
+ * @returns {number}
+ */
+function nodeCacheCap(q) {
+  return Math.max(
+    NODE_CACHE_FLOOR,
+    Math.min(MAX_CACHED_NODES, Math.ceil(MAX_CACHED_NODES * Math.pow(q, NODE_CACHE_EXP))),
+  );
+}
+
+/** Measured above. Do not round it to 1.5 because that is a nicer number. */
+const NODE_CACHE_EXP = 1.35;
+
+/**
+ * The measured floor: the phone tier's knee (500) plus 12%. See above. The
+ * curve alone would give 407 at q = 0.40, which is under the knee and quietly
+ * costs 19% of the drawn node set. Anyone shipping a tier below 0.40 owes this
+ * file the same sweep, not a guess.
+ */
+const NODE_CACHE_FLOOR = 560;
+
+/** Slack scales with the cap it protects, and never drops below 32. */
+function evictSlackFor(cap) {
+  return Math.max(32, Math.round(cap * (EVICT_SLACK / MAX_CACHED_NODES)));
+}
 
 /** Per-frame build budget for PREFETCHING children, milliseconds. */
 const BUILD_BUDGET_MS = 4;
@@ -731,6 +813,9 @@ export async function createTerrain(scene, opts = {}) {
   const lodTau = LOD_TAU / q;
   const lodKMin = LOD_K_MIN * q;
   const lodKMax = LOD_K_MAX * q;
+  // The cache ceiling is a TIER decision, not a constant — see nodeCacheCap.
+  const cacheCap = nodeCacheCap(q);
+  const evictSlack = evictSlackFor(cacheCap);
   const drawRadius = cfg.viewRadiusM * 1.6;
   /** Morph-end distance for the root, which is never replaced by anything. */
   const NO_MORPH = drawRadius * 4;
@@ -966,11 +1051,11 @@ export async function createTerrain(scene, opts = {}) {
       `dem ${(tDem - t0) | 0}ms, field ${(tField - tDem) | 0}ms, ` +
       `lakes ${(tLakes - tField) | 0}ms, mesh ${(tNodes - tLakes) | 0}ms`,
   );
-  if (built.length > MAX_CACHED_NODES) {
+  if (built.length > cacheCap) {
     console.warn(
-      `[terrain] working set ${built.length} exceeds MAX_CACHED_NODES ` +
-        `${MAX_CACHED_NODES}; the LOD will thrash. Raise the cache, raise ` +
-        `LOD_TAU, or lower LOD_K_MAX.`,
+      `[terrain] working set ${built.length} exceeds the node cache cap ` +
+        `${cacheCap} (lodQuality ${q}); the LOD will thrash. Raise ` +
+        `NODE_CACHE_FLOOR, raise LOD_TAU, or lower LOD_K_MAX.`,
     );
   }
 
@@ -1451,11 +1536,11 @@ export async function createTerrain(scene, opts = {}) {
   }
 
   function evictStale() {
-    if (built.length <= MAX_CACHED_NODES + EVICT_SLACK) return;
+    if (built.length <= cacheCap + evictSlack) return;
     // Oldest first. Anything drawn this frame is untouchable.
     built.sort(byLastUsed);
     let i = 0;
-    while (built.length > MAX_CACHED_NODES && i < built.length) {
+    while (built.length > cacheCap && i < built.length) {
       const n = built[i];
       if (n.lastUsed === frameId) break; // sorted, so everything after is live
       releaseNode(n, false);
@@ -1496,6 +1581,13 @@ export async function createTerrain(scene, opts = {}) {
       finestCellM: Number.isFinite(finest) ? finest : 0,
       byLevel,
       tau: lodTau,
+      /** The tier's own ceiling on the cache, and what it costs if it fills.
+       *  `built` is the live count; this is what it can never exceed. */
+      lodQuality: q,
+      cacheCap,
+      evictSlack,
+      cacheBytes: built.length * NODE_BYTES,
+      cacheCapBytes: (cacheCap + evictSlack) * NODE_BYTES,
     };
   }
 

@@ -72,9 +72,10 @@
  *    the baked region, which is genuinely open ocean and British Columbia.
  *
  * 3. RESIDENT BYTES ARE CAPPED AND THE CAP IS ASSERTED. Every layer has a tile
- *    budget; the sum of all budgets is checked against RESIDENT_CAP_BYTES at
- *    module load (assertCapBudget) and the live total is re-checked after every
- *    paging pass. Exceeding it is a console.error, not a silent leak.
+ *    budget; the sum of all budgets is checked against the live cap whenever a
+ *    layer is registered (assertCapBudget) and the live total is re-checked
+ *    after every paging pass. Exceeding it is a console.error, not a silent
+ *    leak. The cap and the per-layer budgets are TIER-SETTABLE — see § TIERS.
  *
  * 4. WHAT THE AIRCRAFT IS ABOUT TO FLY OVER IS ALREADY THERE. The desired set
  *    is scored by distance to the SEGMENT from the aircraft to where it will be
@@ -90,9 +91,25 @@
  *                                                 ------   ---------
  *                                                 654      81.75 MiB
  *
- * against a RESIDENT_CAP_BYTES of 96 MiB. The budgets deliberately exceed the
+ * against a default cap of 96 MiB. The budgets deliberately exceed the
  * disc-plus-stadium area so that eviction never has to bite inside the radius;
- * see § BLENDING for why that matters.
+ * see § BLENDING for why that matters. MEASURED against the real baked tiles,
+ * parked at KBFI: 238 + 258 + 93 = 589 tiles, 73.6 MiB.
+ *
+ * ON A PHONE the same arithmetic runs at a 48 MiB cap (§ TIERS):
+ *
+ *   z=11   pinned   238          -                238      29.75 MiB
+ *   z=13   18 km     93          104               96      12.00 MiB
+ *   z=14    6 km     41           46               48       6.00 MiB
+ *                                                 ------   ---------
+ *                                                 382      47.75 MiB
+ *
+ * The z=13 stadium (104 tiles at a 3.4 km lead) is larger than its 96-tile
+ * budget, so the budget clips it — and that is fine, because the clip happens
+ * at the FAR end of the segment: tiles are scored by distance to the segment
+ * and the cheapest 96 form a stadium of about 17.2 km effective radius, still
+ * outside the 15.3 km frontier fade (FADE_OUTER x 18 km). MEASURED at KBFI:
+ * 238 + 93 + 41 = 372 tiles, 46.50 MiB.
  *
  * ===========================================================================
  * § BLENDING — why layers fade instead of switching
@@ -213,12 +230,32 @@ const ELEV_SCALE_INV = 1 / ELEV_SCALE;
 const TILE_BYTES = TILE_SIZE * TILE_SIZE * 2;
 
 /**
- * The hard ceiling on decoded elevation data, pinned plus paged. 96 MiB against
- * a planned 81.75 MiB of budget — see the table in § PAGING. It is asserted
- * twice: once at configuration time against the sum of the layer budgets, and
- * again after every paging pass against what is actually held.
+ * The DEFAULT hard ceiling on decoded elevation data, pinned plus paged.
+ * 96 MiB against a planned 81.75 MiB of budget — see the table in § PAGING.
+ *
+ * This is the DESKTOP number and it is the value the live cap starts at.
+ * `configurePaging()` lowers both the cap and the per-layer policy on a smaller
+ * device; read the live one with `getPagingConfig().capBytes`, or off
+ * `getRegionStats().residentCapBytes`. It is asserted twice: once at
+ * configuration time against the sum of the layer budgets, and again after
+ * every paging pass against what is actually held.
  */
 export const RESIDENT_CAP_BYTES = 96 * 1024 * 1024;
+
+/**
+ * THE FLOOR NO TIER MAY GO UNDER.
+ *
+ * The z=11 base is pinned and §PAGING property 2 forbids evicting it: a miss
+ * must fall to a COARSER layer, never to zero, because a 0 m return over the
+ * Cascades is a 2 km cliff the flight model correctly destroys the aeroplane
+ * on. 238 tiles x 128 KiB is 29.75 MiB that CANNOT be paged away, so a cap
+ * below it would be a cap the module can only satisfy by breaking the ground.
+ *
+ * 32 MiB leaves the pinned base plus two tiles of slack. `configurePaging()`
+ * refuses anything smaller and keeps the previous cap — §1.6: degrade, never
+ * throw, and never silently accept a number that would put a hole in the world.
+ */
+export const MIN_RESIDENT_CAP_BYTES = 32 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Constants — void repair
@@ -370,18 +407,33 @@ const EDGE_BAND_M = 3000;
 const WARMUP_RADIUS_FRACTION = 0.4;
 
 /**
- * Per-layer paging policy, keyed by zoom. `radiusM` is the coverage we try to
- * hold; `budgetTiles` is the hard resident count. See the budget table in
- * § PAGING for how the two relate — budget always exceeds the area the radius
- * implies, so eviction bites outside the fade region rather than inside it.
+ * The DEFAULT per-layer paging policy, keyed by zoom. `radiusM` is the coverage
+ * we try to hold; `budgetTiles` is the hard resident count. See the budget
+ * table in § PAGING for how the two relate — budget always exceeds the area the
+ * radius implies, so eviction bites outside the fade region rather than inside
+ * it.
+ *
+ * These are the DESKTOP numbers. `configurePaging()` replaces the live table;
+ * this object is never mutated, so it stays a readable statement of the
+ * default.
  */
-const PAGING_POLICY = {
-  13: { radiusM: 30000, budgetTiles: 288 },
-  14: { radiusM: 9000, budgetTiles: 128 },
-};
+export const DEFAULT_PAGING_POLICY = Object.freeze({
+  13: Object.freeze({ radiusM: 30000, budgetTiles: 288 }),
+  14: Object.freeze({ radiusM: 9000, budgetTiles: 128 }),
+});
 
 /** Fallback for a paged level the policy table does not name. */
 const DEFAULT_POLICY = { radiusM: 12000, budgetTiles: 96 };
+
+// ---------------------------------------------------------------------------
+// The live memory configuration — see § TIERS
+// ---------------------------------------------------------------------------
+
+/** The cap actually enforced. Starts at the desktop value. */
+let residentCapBytes = RESIDENT_CAP_BYTES;
+
+/** The policy actually used by ensureLayer(). Starts at the desktop table. */
+let pagingPolicy = DEFAULT_PAGING_POLICY;
 
 // ---------------------------------------------------------------------------
 // State
@@ -488,6 +540,119 @@ export function setTileProvider(opts = {}) {
     manifestData = opts.manifest;
     manifestFetched = true;
   }
+}
+
+// ---------------------------------------------------------------------------
+// § TIERS — one knob, and the two things it is not allowed to break
+// ---------------------------------------------------------------------------
+//
+// A phone tab is killed somewhere around 200 MB TOTAL, counting the GPU. The
+// desktop pager holds 73.6 MiB of decoded elevation, measured, which is a third
+// of that ceiling on its own. So the cap and the per-layer policy became
+// tier-settable — see core/device.js §"DEM RESIDENT CAP" for the arithmetic
+// behind the phone numbers, and MODULES.md §2.18 for the table.
+//
+// TWO PROPERTIES SURVIVE EVERY TIER, and check-geo-mobile.mjs asserts both
+// against the real baked tiles at the phone budget:
+//
+//   The pinned z=11 base is never touched. It is 29.75 MiB and it covers the
+//   whole region, so a smaller cap makes the FINE layers narrower, never the
+//   ground absent. `MIN_RESIDENT_CAP_BYTES` is what stops a caller asking for a
+//   cap that could only be met by unpinning it.
+//
+//   getElevation() stays synchronous, allocation-free and total. Nothing below
+//   touches the sampler; a smaller working set just means the fold falls
+//   through to a coarser layer more often, which it was always able to do.
+//
+// Calling this AFTER the layers exist is supported (it repages and re-enforces
+// immediately) but the intended call site is boot, before createTerrain().
+
+/**
+ * Set the resident ceiling and the per-layer paging policy for this device.
+ *
+ * Call it BEFORE `loadRegion()` / `loadDetailLayers()`. Called later it still
+ * works — every paged layer is re-derived, the desired set is recomputed and
+ * the cap is re-enforced on the spot — which is what lets one Node process
+ * assert the phone budget and then the desktop budget.
+ *
+ * Both fields are optional and validated. An implausible cap or a malformed
+ * policy entry is IGNORED with a console warning and the previous value stands:
+ * a paging module that throws on a bad budget takes the whole boot with it
+ * (§1.6), and one that accepts a 4 MiB cap puts a hole in the Cascades.
+ *
+ * @param {{capBytes?: number, policy?: Record<number, {radiusM:number, budgetTiles:number}>}} [opts]
+ * @returns {{capBytes: number, policy: object}} the configuration now in force
+ */
+export function configurePaging(opts = {}) {
+  if (opts.capBytes !== undefined) {
+    const c = Number(opts.capBytes);
+    if (!Number.isFinite(c) || c < MIN_RESIDENT_CAP_BYTES) {
+      console.warn(
+        `[elevation] ignoring a resident cap of ${opts.capBytes}: the pinned ` +
+          `z=${DEM_ZOOM} base alone is ${(238 * TILE_BYTES) / 1048576} MiB and it ` +
+          `cannot be evicted (§PAGING property 2). Minimum is ` +
+          `${MIN_RESIDENT_CAP_BYTES / 1048576} MiB; keeping ` +
+          `${(residentCapBytes / 1048576).toFixed(0)} MiB.`,
+      );
+    } else {
+      residentCapBytes = c;
+    }
+  }
+
+  if (opts.policy) {
+    /** @type {Record<number, {radiusM:number, budgetTiles:number}>} */
+    const next = {};
+    let bad = 0;
+    for (const [zoom, p] of Object.entries(opts.policy)) {
+      const radiusM = Number(p?.radiusM);
+      const budgetTiles = Math.floor(Number(p?.budgetTiles));
+      if (!(radiusM > 0) || !(budgetTiles > 0)) {
+        bad++;
+        continue;
+      }
+      next[Number(zoom)] = { radiusM, budgetTiles };
+    }
+    if (bad) {
+      console.warn(
+        `[elevation] ${bad} malformed paging-policy entr${bad === 1 ? 'y' : 'ies'} ` +
+          'ignored; those zooms fall back to the default policy.',
+      );
+    }
+    if (Object.keys(next).length) pagingPolicy = Object.freeze(next);
+  }
+
+  // Re-derive any layer that already exists, then repage and re-enforce so the
+  // new ceiling is true immediately rather than at the next viewer move.
+  if (layers.length) {
+    for (const layer of layers) {
+      if (layer.pinned) continue;
+      const policy = pagingPolicy[layer.zoom] ?? DEFAULT_POLICY;
+      const mpp = layer.tileM / layer.tileSize;
+      layer.radiusM = policy.radiusM;
+      layer.budgetTiles = policy.budgetTiles;
+      layer.fadeInnerPx = (policy.radiusM * FADE_INNER) / mpp;
+      layer.fadeOuterPx = (policy.radiusM * FADE_OUTER) / mpp;
+      // Force the next repage: the desired set is a function of the radius.
+      layer.lastRepageTx = NaN;
+      layer.lastRepageTy = NaN;
+      layer.lastRepageMs = -1e9;
+    }
+    assertCapBudget();
+    if (viewerSet) repageAll(true);
+    else enforceCap();
+  }
+
+  return getPagingConfig();
+}
+
+/**
+ * The configuration in force, for the acceptance checks and the console.
+ * `policy` is a copy — mutating it changes nothing.
+ */
+export function getPagingConfig() {
+  const policy = {};
+  for (const [z, p] of Object.entries(pagingPolicy)) policy[z] = { ...p };
+  return { capBytes: residentCapBytes, minCapBytes: MIN_RESIDENT_CAP_BYTES, policy };
 }
 
 // ---------------------------------------------------------------------------
@@ -766,12 +931,12 @@ function assertCapBudget() {
   let planned = 0;
   // A pinned layer's budget IS its declared tile count — it holds everything.
   for (const l of layers) planned += l.budgetTiles * TILE_BYTES;
-  if (planned > RESIDENT_CAP_BYTES) {
+  if (planned > residentCapBytes) {
     capViolations++;
     console.error(
       `[elevation] planned resident budget ${(planned / 1048576).toFixed(1)} MiB ` +
-        `exceeds the ${(RESIDENT_CAP_BYTES / 1048576).toFixed(0)} MiB cap. ` +
-        'Lower a layer budget in PAGING_POLICY or drop a level.',
+        `exceeds the ${(residentCapBytes / 1048576).toFixed(0)} MiB cap. ` +
+        'Lower a layer budget in the paging policy or drop a level.',
     );
   }
   return planned;
@@ -793,7 +958,7 @@ function ensureLayer(zoom, bbox, level) {
   const box = level?.bbox ?? bbox;
   const tileSize = level?.tileSize ?? TILE_SIZE;
   const pinned = zoom <= DEM_ZOOM;
-  const policy = PAGING_POLICY[zoom] ?? DEFAULT_POLICY;
+  const policy = pagingPolicy[zoom] ?? DEFAULT_POLICY;
   const range = tileRange(box, zoom);
 
   const present = level?.tiles
@@ -938,9 +1103,12 @@ const _ll2 = { lat: 0, lon: 0 };
  * @param {DemLayer} layer
  * @param {boolean} force Ignore the movement/time gates.
  * @param {number} [radiusScale] Shrink the radius (boot warm-up uses this).
+ * @returns {boolean} true when the desired set was actually rebuilt. `false`
+ *          means the movement/time gate skipped this layer, and repageAll()
+ *          uses that to know whose queued work it must NOT throw away.
  */
 function repageLayer(layer, force, radiusScale = 1) {
-  if (layer.pinned) return;
+  if (layer.pinned) return false;
 
   const ts = layer.tileSize;
   localToLl(viewX, viewZ, _ll2);
@@ -962,7 +1130,7 @@ function repageLayer(layer, force, radiusScale = 1) {
       !(moved > REPAGE_TILE_FRACTION) &&
       t - layer.lastRepageMs < REPAGE_MIN_MS
     ) {
-      return;
+      return false;
     }
   }
   layer.lastRepageTx = vtx;
@@ -1064,16 +1232,36 @@ function repageLayer(layer, force, radiusScale = 1) {
     if (inflight.has(layer.zoom * 4294967296 + key) || tile.arrived) continue;
     loadQueue.push({ layer, key, cost: candCost[idx] });
   }
+  return true;
 }
 
 /** Repage every paged layer and re-check the live cap. */
 function repageAll(force, radiusScale = 1) {
-  // Rebuild the paged half of the queue but never drop pinned work: the base
-  // layer's 238 tiles are queued once at boot and a setViewer() landing between
-  // two awaits inside drainPaging() must not be able to amputate them.
-  loadQueue = loadQueue.filter((j) => j.layer.pinned);
+  // Rebuild the paged half of the queue but never drop work whose owner is not
+  // going to re-queue it on this pass.
+  //
+  // PINNED work is kept because the base layer's 238 tiles are queued once at
+  // boot and a setViewer() landing between two awaits inside drainPaging() must
+  // not be able to amputate them.
+  //
+  // A THROTTLED layer's work is kept for the same reason one level up. A layer
+  // whose movement/time gate declines to rebuild has not re-queued anything, so
+  // clearing the queue on its behalf silently cancels every load it had
+  // outstanding. It self-heals — the next pass past REPAGE_MIN_MS rebuilds from
+  // the desired set — but "self-heals in 250 ms, if the viewer moves" is not the
+  // same as "does not lose the work", and the difference shows up exactly where
+  // it is least welcome: the first repage after a teleport or after
+  // configurePaging() widens a layer, both of which are followed immediately by
+  // a setViewer() from the very next frame.
+  const stale = loadQueue;
+  loadQueue = stale.filter((j) => j.layer.pinned);
+  const rebuilt = new Set();
   for (let i = 0; i < layers.length; i++) {
-    repageLayer(layers[i], force, radiusScale);
+    if (repageLayer(layers[i], force, radiusScale)) rebuilt.add(layers[i]);
+  }
+  for (let i = 0; i < stale.length; i++) {
+    const j = stale[i];
+    if (!j.layer.pinned && !rebuilt.has(j.layer)) loadQueue.push(j);
   }
   loadQueue.sort((a, b) => a.cost - b.cost);
   enforceCap();
@@ -1086,26 +1274,26 @@ function repageAll(force, radiusScale = 1) {
  */
 function enforceCap() {
   if (residentBytes > peakResidentBytes) peakResidentBytes = residentBytes;
-  if (residentBytes <= RESIDENT_CAP_BYTES) return;
+  if (residentBytes <= residentCapBytes) return;
 
   capViolations++;
   // Shed from the finest paged layer outward — the coarser a layer is, the more
   // ground each of its tiles covers, so it is the more valuable byte.
-  for (let i = 0; i < layers.length && residentBytes > RESIDENT_CAP_BYTES; i++) {
+  for (let i = 0; i < layers.length && residentBytes > residentCapBytes; i++) {
     const layer = layers[i];
     if (layer.pinned) continue;
     const byCost = [...layer.tiles.entries()]
       .filter(([, t]) => t.q)
       .sort((a, b) => b[1].cost - a[1].cost);
     for (const [key, tile] of byCost) {
-      if (residentBytes <= RESIDENT_CAP_BYTES) break;
+      if (residentBytes <= residentCapBytes) break;
       layer.tiles.delete(key);
       residentBytes -= tile.q.byteLength;
       evictions++;
     }
   }
   console.error(
-    `[elevation] resident bytes exceeded the ${(RESIDENT_CAP_BYTES / 1048576).toFixed(0)} MiB ` +
+    `[elevation] resident bytes exceeded the ${(residentCapBytes / 1048576).toFixed(0)} MiB ` +
       'cap and tiles were shed. This is a paging bug, not a tuning problem.',
   );
 }
@@ -1399,7 +1587,7 @@ export function getRegionStats() {
     maxElevationM,
     residentBytes,
     peakResidentBytes,
-    residentCapBytes: RESIDENT_CAP_BYTES,
+    residentCapBytes,
     residentTiles: layers.reduce((n, l) => n + countDecoded(l), 0),
     pageIns,
     evictions,

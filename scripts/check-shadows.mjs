@@ -538,6 +538,72 @@ console.log('\nownership: §1.7 says sky.js owns every light');
   );
 }
 
+// ---------------------------------------------------------------------------
+// 'off' IS A TIER, NOT A FLAG. The phone budget (core/device.js) buys its whole
+// draw-call ceiling by turning shadows off, and "off" has to mean off: no
+// per-frame traverse of a scene with ~500 objects in it, and no CSM_CASCADES
+// handed to materials that will never have a cascade to sample. Measured before
+// this rule existed: 62 materials carrying the define with zero cascades built,
+// and 20 of the 31 live programs with `CSM_CASCADES,4` in the cache key — every
+// one of them a first-use compile stall on a mobile driver.
+console.log("\n'off': the phone tier's shadow cost is zero, not nearly zero");
+{
+  const scene = makeScene();
+  // Enough of a scene to notice: a lit mesh under each of the three tag rules.
+  const lit = () => new THREE.MeshStandardMaterial();
+  const plane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), lit());
+  plane.name = 'runway-asphalt';
+  const tower = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), lit());
+  tower.name = 'city-tall';
+  const far = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), lit());
+  far.name = 'city-minor';
+  far.userData.csmNoCast = true;
+  scene.add(plane, tower, far);
+
+  const cam = makeCam();
+  cam.updateMatrixWorld();
+
+  const off = createShadows(scene, { shadowMap: {} }, { quality: 'off' });
+  for (let i = 0; i < 5; i++) off.update(cam);
+  const so = off.getStats();
+  ok('no cascade lights exist', off.lights.length === 0);
+  ok('the tagging traverse does not run', so.tagging === false && so.tagMs === 0);
+  ok(
+    'and no material anywhere is given CSM_CASCADES',
+    so.materialsSetUp === 0 &&
+      [plane, tower, far].every((m) => !m.material.defines?.CSM_CASCADES),
+  );
+  off.dispose();
+
+  // The same scene at 'high' — the rules must still be the rules.
+  const on = createShadows(scene, { shadowMap: {} }, { quality: 'high' });
+  for (let i = 0; i < 3; i++) on.update(cam);
+  const sh = on.getStats();
+  ok('at a real tier the traverse runs again', sh.tagging === true);
+  ok(
+    'and every lit material gets the define back',
+    sh.materialsSetUp >= 3 &&
+      [plane, tower, far].every((m) => m.material.defines.CSM_CASCADES === _MAX_CASCADES),
+  );
+
+  // The opt-out landmarkModels.js asked for by name. Without it, a module that
+  // knows one of its meshes is too far away to cast a visible shadow has no way
+  // to say so: this traversal sets castShadow = true on it again every frame.
+  ok('userData.csmNoCast is honoured', far.castShadow === false);
+  ok('and it is an opt-out from CASTING only', far.receiveShadow === true);
+  ok('everything else still casts', plane.castShadow === true && tower.castShadow === true);
+
+  // Every cascade must be asked for its first map, whatever its phase says —
+  // otherwise three binds its default 2x2 RGBA texture to a sampler2DShadow for
+  // a whole frame and the driver rejects every draw call that reads it.
+  ok(
+    'every cascade is primed on the first frame, whatever its phase',
+    sh.mapsUnprimed === 0,
+    `${sh.mapsUnprimed} of ${on.lights.length} unprimed`,
+  );
+  on.dispose();
+}
+
 console.log(
   failures ? `\n${failures} shadow check(s) FAILED\n` : '\nall shadow checks passed\n',
 );

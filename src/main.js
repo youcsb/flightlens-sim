@@ -44,8 +44,10 @@ import * as THREE from 'three';
 
 import { setOrigin, DEFAULT_ORIGIN, distanceBetween, bearingBetween } from './geo/coords.js';
 import { getRegionStats, warmAt } from './geo/elevation.js';
+import { applyGeoBudgets, describeGeoBudgets } from './geo/geoBudgets.js';
 import { loadAirports, buildRunwayMeshes, getSpawn } from './geo/airports.js';
 import { placeLandmarks } from './geo/landmarks.js';
+import { setBuildingBudget } from './geo/buildings.js';
 import { createTerrain } from './world/terrain.js';
 import { createSky } from './world/sky.js';
 import { createAircraft } from './aircraft/model.js';
@@ -176,6 +178,12 @@ const device = resolveDevice({
 let budgets = device.budgets;
 console.info(describeDevice(device));
 
+// The footprint loader is started by landmarkModels.js, not from here, so the
+// size budget has to be handed to the module rather than passed at a call site.
+// It must land before that load begins — hence here, next to the tier that
+// produced it. Boot-time only, like the other three (§2.18).
+setBuildingBudget(budgets.buildings);
+
 // ---------------------------------------------------------------------------
 // Renderer + scene
 // ---------------------------------------------------------------------------
@@ -245,6 +253,12 @@ const overlay = createOverlay(hudEl, {
 async function boot() {
   // 1. Anchor the projection. Everything placed after this is relative to it.
   setOrigin(DEFAULT_ORIGIN.lat, DEFAULT_ORIGIN.lon);
+
+  // 1b. Hand the tier to the two geo modules that hold real memory. MUST be
+  // before createTerrain(): it registers the DEM layers and decodes the
+  // land-cover rasters, and both are boot-time-only decisions. See
+  // geo/geoBudgets.js.
+  console.info(describeGeoBudgets(applyGeoBudgets(budgets)));
 
   // 2. Terrain loads the DEM and is the gate for every ground query below.
   overlay.setLoadingText('loading elevation tiles…');
