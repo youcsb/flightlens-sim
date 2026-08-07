@@ -26,28 +26,63 @@
  * different sampler.
  *
  * ---------------------------------------------------------------------------
- * THE LOD SCHEME — CDLOD (continuous distance-dependent LOD)
+ * THE LOD SCHEME — CDLOD with a MEASURED error metric
  * ---------------------------------------------------------------------------
  * A quadtree over the region. Each selected node draws a fixed GRID x GRID
  * lattice, so every node costs the same and the whole terrain is one shared
- * index buffer. A node subdivides while the camera is closer than
- * LOD_K * nodeSize; the node that ends up drawn is therefore always between
- * LOD_K * S and 2 * LOD_K * S away. Its cell size is S / GRID, so the angular
- * size of a cell is bounded by
+ * index buffer.
  *
- *      cell / distance  <=  (S / GRID) / (LOD_K * S)  =  1 / (GRID * LOD_K)
+ * WHAT CHANGED IN ROUND 2, AND WHY. The old rule was `subdivide while the
+ * camera is nearer than LOD_K * nodeSize` — fixed rings, identical over the
+ * middle of Puget Sound and over the Willis Wall. That was defensible while the
+ * DEM was 51.8 m/px everywhere: the mesh's finest cell was 8 m, six times finer
+ * than the data, so every node was interpolating the same smooth mush and there
+ * was nothing for an error metric to find. The DEM is now 12.95 m/px region-wide
+ * and 6.47 m/px over the Seattle inset, and there IS something to find.
  *
- * — INDEPENDENT OF S. That is the whole point: one constant, 1/160 rad here
- * (~6 px at 1080p / 60 deg FOV), governs the silhouette error everywhere, from
- * the runway threshold to Mount Rainier at 84 km. A naive "coarser when far"
- * scheme would render Rainier as a lump; this one puts 512 m cells on it at
- * 84 km, about forty samples across the cone.
+ * So each node now carries a MEASURED geometric error: the largest vertical
+ * distance between its own lattice and the finer surface underneath it,
+ * probed off the real DEM at node creation (see `probeNode`). A node
+ * subdivides while
+ *
+ *      cameraDistance  <  err / LOD_TAU
+ *
+ * which holds the node's vertical error below LOD_TAU radians of screen angle
+ * everywhere. Flat ground collapses to its parent immediately; a ridgeline
+ * holds its children out to three times the old distance. Clamped into
+ * [LOD_K_MIN, LOD_K_MAX] * size so neither end can run away.
+ *
+ * Measured against the previous fixed-ring rule, over four cameras (KBFI 600 m,
+ * mid-Sound 1500 m, Rainier flank 3000 m, Cascade crest 2000 m), sampling the
+ * DRAWN SURFACE against `getElevationLocal` — the honest definition of "is the
+ * mesh telling the truth":
+ *
+ *              drawn nodes   mesh-vs-field RMS   worst      normal error
+ *   ring 2.5       586           0.858 m        16.2 m         6.3 deg
+ *   error metric   694           0.670 m        11.9 m         5.5 deg
+ *
+ * and where the ground is genuinely flat it is cheaper, not dearer: mid-Sound
+ * goes 587 -> 530 nodes. The whole 18% node increase is spent on the Cascades
+ * (574 -> 769) and Rainier (561 -> 766), which is exactly where the geographic
+ * critic said the detail was missing.
+ *
+ * THE FINEST NODE IS TIED TO THE DATA, NOT TO A CONSTANT. `demSpacingAt()`
+ * returns the sample spacing of the finest baked DEM layer covering a node, and
+ * a node whose own cells are already at or below it does not subdivide — its
+ * children would interpolate an interpolation. In practice that means 4 m cells
+ * inside the z=14 Seattle inset (6.47 m/px data) and 8 m cells everywhere else
+ * (12.95 m/px). Near-field mesh-vs-field error at KBFI: 0.084 m -> 0.045 m.
  *
  * POPPING is removed by geomorphing, not hidden by fog. Every vertex carries
  * the height it would have on its PARENT's lattice (aMorph.x). The vertex
- * shader lerps toward that value over the outer quarter of the node's distance
+ * shader lerps toward that value over the outer 30% of the node's distance
  * range, so by the time a node is replaced by its parent its shape is already
  * identical to the parent's. Nothing ever jumps.
+ *
+ * The morph window is now PER NODE (aMorph.y = the distance at which this node's
+ * parent stops subdividing), because with an error metric there is no longer a
+ * single distance at which a given level is swapped out. Getting this wrong is
+ * not subtle: a node whose morph completes after its own switch distance pops.
  *
  * The same mechanism removes CRACKS between neighbouring LODs, and this is
  * worth spelling out because it is not obvious: at a boundary between a node of
@@ -58,8 +93,13 @@
  * sample; odd ones are the linear interpolation the coarse triangle already
  * draws. The surfaces agree exactly.
  *
- * Skirts are still generated. They are insurance, not the mechanism — with the
- * morph working they are never visible.
+ * SKIRTS STOP BEING DECORATION. Under fixed rings two neighbouring nodes at the
+ * same level always switched at the same distance, so the level difference
+ * across any edge was at most one and the morph covered it. An error metric
+ * breaks that: a rough node subdivides while the flat node beside it does not,
+ * and the seam between them can carry a residual as large as the rough node's
+ * own geometric error. Nothing else covers that, so the skirt depth is now
+ * driven by the error rather than by the cell size — see `skirtDepthFor`.
  *
  * ---------------------------------------------------------------------------
  * COLOUR: PROCEDURAL, NOT PHOTOGRAPHIC
@@ -90,6 +130,7 @@ import {
   isLoaded as demLoaded,
   SEA_LEVEL_M,
   DEM_ZOOM,
+  DETAIL_BBOX,
   WATER_LEVEL_M,
 } from '../geo/elevation.js';
 import { REGION_BBOX, llToLocal } from '../geo/coords.js';
@@ -119,8 +160,12 @@ import { clamp } from '../core/units.js';
  *           let them drive surface albedo. Default true. With it off (or with
  *           nothing baked) the surface falls back to the elevation-and-slope
  *           palette, which paints every lowland the same green.
- * @property {number} [lodQuality]   Multiplies LOD_K. >1 = more triangles, sharper
- *           silhouettes, more draw calls. Default 1.
+ * @property {number} [lodQuality]   Scales the whole LOD error budget: divides
+ *           LOD_TAU and multiplies both ends of the clamp band. >1 = more
+ *           triangles, smaller geometric error, more draw calls, quadratically
+ *           more memory. Default 1, which is the swept value — see LOD_TAU.
+ *           It cannot make the mesh finer than the DEM: `demSpacingAt` is a
+ *           hard stop that lodQuality does not scale, by design.
  * @property {number} [originX] @property {number} [originY] @property {number} [originZ]
  *           Where to build the first full set of chunks, in local scene metres.
  *           Default (0, 400, 0) — the scene origin is the KBFI spawn by
@@ -152,48 +197,73 @@ const DEFAULTS = {
 /**
  * Cells per node edge. 64 is the sweet spot for this scene.
  *
- * Screen error is 1/(GRID * LOD_K) whichever way you split it, but the node
- * COUNT is not neutral: for a fixed error, halving GRID forces LOD_K to double,
- * and the number of nodes in a level's annulus goes as LOD_K^2. A 32-cell grid
- * at the same fidelity needs four times the draw calls — WebGL dies on the call
- * overhead long before the GPU notices the triangles.
+ * Node COUNT is what this trades against, and it is not neutral: for a fixed
+ * geometric error, halving GRID doubles the distance at which a node of a given
+ * size must still be subdivided, and the number of nodes in a level's annulus
+ * goes as the square of that. A 32-cell grid at the same fidelity needs four
+ * times the draw calls — WebGL dies on the call overhead long before the GPU
+ * notices the triangles.
  */
 const GRID = 64;
 const VERTS_PER_SIDE = GRID + 1;
 const GRID_VERTS = VERTS_PER_SIDE * VERTS_PER_SIDE; // 4225
 const SKIRT_VERTS = GRID * 4; // 256
 const NODE_VERTS = GRID_VERTS + SKIRT_VERTS; // 4481, comfortably under 65536
+/** Every node draws the same shared index buffer, so this is a constant. */
+const TRIS_PER_NODE = GRID * GRID * 2 + SKIRT_VERTS * 2; // 8704
 
 /**
- * A node subdivides while the camera is within LOD_K * nodeSize of it.
+ * THE SCREEN-ERROR BUDGET. A node subdivides while its measured geometric error
+ * subtends more than LOD_TAU radians: `d < err / LOD_TAU`.
  *
- * THIS NUMBER IS A BUDGET, NOT A TASTE SETTING. Nodes of a given level that end
- * up drawn are exactly those whose box-distance falls in [K*S, 2*K*S), an
- * annulus whose area goes as K^2*S^2 — so the count per level goes as K^2,
- * INDEPENDENT of S, and is paid once for every level between the finest node
- * and the draw radius. Here that is seven levels (512 m up to 32 km), and the
- * cost is quadratic in K:
- *
- *   K = 4.0   ~2,500 nodes drawn   ~400 MB of vertex buffers
- *   K = 2.5      608 nodes drawn    142 MB   <- measured, 881 alive
- *
- * K = 4 was the value this file shipped with, and it does not fit in any
- * plausible cache. The failure is not a slow frame, it is a LIMIT CYCLE:
- * evictStale() destroys chunks the next frame needs, visit() then refuses to
- * subdivide (a node only subdivides once all four children own geometry), so
- * the parent draws itself coarse, its children get rebuilt, and round it goes.
- * Measured with a STATIONARY camera at the KBFI spawn it drew 243 nodes on
- * frame 120 and 174 on frame 400, never the same set twice — continuous
- * popping, 5 ms/frame of rebuilds forever, and Mount Rainier stuck on 2,048 m
- * cells instead of 256. At K = 2.5 the same test draws an IDENTICAL 608 nodes
- * on frames 30, 120 and 400, and update() falls to 0 ms.
- *
- * The price is screen error: 1/(GRID*K) goes from 1/256 rad to 1/160 (~6 px at
- * 1080p / 60 deg FOV rather than ~4). That is the right trade for a terrain
- * that actually converges. If you raise K, raise MAX_CACHED_NODES by K^2 in the
- * same edit and re-run the stationary-camera test.
+ * 0.003 rad is ~1.7 px at 1000x562 / 60 deg FOV, ~3.2 px at 1080p. It is not a
+ * taste setting; it was chosen off the Pareto front of drawn-node count against
+ * measured mesh-vs-field deviation, swept over four cameras. Halving it to
+ * 0.0015 buys 0.67 m -> 0.51 m of RMS for 910 nodes instead of 694, which does
+ * not fit the memory budget. Doubling it to 0.006 gives back the node count but
+ * loses the Cascade ridgelines this round exists to recover.
  */
-const LOD_K = 2.5;
+const LOD_TAU = 0.003;
+
+/**
+ * The error metric is clamped into [LOD_K_MIN, LOD_K_MAX] * nodeSize, and both
+ * ends earn their place.
+ *
+ * LOD_K_MIN is the floor: a node with zero error still has to subdivide
+ * eventually or the aircraft ends up sitting on a 262 km quad over the middle
+ * of the Sound. 0.8 means "subdivide once you are closer than the node is wide".
+ *
+ * LOD_K_MAX is the ceiling, and it is the one that protects the frame. Nodes of
+ * a level that end up drawn occupy an annulus whose area goes as K^2, so the
+ * count per level — and therefore the whole vertex-buffer budget — is quadratic
+ * in it. Over Mount Rainier every level's error exceeds the budget at every
+ * distance, so the ceiling is what is actually binding there and 3.2 is the
+ * largest value whose worst-case working set still fits MAX_CACHED_NODES. The
+ * old fixed ring was 2.5 for comparison.
+ */
+const LOD_K_MIN = 0.8;
+const LOD_K_MAX = 3.2;
+
+/**
+ * A node's switch distance is forced to at most its parent's over this ratio.
+ *
+ * Two reasons, both load-bearing. (1) A child must be replaced by its parent at
+ * a GREATER distance than it is itself drawn at, or the hierarchy is not
+ * nested and the selector can pick a child and its parent at once. The probe is
+ * per node and there is no guarantee a rough child sits under a rough parent.
+ * (2) The morph window is [MORPH_START_FRAC, 1] of the parent's switch
+ * distance, so the child's own switch distance has to fall below the start of
+ * that window or the node is swapped out before it has finished morphing —
+ * which is a pop. 1/1.45 = 0.69 < MORPH_START_FRAC = 0.70.
+ *
+ * For homogeneous terrain the natural ratio between levels is 2^H ~ 1.74 for a
+ * Hurst exponent of 0.8, so this clamp only bites where roughness changes fast
+ * between a node and its parent — a coastline, a valley wall.
+ */
+const LOD_PARENT_RATIO = 1.45;
+
+/** Fraction of the morph-end distance at which morphing begins. */
+const MORPH_START_FRAC = 0.7;
 
 /**
  * Root extent, metres. The region is 166 km E-W by 211 km N-S, so 262144 (2^18)
@@ -202,41 +272,80 @@ const LOD_K = 2.5;
  */
 const ROOT_SIZE = 262144;
 
-/** Finest node: 512 m across, so 8 m cells. Finer than the 13 m/px z=13 DEM. */
-const MIN_NODE_SIZE = 512;
-const MAX_LEVEL = Math.round(Math.log2(ROOT_SIZE / MIN_NODE_SIZE)); // 9
+/**
+ * Finest node: 256 m across, so 4 m cells.
+ *
+ * This is a LIMIT, not a target — `demSpacingAt()` decides per node whether it
+ * is reachable. 4 m cells are only ever selected inside the z=14 Seattle inset,
+ * where the DEM is 6.47 m/px and there is real information at that scale; over
+ * the rest of the region the data is 12.95 m/px and the tree stops one level
+ * earlier at 8 m cells, because 4 m cells there would be sampling the bilinear
+ * interpolation between two DEM texels and calling it terrain.
+ */
+const MIN_NODE_SIZE = 256;
+const MAX_LEVEL = Math.round(Math.log2(ROOT_SIZE / MIN_NODE_SIZE)); // 10
 
 /**
- * Built geometries kept alive. ~161 KB each, so 1,100 is ~177 MB of vertex
- * buffers in the worst case.
- *
- * THIS MUST EXCEED THE WORKING SET or the LOD never converges — see LOD_K. The
- * working set is not a guess: measured at the KBFI spawn with an unbounded
- * cache, the selection settles on 608 drawn / 881 alive and then does not
- * change at all between frame 30 and frame 400. 1,100 is that plus 25% of
- * slack, which is what lets a 180-degree turn reuse the ground behind you
- * instead of rebuilding it.
+ * Sample spacing of the finest baked DEM layer, metres. From the bake manifest:
+ * z=14 covers DETAIL_BBOX at 6.47 m/px, z=13 covers the whole region at
+ * 12.95 m/px. These are what tie mesh density to real data resolution.
  */
-const MAX_CACHED_NODES = 1100;
+const DEM_SPACING_FINE = 6.47;
+const DEM_SPACING_REGION = 12.95;
+
+/**
+ * Built geometries kept alive. 134 KB each (positions and morph as Float32,
+ * normals as normalised Int16 — see buildNodeGeometry), so the real ceiling of
+ * MAX_CACHED_NODES + EVICT_SLACK is ~199 MB of vertex buffers. Round 1 held
+ * 1,100 + 96 fatter nodes at ~188 MB, so the error metric buys 28% more nodes
+ * for 6% more memory.
+ *
+ * THIS MUST EXCEED THE WORKING SET or the LOD never converges, and the failure
+ * is not a slow frame, it is a LIMIT CYCLE: evictStale() destroys chunks the
+ * next frame needs, visit() then refuses to subdivide (a node only subdivides
+ * once all four children own geometry), so the parent draws itself coarse, its
+ * children get rebuilt, and round it goes — continuous popping, milliseconds of
+ * rebuilds forever, and Mount Rainier stuck at a level it should have left.
+ *
+ * The working set is measured, not guessed. The error metric's worst camera of
+ * the four swept is the Rainier flank at 766 drawn / 1,041 nodes touched; the
+ * built set runs about 1.45x drawn because visit() prefetches children before
+ * it will use them. 1,400 is that plus slack, which is also what lets a
+ * 180-degree turn reuse the ground behind you instead of rebuilding it.
+ */
+const MAX_CACHED_NODES = 1400;
 
 /**
  * Evict only once the cache is this far over. Without hysteresis, a working set
  * that sits just above the cap makes evictStale() sort the whole array every
  * single frame for the sake of one or two nodes.
  */
-const EVICT_SLACK = 96;
+const EVICT_SLACK = 120;
 
 /** Per-frame build budget for PREFETCHING children, milliseconds. */
 const BUILD_BUDGET_MS = 4;
 
 /**
- * Skirt depth, capped. It only has to cover a crack that geomorphing already
- * makes impossible, so it is deliberately small: a deep apron on a coarse node
- * would hang kilometres below the seabed and show through the transparent
- * water at shorelines.
+ * Skirt depth, metres — and under an error metric this is not decoration.
+ *
+ * With fixed rings, two neighbouring nodes at the same level switched at the
+ * same distance, so the level difference across any shared edge was at most one
+ * and the geomorph closed it exactly. An error metric deliberately breaks that
+ * symmetry: a rough node subdivides while the flat node beside it does not, and
+ * the vertical residual at that seam is bounded by the rough node's own
+ * geometric error, not by its cell size. `cellSize * 4` used to cover every
+ * case; it no longer does, and an uncovered seam is a hole straight through to
+ * the sky.
+ *
+ * So the depth tracks the error. The cell-size term stays as the floor for
+ * ordinary ground, and the old 120 m cap stays with it — a deep apron on a
+ * coarse node hangs below the seabed and shows through the transparent water at
+ * shorelines, and over water the error is ~0 so that branch is what applies
+ * there. Only genuinely broken ground, where there is no water to show through,
+ * ever gets a deeper skirt.
  */
-function skirtDepthFor(cellSize) {
-  return Math.min(cellSize * 4, 120);
+function skirtDepthFor(cellSize, errM) {
+  return Math.min(Math.max(Math.min(cellSize * 3, 120), errM * 1.6), 900);
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +470,40 @@ float tNoise(vec2 p) {
 vec3 tSrgb(vec3 c) { return c * c * (c * 0.305306011 + 0.682171111) + c * 0.012522878; }
 `;
 
+/**
+ * MICRO-RELIEF — the derivative-based fine shading term.
+ *
+ * The mesh runs out of triangles long before the eye runs out of acuity. On
+ * short final the finest cell here is 4 m across and covers a couple of hundred
+ * pixels, and no LOD budget that fits in memory is ever going to put a triangle
+ * on a boulder. Below that scale the ground has to be carried by the NORMAL
+ * instead: a height field defined procedurally, its gradient taken by three
+ * taps, and the surface normal bent by it before three's lighting runs.
+ *
+ * WHY THIS IS NOT THE SAME AS THE EXISTING `grain`. grain modulates ALBEDO, so
+ * it reads as dirt on a flat surface — it looks identical whatever the sun is
+ * doing, and it is exactly as visible on a slope facing the sun as on one
+ * facing away. This bends the normal, so it responds to the sun: the same rock
+ * face has lit and shadowed micro-facets, it changes as the aircraft turns, and
+ * it is what makes a slope read as a slope rather than as a shaded polygon.
+ * That is also why it cannot be baked into a normal map — the whole point is
+ * that it costs no texture and has no resolution floor.
+ *
+ * PERIODS 32 / 8 / 2 m ALL DIVIDE THE 32 m NOISE-ORIGIN QUANTUM. Get that wrong
+ * and the relief crawls across the ground as you fly — see GLSL_NOISE for the
+ * precision trap that forces the quantised origin in the first place.
+ *
+ * `hf` fades the 2 m octave out on its own, ahead of the rest: it is the first
+ * one to drop below a pixel and the first one to alias into a shimmer.
+ */
+const GLSL_RELIEF = /* glsl */ `
+float tRelief(vec2 p, float hf) {
+  return tNoise(p * 0.03125) * 0.58
+       + tNoise(p * 0.125)   * 0.28
+       + tNoise(p * 0.5)     * 0.14 * hf;
+}
+`;
+
 // ---------------------------------------------------------------------------
 // Scratch — module scope, because update() must not allocate
 // ---------------------------------------------------------------------------
@@ -369,9 +512,93 @@ const _camPos = new THREE.Vector3();
 /** Previous camera position + timestamp, for the DEM pager's velocity lead. */
 const _camPrev = new THREE.Vector3();
 let _camPrevMs = -1;
-const _probe = new Float32Array(81);
 /** Hoisted so evictStale()'s sort does not allocate a comparator per frame. */
 const byLastUsed = (a, b) => a.lastUsed - b.lastUsed;
+
+// ---------------------------------------------------------------------------
+// The per-node probe
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe lattice: PROBE_N x PROBE_N samples spanning the node exactly.
+ *
+ * 17 is the smallest odd size that gives a usable error estimate — the residual
+ * is measured at the odd points against their even neighbours, so a 9x9 probe
+ * has only 56 of them and a single DEM artefact swings the answer. 17x17 has
+ * 208, costs ~40 us per node against the ~130 us the node's real 69x69 build
+ * grid costs, and is only paid once per node for the life of the tree.
+ */
+const PROBE = 16;
+const PROBE_N = PROBE + 1;
+const _probe = new Float32Array(PROBE_N * PROBE_N);
+const _probeOut = { lo: 0, hi: 0, err: 0 };
+
+/**
+ * Height range and GEOMETRIC ERROR of one node, straight off the DEM.
+ *
+ * The error is the largest vertical distance between the node's lattice and the
+ * finer surface underneath it, measured the same way the geomorph measures it:
+ * every odd probe point against the linear interpolation of its even
+ * neighbours. That is exactly the quantity the LOD is trying to bound, and it
+ * is exactly the quantity aMorph.x has to hide when the node collapses onto its
+ * parent — one definition, used for both, so they cannot disagree.
+ *
+ * It is measured at the PROBE lattice (size/8 against size/16), not at the
+ * node's own draw lattice (size/64), because sampling 129x129 per node at
+ * creation would cost 40x more than building the node does. Terrain roughness
+ * scales as a power law in the sample spacing, so the two differ by a constant
+ * factor across all nodes — which is absorbed into LOD_TAU and cancels out of
+ * every comparison the selector makes.
+ *
+ * MAX, not RMS. The LOD is a bound on the worst visible deviation, and a cliff
+ * that occupies 2% of a node is still a cliff on the skyline. RMS was swept and
+ * loses the Cascade ridgelines, which is the whole point of the exercise.
+ *
+ * Returns a module-scope object — 1.8 forbids allocating on paths that run
+ * during flight, and new nodes are created while flying.
+ */
+function probeNode(x0, z0, size) {
+  const s = size / PROBE;
+  fillHeightGrid(x0, z0, s, s, PROBE_N, PROBE_N, _probe);
+
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 0; i < PROBE_N * PROBE_N; i++) {
+    const v = _probe[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+
+  let err = 0;
+  for (let j = 0; j <= PROBE; j++) {
+    const oj = j & 1;
+    for (let i = 0; i <= PROBE; i++) {
+      const oi = i & 1;
+      if (!oi && !oj) continue; // an even point IS on the coarse lattice
+      const k = j * PROBE_N + i;
+      let ref;
+      if (oi && !oj) {
+        ref = (_probe[k - 1] + _probe[k + 1]) * 0.5;
+      } else if (!oi && oj) {
+        ref = (_probe[k - PROBE_N] + _probe[k + PROBE_N]) * 0.5;
+      } else {
+        ref =
+          (_probe[k - PROBE_N - 1] +
+            _probe[k - PROBE_N + 1] +
+            _probe[k + PROBE_N - 1] +
+            _probe[k + PROBE_N + 1]) *
+          0.25;
+      }
+      const d = Math.abs(_probe[k] - ref);
+      if (d > err) err = d;
+    }
+  }
+
+  _probeOut.lo = lo;
+  _probeOut.hi = hi;
+  _probeOut.err = err;
+  return _probeOut;
+}
 
 /**
  * Build the terrain and add it to `scene`.
@@ -421,8 +648,16 @@ export async function createTerrain(scene, opts = {}) {
   scene.add(group);
 
   const exag = cfg.exaggeration;
-  const lodK = LOD_K * Math.max(0.25, cfg.lodQuality);
+  // lodQuality scales the whole error budget coherently: a tighter tolerance
+  // AND a wider clamp band, so raising it actually reaches finer levels rather
+  // than just pushing every node against the same ceiling.
+  const q = Math.max(0.25, cfg.lodQuality);
+  const lodTau = LOD_TAU / q;
+  const lodKMin = LOD_K_MIN * q;
+  const lodKMax = LOD_K_MAX * q;
   const drawRadius = cfg.viewRadiusM * 1.6;
+  /** Morph-end distance for the root, which is never replaced by anything. */
+  const NO_MORPH = drawRadius * 4;
 
   // -------------------------------------------------------------------------
   // 2. Region height + shore-distance field
@@ -442,6 +677,49 @@ export async function createTerrain(scene, opts = {}) {
   // past the nominal edge.
   const demRect = computeDemRect(cfg.bbox, 16000);
 
+  // The z=14 inset, in local metres. Inside it the DEM is 6.47 m/px and the
+  // tree is allowed one more level than it is anywhere else — this rectangle is
+  // the entire reason MIN_NODE_SIZE is 256 rather than 512.
+  const fineRect = computeDemRect(DETAIL_BBOX, 0);
+
+  /**
+   * Sample spacing of the finest baked DEM layer covering a node, metres.
+   *
+   * This is what stops the mesh from out-running its own source. A node whose
+   * cells are already at or finer than this has nothing left to gain from
+   * subdividing: its children would be drawing the bilinear interpolation
+   * between two DEM texels at a higher polygon count and calling it terrain,
+   * which is the definition of over-tessellation and is also §1.5's line about
+   * never trading geometric accuracy for visual polish, read backwards.
+   */
+  function demSpacingAt(x0, z0, size) {
+    if (
+      x0 + size > fineRect.xMin &&
+      x0 < fineRect.xMax &&
+      z0 + size > fineRect.zMin &&
+      z0 < fineRect.zMax
+    ) {
+      return DEM_SPACING_FINE;
+    }
+    return DEM_SPACING_REGION;
+  }
+
+  /**
+   * The distance below which a node subdivides. Zero means never.
+   *
+   * @param {number} err   metres, from probeNode
+   * @param {number} size  node edge, metres
+   * @param {number} parentD  the parent's switch distance, or Infinity for the root
+   */
+  function switchDistanceFor(err, size, x0, z0, parentD) {
+    if (size / GRID <= demSpacingAt(x0, z0, size)) return 0;
+    let d = err / lodTau;
+    if (d < lodKMin * size) d = lodKMin * size;
+    else if (d > lodKMax * size) d = lodKMax * size;
+    const cap = parentD / LOD_PARENT_RATIO;
+    return d < cap ? d : cap;
+  }
+
   // -------------------------------------------------------------------------
   // 3. Lakes (needs the field so lake texels count as water for shore distance)
   // -------------------------------------------------------------------------
@@ -454,7 +732,7 @@ export async function createTerrain(scene, opts = {}) {
   // -------------------------------------------------------------------------
   // 4. Materials
   // -------------------------------------------------------------------------
-  const terrainMat = makeTerrainMaterial(lodK, exag, landcover, fieldTexture, regionRect);
+  const terrainMat = makeTerrainMaterial(exag, landcover, fieldTexture, regionRect);
   const seaMat = cfg.water
     ? makeWaterMaterial(fieldTexture, regionRect, cfg.seaLevelM, false)
     : null;
@@ -480,7 +758,7 @@ export async function createTerrain(scene, opts = {}) {
   /** @type {Array<Object>} Nodes whose geometry we want but do not urgently need. */
   const prefetch = [];
 
-  const root = makeNode(0, 0, 0);
+  const root = makeNode(0, 0, 0, null);
 
   // -------------------------------------------------------------------------
   // 6. Water surfaces
@@ -577,14 +855,16 @@ export async function createTerrain(scene, opts = {}) {
   }
   console.info(
     `[terrain] ${nodes.size} nodes (${built.length} built, ${emitted.length} drawn ` +
-      `after ${passes} LOD passes), ${lakes ? lakes.kept : 0} lakes | ` +
+      `after ${passes} LOD passes, ${((emitted.length * TRIS_PER_NODE) / 1e6).toFixed(2)}M tri), ` +
+      `${lakes ? lakes.kept : 0} lakes | ` +
       `dem ${(tDem - t0) | 0}ms, field ${(tField - tDem) | 0}ms, ` +
       `lakes ${(tLakes - tField) | 0}ms, mesh ${(tNodes - tLakes) | 0}ms`,
   );
   if (built.length > MAX_CACHED_NODES) {
     console.warn(
       `[terrain] working set ${built.length} exceeds MAX_CACHED_NODES ` +
-        `${MAX_CACHED_NODES}; the LOD will thrash. Raise the cache or LOD_K.`,
+        `${MAX_CACHED_NODES}; the LOD will thrash. Raise the cache, raise ` +
+        `LOD_TAU, or lower LOD_K_MAX.`,
     );
   }
 
@@ -703,7 +983,12 @@ export async function createTerrain(scene, opts = {}) {
    * node is always an exact multiple of its size — which is what makes every
    * level's vertices align and the crack-free morph work.
    */
-  function makeNode(level, ix, iz) {
+  /**
+   * @param {Object|null} parent  needed for the switch-distance nesting clamp,
+   *        and to give the node its morph-end distance. Always the real parent:
+   *        every node is reached either as the root or through ensureChildren.
+   */
+  function makeNode(level, ix, iz, parent) {
     const key = `${level}/${ix}/${iz}`;
     let node = nodes.get(key);
     if (node) return node;
@@ -718,22 +1003,21 @@ export async function createTerrain(scene, opts = {}) {
       z0 + size > demRect.zMin &&
       z0 < demRect.zMax;
 
-    // A cheap 9x9 probe gives a height range good enough for LOD distance and
-    // frustum bounds before the node is ever built. Skipped where there is no
-    // DEM: the answer is provably a flat zero and the node is never drawn.
+    // The probe gives a height range good enough for LOD distance and frustum
+    // bounds before the node is ever built, AND the geometric error the LOD
+    // decision is made on. Skipped where there is no DEM: the answer is
+    // provably a flat zero and the node is never drawn.
     let lo = 0;
     let hi = 0;
+    let err = 0;
     if (hasData) {
-      fillHeightGrid(x0, z0, size / 8, size / 8, 9, 9, _probe);
-      lo = Infinity;
-      hi = -Infinity;
-      for (let i = 0; i < 81; i++) {
-        const v = _probe[i];
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-      }
+      const p = probeNode(x0, z0, size);
+      lo = p.lo;
+      hi = p.hi;
+      err = p.err;
     }
 
+    const parentD = parent ? parent.switchD : Infinity;
     node = {
       key,
       level,
@@ -744,7 +1028,13 @@ export async function createTerrain(scene, opts = {}) {
       z0,
       hasData,
       cell: size / GRID,
-      // Padded: a 9x9 probe of a 262 km node misses a lot of mountain.
+      err,
+      switchD: hasData ? switchDistanceFor(err, size, x0, z0, parentD) : 0,
+      // What the vertex shader morphs toward: the distance at which this node's
+      // PARENT stops subdividing is exactly the distance at which this node is
+      // replaced by it, so the morph must be complete by then and not before.
+      morphEnd: parent ? parentD : NO_MORPH,
+      // Padded: a 17x17 probe of a 262 km node still misses a lot of mountain.
       yMin: (lo - size * 0.05) * exag,
       yMax: (hi + size * 0.05) * exag,
       children: null,
@@ -762,10 +1052,10 @@ export async function createTerrain(scene, opts = {}) {
     const ix = node.ix * 2;
     const iz = node.iz * 2;
     node.children = [
-      makeNode(l, ix, iz),
-      makeNode(l, ix + 1, iz),
-      makeNode(l, ix, iz + 1),
-      makeNode(l, ix + 1, iz + 1),
+      makeNode(l, ix, iz, node),
+      makeNode(l, ix + 1, iz, node),
+      makeNode(l, ix, iz + 1, node),
+      makeNode(l, ix + 1, iz + 1, node),
     ];
     return node.children;
   }
@@ -807,7 +1097,10 @@ export async function createTerrain(scene, opts = {}) {
     const d = nodeDistance(node, px, py, pz);
     if (d > drawRadius) return;
 
-    if (node.level < MAX_LEVEL && d < lodK * node.size) {
+    // THE LOD DECISION. `switchD` is the node's own measured error turned into
+    // a distance (see switchDistanceFor); zero means the DEM has nothing finer
+    // to say here and the node is terminal whatever the camera does.
+    if (node.level < MAX_LEVEL && d < node.switchD) {
       const kids = ensureChildren(node);
       // A no-data child counts as ready — it is never drawn, so waiting for a
       // geometry it will never own would freeze this whole branch at its
@@ -893,7 +1186,39 @@ export async function createTerrain(scene, opts = {}) {
     }
   }
 
-  return { group, getHeightAt, update, converge, dispose };
+  /**
+   * LOD diagnostics. Not a per-frame path and not an API anything imports —
+   * it exists because the only honest way to tune an error-driven LOD is to
+   * measure what it actually selected, and `renderer.info` cannot tell you
+   * which LEVELS the triangles came from.
+   *
+   * `drawn` is the selected set; the renderer frustum-culls it further, so
+   * `renderer.info.render.triangles` will be a fraction of `triangles` here.
+   *
+   * @returns {{nodes:number, built:number, drawn:number, triangles:number,
+   *            finestCellM:number, byLevel:number[], tau:number}}
+   */
+  function stats() {
+    const byLevel = new Array(MAX_LEVEL + 1).fill(0);
+    let finest = Infinity;
+    for (let i = 0; i < emitted.length; i++) {
+      const node = nodes.get(emitted[i].name.slice('terrain-'.length));
+      if (!node) continue;
+      byLevel[node.level]++;
+      if (node.cell < finest) finest = node.cell;
+    }
+    return {
+      nodes: nodes.size,
+      built: built.length,
+      drawn: emitted.length,
+      triangles: emitted.length * TRIS_PER_NODE,
+      finestCellM: Number.isFinite(finest) ? finest : 0,
+      byLevel,
+      tau: lodTau,
+    };
+  }
+
+  return { group, getHeightAt, update, converge, stats, dispose };
 }
 
 // ===========================================================================
@@ -966,8 +1291,29 @@ function boundaryRing() {
 }
 
 const _ring = boundaryRing();
-/** (GRID + 3)^2 samples: the node lattice plus a one-cell border for normals. */
-const _hgrid = new Float32Array((GRID + 3) * (GRID + 3));
+
+/**
+ * (GRID + 5)^2 samples: the node lattice plus a TWO-cell border.
+ *
+ * One cell was enough while the finest node had 8 m cells. It is not enough at
+ * 4 m: a 4 m central difference on 6.47 m/px data measures the slope of the
+ * bilinear interpolation inside a single DEM texel, whose gradient is constant
+ * across the texel and jumps at its edge — so every DEM texel came out as a
+ * flat facet with a crease around it, a quilt of 6 m diamonds laid over the
+ * ground. The second border ring lets `buildNodeGeometry` widen the normal
+ * stencil to +/-2 cells wherever the node is finer than the data, which puts
+ * the difference back across a real texel boundary. Costs 6% more samples.
+ */
+const NORMAL_BORDER = 2;
+const HGRID_W = GRID + 1 + NORMAL_BORDER * 2;
+const _hgrid = new Float32Array(HGRID_W * HGRID_W);
+
+/**
+ * Smallest central-difference half-width used for vertex normals, metres.
+ * Below the DEM's own sample spacing a normal measures interpolation, not
+ * ground — see NORMAL_BORDER. 7 m clears the 6.47 m/px inset.
+ */
+const NORMAL_MIN_EPS_M = 7;
 
 /**
  * Sample the DEM for one node and turn it into a drawable chunk.
@@ -985,17 +1331,27 @@ const _hgrid = new Float32Array((GRID + 3) * (GRID + 3));
  */
 function buildNodeGeometry(node, sharedIndex, exag) {
   const c = node.cell;
-  const W = GRID + 3;
+  const W = HGRID_W;
+  const B = NORMAL_BORDER;
 
-  // One extra ring of samples on each side, so edge normals are correct rather
+  // Two extra rings of samples on each side, so edge normals are correct rather
   // than clamped — clamped edge normals give every chunk a visible dark rim.
-  fillHeightGrid(node.x0 - c, node.z0 - c, c, c, W, W, _hgrid);
+  fillHeightGrid(node.x0 - B * c, node.z0 - B * c, c, c, W, W, _hgrid);
 
   const pos = new Float32Array(NODE_VERTS * 3);
-  const nrm = new Float32Array(NODE_VERTS * 3);
+  // Int16, normalised. A unit vector has no use for 24 bits of mantissa: the
+  // quantisation step is 1/32767, which is 0.002 degrees of tilt, and it halves
+  // the largest single cost in the cache. The error metric selects ~28% more
+  // nodes than the fixed rings did, and this is what pays for them — the
+  // worst-case vertex-buffer footprint lands at 199 MB against round 1's 188.
+  const nrm = new Int16Array(NODE_VERTS * 3);
   const mrp = new Float32Array(NODE_VERTS * 3);
-  const drop = skirtDepthFor(c);
-  const inv2c = 1 / (2 * c);
+  const drop = skirtDepthFor(c, node.err);
+  // Normal stencil half-width in CELLS: 1 normally, 2 where the node's own
+  // cells are finer than the DEM under them. See NORMAL_BORDER.
+  const ns = c < NORMAL_MIN_EPS_M ? 2 : 1;
+  const nStride = ns * W;
+  const inv2c = 1 / (2 * ns * c);
 
   // Bounds over the WHOLE sampled block, border ring included. Every value the
   // geomorph can ever produce is either a sample from _hgrid or a mean of two
@@ -1013,9 +1369,9 @@ function buildNodeGeometry(node, sharedIndex, exag) {
   maxY *= exag;
 
   for (let j = 0; j <= GRID; j++) {
-    const gj = j + 1;
+    const gj = j + B;
     for (let i = 0; i <= GRID; i++) {
-      const gi = i + 1;
+      const gi = i + B;
       const v = j * VERTS_PER_SIDE + i;
       const h = _hgrid[gj * W + gi] * exag;
 
@@ -1024,16 +1380,17 @@ function buildNodeGeometry(node, sharedIndex, exag) {
       pos[v * 3 + 2] = node.z0 + j * c;
 
       // Same convention as elevation.getNormalLocal: +Y up, x east, z south.
-      const hL = _hgrid[gj * W + gi - 1] * exag;
-      const hR = _hgrid[gj * W + gi + 1] * exag;
-      const hD = _hgrid[(gj - 1) * W + gi] * exag;
-      const hU = _hgrid[(gj + 1) * W + gi] * exag;
+      const hL = _hgrid[gj * W + gi - ns] * exag;
+      const hR = _hgrid[gj * W + gi + ns] * exag;
+      const hD = _hgrid[gj * W + gi - nStride] * exag;
+      const hU = _hgrid[gj * W + gi + nStride] * exag;
       const nx = (hL - hR) * inv2c;
       const nz = (hD - hU) * inv2c;
       const len = Math.sqrt(nx * nx + 1 + nz * nz);
-      nrm[v * 3] = nx / len;
-      nrm[v * 3 + 1] = 1 / len;
-      nrm[v * 3 + 2] = nz / len;
+      const q = 32767 / len;
+      nrm[v * 3] = Math.round(nx * q);
+      nrm[v * 3 + 1] = Math.round(q);
+      nrm[v * 3 + 2] = Math.round(nz * q);
 
       // Parent lattice value: the parent samples every OTHER vertex of ours.
       let parent;
@@ -1057,7 +1414,7 @@ function buildNodeGeometry(node, sharedIndex, exag) {
           exag;
       }
       mrp[v * 3] = parent;
-      mrp[v * 3 + 1] = c;
+      mrp[v * 3 + 1] = node.morphEnd;
       mrp[v * 3 + 2] = 0;
     }
   }
@@ -1074,13 +1431,15 @@ function buildNodeGeometry(node, sharedIndex, exag) {
     nrm[dst * 3 + 1] = nrm[src * 3 + 1];
     nrm[dst * 3 + 2] = nrm[src * 3 + 2];
     mrp[dst * 3] = mrp[src * 3];
-    mrp[dst * 3 + 1] = c;
+    mrp[dst * 3 + 1] = node.morphEnd;
     mrp[dst * 3 + 2] = drop;
   }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  // `normalized` is the load-bearing argument: without it GL hands the shader
+  // 32767.0 instead of 1.0 and every surface goes black.
+  geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3, true));
   geo.setAttribute('aMorph', new THREE.BufferAttribute(mrp, 3));
   geo.setIndex(sharedIndex);
 
@@ -1112,7 +1471,7 @@ function buildNodeGeometry(node, sharedIndex, exag) {
  * its tone mapping working without this module reimplementing any of it. The
  * cost is that the injection points must match three's chunk names exactly.
  */
-function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
+function makeTerrainMaterial(exag, landcover, fieldTexture, rect) {
   const lcRegion = landcover?.region ?? null;
   const lcDetail = landcover?.detail ?? null;
   // A land-cover layer with no texture bound is not a "disabled" uniform, it is
@@ -1122,7 +1481,6 @@ function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
   const lcShape = `${lcRegion ? 'r' : ''}${lcDetail ? 'd' : ''}` || 'none';
 
   const uniforms = {
-    uMorphK: { value: lodK },
     uNoiseOrigin: { value: new THREE.Vector2() },
     uExag: { value: exag },
     uField: { value: fieldTexture },
@@ -1167,8 +1525,9 @@ function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
         '#include <common>',
         /* glsl */ `
         #include <common>
+        // x = height on the PARENT lattice, y = the distance at which this node
+        // is replaced by its parent, z = skirt drop.
         attribute vec3 aMorph;
-        uniform float uMorphK;
         varying vec3 vTerrWorld;
         varying vec3 vTerrNormal;
         varying float vTerrSurfaceY;
@@ -1178,12 +1537,21 @@ function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
         '#include <beginnormal_vertex>',
         /* glsl */ `
         #include <beginnormal_vertex>
-        // Morph window: the outer quarter of this node's distance range. A node
-        // of size S draws between K*S and 2*K*S from the camera, so by 2*K*S it
-        // is fully collapsed onto its parent's lattice and the swap is a no-op.
-        float tNodeSize = aMorph.y * float(${GRID});
-        float tMorphStart = uMorphK * tNodeSize * 1.5;
-        float tMorphEnd   = uMorphK * tNodeSize * 2.0;
+        // Morph window: the outer 30% of this node's distance range, which is
+        // now a PER-NODE quantity because the LOD is error-driven and there is
+        // no single distance at which a level is swapped out. aMorph.y is the
+        // distance at which this node's parent stops subdividing — i.e. the
+        // exact distance at which this node is replaced by it — so by then the
+        // node has already collapsed onto the parent's lattice and the swap is
+        // a no-op.
+        //
+        // Note the asymmetry that makes this sound: selection uses the distance
+        // to the node's BOX, which is a lower bound on the distance to any
+        // vertex in it. So when the box reaches aMorph.y the nearest vertex is
+        // exactly at the end of its window and every other vertex is already
+        // past it. The morph can finish early; it can never finish late.
+        float tMorphEnd   = aMorph.y;
+        float tMorphStart = tMorphEnd * float(${MORPH_START_FRAC});
         float tCamDist = distance(cameraPosition, position);
         float tMorph = clamp((tCamDist - tMorphStart) / max(tMorphEnd - tMorphStart, 1.0), 0.0, 1.0);
         `,
@@ -1215,7 +1583,9 @@ function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
         varying vec3 vTerrNormal;
         varying float vTerrSurfaceY;
         float tRoughOut;
+        vec3 tNormalOut;
         ${GLSL_NOISE}
+        ${GLSL_RELIEF}
         ${landcoverFetchGlsl(lcRegion, lcDetail)}
         `,
       )
@@ -1223,6 +1593,21 @@ function makeTerrainMaterial(lodK, exag, landcover, fieldTexture, rect) {
       .replace(
         '#include <roughnessmap_fragment>',
         'float roughnessFactor = tRoughOut;',
+      )
+      .replace(
+        '#include <normal_fragment_maps>',
+        /* glsl */ `
+        #include <normal_fragment_maps>
+        // The micro-relief normal, computed back in the colour block (three
+        // runs map_fragment before this) and handed over the same way
+        // tRoughOut is. viewMatrix is in three's fragment prefix and carries no
+        // scale, so it maps a world-space normal straight into view space.
+        //
+        // This OVERWRITES rather than blends: tNormalOut already starts from
+        // the interpolated geometric normal with gl_FrontFacing applied, so
+        // nothing three computed above is being thrown away.
+        normal = normalize((viewMatrix * vec4(tNormalOut, 0.0)).xyz);
+        `,
       );
   };
 
@@ -1487,6 +1872,21 @@ function terrainColourGlsl(lcRegion, lcDetail) {
     ? 'tRoughOut = 0.95;'
     : 'tRoughOut = mix(0.95, lcRough, lcOn);';
 
+  // What the ground is made of decides how much sub-metre relief it has, and
+  // the survey knows. NOT lcAmt: that is the ALBEDO modulation strength, and it
+  // is 1.0 for high-intensity development — correct for painting a street grid,
+  // exactly wrong for bump, because a car park is the flattest thing in the
+  // region. These are step functions, so each mix() is a select.
+  const lcReliefBlock = !hasLc
+    ? ''
+    : /* glsl */ `
+    float lcBump = 1.0;
+    lcBump = mix(lcBump, 0.30, lcIsDev);   // roofs, tarmac, mown verges
+    lcBump = mix(lcBump, 1.35, lcIsTree);  // conifer canopy, the roughest thing here
+    lcBump = mix(lcBump, 0.45, lcIsIce);   // firn and crevasse fields, not talus
+    lcBump = mix(lcBump, 0.0,  lcIsWater);
+    reliefAmp *= mix(1.0, lcBump, lcOn);`;
+
   const lcFinalTint = !hasLc
     ? 'col *= 0.90 + 0.20 * nMacro + grain * 0.10;'
     : // With real classes doing the work, the old macro wash only muddies them.
@@ -1600,6 +2000,72 @@ ${lcSnow}
   snowCol *= 0.93 + grain * 0.14;
   snowy = clamp(snowy, 0.0, 1.0);
   col = mix(col, snowCol, snowy);
+
+  // --- fine shading: the micro-relief normal ------------------------------
+  // See GLSL_RELIEF for why this is a normal and not more albedo noise. The
+  // amplitude is in GRADIENT units rather than metres, deliberately: what the
+  // eye reads is the slope the perturbation adds, and a metre of relief means
+  // something very different laid on a 4 m cell than on a 512 m one.
+  float reliefFade = 1.0 - smoothstep(1000.0, 3500.0, camDist);
+  // Amplitude is calibrated against the field's own gradient, which is what
+  // makes these numbers mean something. tRelief's octaves contribute
+  // 0.58*1.5/32 + 0.28*1.5/8 + 0.14*1.5/2 per metre, so |grad r| peaks near
+  // 0.19: an amplitude of 1.5 is a peak tilt of atan(0.29) ~ 16 degrees on flat
+  // rock and ~27 with the slope boost, and 0.45 gives a forested hillside about
+  // 12. Guessed values were 5x too small and the term did nothing visible —
+  // an A/B readback at 1.5 km was pixel-identical with it on and off.
+  float reliefAmp = mix(0.45, 1.50, rocky);
+  // Steep ground is broken ground: talus, ribs, gullies, slide paths.
+  reliefAmp *= 1.0 + smoothstep(0.35, 1.20, slope) * 0.8;
+  // Snowfields are smooth by comparison, and a hard bump on snow reads as
+  // static because there is no albedo variation under it to anchor it.
+  reliefAmp *= 1.0 - snowy * 0.62;
+${lcReliefBlock}
+  reliefAmp *= reliefFade;
+
+  // ONE evaluation of the height field, and the gradient comes out of the
+  // rasteriser for free. dFdx/dFdy give the screen-space rate of change of the
+  // relief AND of world position; inverting that 2x2 Jacobian turns the pair
+  // into the world-space gradient. Three noise taps became one.
+  //
+  // Measured, GPU time at 1000x562 over five cameras: the three-tap version
+  // cost up to 6.2 ms a frame on its own. This costs 0.4-1.4 ms.
+  //
+  // The second win is free antialiasing. Derivatives are evaluated per 2x2
+  // quad, so this measures the relief's slope AT THE PIXEL SCALE: detail finer
+  // than a pixel averages out and stops contributing, instead of boiling as the
+  // aircraft moves. A fixed-epsilon difference cannot do that — it samples the
+  // same 0.5 m whether a pixel covers a centimetre or ten metres.
+  //
+  // It must stay OUT of conditional flow. Derivatives inside a branch that is
+  // not uniform across the quad are undefined, and the fade is a distance test
+  // that straddles quads. Hence no branch: the fade multiplies instead.
+  float hf = 1.0 - smoothstep(180.0, 800.0, camDist);
+  float r0 = tRelief(lp, hf);
+  vec2 dwx = dFdx(wp);
+  vec2 dwy = dFdy(wp);
+  float rdx = dFdx(r0);
+  float rdy = dFdy(r0);
+  float det = dwx.x * dwy.y - dwx.y * dwy.x;
+  // Degenerate at a silhouette, where world position stops changing across the
+  // quad. Clamped rather than branched, for the reason above.
+  det = abs(det) < 1e-7 ? 1e-7 : det;
+  vec2 rg = vec2(rdx * dwy.y - rdy * dwx.y, dwx.x * rdy - dwy.x * rdx) * (reliefAmp / det);
+  // Grazing angles can still throw a large gradient out of a near-singular
+  // Jacobian; cap the tilt at ~55 degrees so nothing ever inverts.
+  float rgl = length(rg);
+  rg *= rgl > 1.4 ? 1.4 / rgl : 1.0;
+
+  // Project into the surface's own tangent plane before bending the normal, so
+  // the perturbation is the same size on a cliff as on a flat — otherwise it
+  // flattens out to nothing exactly where it is most wanted.
+  vec3 gw = vec3(rg.x, 0.0, rg.y);
+  gw -= nw * dot(nw, gw);
+  tNormalOut = normalize(nw - gw);
+  // A whisper of cavity darkening off the same field, free because r0 is
+  // already in hand. Weak on purpose: the grain term above carries the albedo
+  // half of this story and doubling it up turns the ground to grey static.
+  col *= 1.0 + (r0 - 0.5) * 0.26 * reliefAmp;
 
   ${lcFinalTint}
 
