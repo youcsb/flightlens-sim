@@ -235,6 +235,12 @@ const C_HDG_UPD = 4.1667;
 /** The bottom-centre cluster: attitude ball plus the demoted indicators. */
 const C_CLU_W = 208;
 const C_CLU_H = 124;
+
+/** Portrait cluster size. Narrower than C_CLU_W so that, centred on a 375-390px
+ *  screen, it clears the airspeed tape on the left and the altitude tape on the
+ *  right rather than sitting on top of them. */
+const C_CLU_W_PORTRAIT = 168;
+const C_CLU_H_PORTRAIT = 100;
 /** Attitude ball centre and radius inside the cluster. */
 const C_AI_CX = 56;
 const C_AI_CY = 60;
@@ -1160,13 +1166,43 @@ function compactStyleSheet(u) {
     height: calc(100vh - ${st} - ${sb} - 100px - ${P.h}px - ${C_CLU_H}px - 20px);
     max-height: ${C_TAPE_H}px; min-height: 104px;
   }
-  .${u}-w-clu { bottom: calc(${sb} + ${P.h}px + 8px); }
+  /* IN PORTRAIT THE CLUSTER GOES TO THE TOP, not the bottom.
+     The thumb reserve takes ~${P.h}px off the bottom, which pushes a
+     bottom-anchored cluster UP into the middle of the screen — exactly where
+     the chase camera frames the aeroplane. Measured at 390x844: the aeroplane
+     spans y 428-596 and the cluster landed at 452-576, sitting squarely on it.
+     Shrinking cannot fix that; the squeeze is structural, so it moves.
+
+     Under the heading strip is clear, and it is where a real PFD puts the
+     attitude indicator anyway. Narrowed to ${C_CLU_W_PORTRAIT}px so it clears
+     both tapes horizontally. */
+  .${u}-w-clu {
+    top: calc(${st} + 100px);
+    bottom: auto;
+    width: ${C_CLU_W_PORTRAIT}px;
+    height: ${C_CLU_H_PORTRAIT}px;
+  }
+  /* The tapes start below the cluster rather than beside it. */
+  .${u}-w-asi, .${u}-w-alt {
+    top: calc(${st} + 100px + ${C_CLU_H_PORTRAIT}px + 10px);
+    height: calc(100vh - ${st} - ${sb} - 100px - ${C_CLU_H_PORTRAIT}px - 10px - ${P.h}px - 16px);
+  }
 }
-/* A short landscape window cannot afford the nearest-field block; the cluster
-   scales down as a whole rather than dropping a row, because a row that is
-   sometimes there is worse than one that never is. */
+/* THE CLUSTER MUST NOT SIT ON THE AEROPLANE.
+   The chase camera frames the aircraft dead centre, and the cluster is pinned
+   bottom-centre — the same column. On a tall window there is room below the
+   aeroplane for both; on a short one there is not. Measured at iPhone landscape
+   (812x375): the aeroplane spans roughly y 189-265 and the full-size cluster
+   occupies y 245-369, overlapping it by 20px and covering the tail.
+
+   So the cluster scales with the height it actually has. It scales as a whole
+   rather than dropping a row, because a row that is sometimes there is worse
+   than one that never is. */
+@media (orientation: landscape) and (max-height: 430px) {
+  .${u}-w-clu { width: 172px; height: 98px; }
+}
 @media (orientation: landscape) and (max-height: 340px) {
-  .${u}-w-clu { width: 178px; height: 106px; }
+  .${u}-w-clu { width: 150px; height: 84px; }
 }
 `;
 }
