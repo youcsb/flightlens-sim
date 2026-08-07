@@ -50,7 +50,7 @@
  */
 
 import * as THREE from 'three';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { bakeStatic } from '../core/bakeStatic.js';
 import { clamp, DEG_TO_RAD } from '../core/units.js';
 import { texSize } from '../core/textureBudget.js';
 
@@ -1054,78 +1054,6 @@ function makeEnvironment(renderer) {
   geo.dispose();
   mat.dispose();
   return rt.texture;
-}
-
-/**
- * Bake every static mesh under `root` into one mesh per material.
- *
- * The airframe is assembled from about eighty parts, which as eighty draw
- * calls is a few milliseconds a frame spent entirely on state changes — real
- * money in a scene that also has to draw 90 km of terrain. Nothing except the
- * four control surfaces and the propeller ever moves relative to the airframe,
- * so everything else can be flattened once at load and drawn in a dozen calls.
- *
- * Anything whose `userData.animated` is set, or that lives under an animated
- * node, is left alone.
- *
- * @param {THREE.Object3D} root must be at identity when this is called
- */
-function bakeStatic(root) {
-  root.updateMatrixWorld(true);
-  const buckets = new Map();
-  const doomed = [];
-
-  const walk = (node, frozen) => {
-    const stop = frozen || node.userData.animated === true;
-    for (const child of node.children.slice()) walk(child, stop);
-    if (!node.isMesh || stop) return;
-    const g = node.geometry.clone();
-    g.applyMatrix4(node.matrixWorld);
-    // mergeGeometries requires identical attribute sets; primitives and the
-    // lofts here all carry position/normal/uv, so drop anything else rather
-    // than let one stray attribute fail the whole merge.
-    for (const name of Object.keys(g.attributes)) {
-      if (name !== 'position' && name !== 'normal' && name !== 'uv') g.deleteAttribute(name);
-    }
-    if (!g.getAttribute('normal')) g.computeVertexNormals();
-    if (!g.getAttribute('uv')) {
-      g.setAttribute('uv', new THREE.Float32BufferAttribute(
-        new Float32Array(g.getAttribute('position').count * 2), 2));
-    }
-    if (!g.index) {
-      const n = g.getAttribute('position').count;
-      g.setIndex(Array.from({ length: n }, (_, i) => i));
-    }
-    let bucket = buckets.get(node.material);
-    if (!bucket) buckets.set(node.material, (bucket = []));
-    bucket.push(g);
-    doomed.push(node);
-  };
-  walk(root, false);
-
-  const made = [];
-  for (const [material, geos] of buckets) {
-    if (geos.length < 2) {
-      for (const g of geos) g.dispose();
-      continue;
-    }
-    const merged = mergeGeometries(geos, false);
-    for (const g of geos) g.dispose();
-    if (!merged) continue;
-    const m = new THREE.Mesh(merged, material);
-    m.name = 'airframe:' + (material.name || material.uuid.slice(0, 8));
-    m.castShadow = true;
-    m.receiveShadow = true;
-    root.add(m);
-    made.push(merged);
-    for (const node of doomed) {
-      if (node.material === material) {
-        node.removeFromParent();
-        node.geometry.dispose();
-      }
-    }
-  }
-  return made;
 }
 
 // ===========================================================================

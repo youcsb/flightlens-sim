@@ -41,6 +41,7 @@ import * as THREE from 'three';
 import { llToLocal, localToLl } from '../geo/coords.js';
 import { getElevation, isWater, isLoaded } from '../geo/elevation.js';
 import { loadBuildings, buildingBudget } from '../geo/buildings.js';
+import { bakeStatic } from '../core/bakeStatic.js';
 
 const DEG = Math.PI / 180;
 
@@ -1116,12 +1117,31 @@ export function buildLandmarkModel(l) {
   if (!Number.isFinite(h) || h < MIN_VISIBLE_HEIGHT_M) return null;
 
   const builder = MODEL_BUILDERS[l.model];
-  if (builder) return builder(l);
-
+  let model;
+  if (builder) model = builder(l);
   // No explicit model: fall back on kind, then on a plain building.
-  if (l.kind === 'stadium') return buildStadiumBowl(l);
-  if (l.kind === 'bridge') return buildGirderBridge(l);
-  return buildGenericTower(l);
+  else if (l.kind === 'stadium') model = buildStadiumBowl(l);
+  else if (l.kind === 'bridge') model = buildGirderBridge(l);
+  else model = buildGenericTower(l);
+
+  /*
+   * FLATTEN IT. Every model above is assembled from primitives that never move
+   * relative to each other — every rotation in this file is set once, here, at
+   * build time — so each one can be drawn as one mesh per material instead of
+   * one per part.
+   *
+   * This is the whole reason the phone was over its draw-call budget. Measured
+   * at phone tier over downtown: the landmarks group cost 96 calls of a 120
+   * budget for only 99k triangles, and the city was not to blame — chunk
+   * merging already folds 23,979 footprints into 26 meshes. It was these: about
+   * 120 meshes across 20 models, the Space Needle 19 of them on its own and the
+   * Tacoma Narrows Bridge another 19.
+   *
+   * Safe here because the model is still at identity and unplaced;
+   * geo/landmarks.js positions it afterwards.
+   */
+  if (model) bakeStatic(model);
+  return model;
 }
 
 // ---------------------------------------------------------------------------
