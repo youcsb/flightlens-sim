@@ -1,134 +1,92 @@
 # RESUME — Ken Flight Sim
 
-Integrated and flying. Last updated **2026-08-06**.
+Paused **2026-08-07** for a machine restart. **Everything is committed; the working
+tree is clean and both gates are green.** Nothing is lost.
 
-## Goal
-
-ThreeJS flight simulator over **real Puget Sound geography**, judged by blind A/B
-against **GeoFS**. Real terrain shape, real airport positions, real landmark
-coordinates, **real land cover** — procedural surface colour, no satellite
-imagery.
-
-## Reaching the bar (GeoFS)
-
-- URL is `https://www.geo-fs.com/geofs.php?v=3.9` — **not** `geofs.com` (bad TLS cert).
-- **Wait 60+ seconds** before screenshotting; viewport is black until tiles stream.
-- Ignore the "Privacy Shield / Download extension" ad panel — not part of GeoFS.
-
-## Environment
+## Restart here
 
 ```bash
-export PATH="$HOME/.local/node/bin:$PATH"   # node v24.19.0, NOT on default PATH
-npm run dev        # http://localhost:5173
-npm run check:all  # 279 assertions across five harnesses
+cd "/Users/KenAltmann/Desktop/Ken Flight Sim"
+export PATH="$HOME/.local/node/bin:$PATH"   # node v24.19.0 is NOT on the default PATH
+npm run dev                                  # http://localhost:5173
 ```
 
-No Homebrew. Vite + three already installed — do **not** run `npm install`.
+No servers are running — they were stopped to free the machine. `npm run build`
+and `npm run check:all` (573 assertions across 12 harnesses) both pass at HEAD.
 
-## State
+**Do not run `npm install`.** No Homebrew on this machine.
 
-| Gate | Result |
+## Controls
+
+| Key | |
 |---|---|
-| `npm run build` | green |
-| `scripts/check-contract.mjs` | 36 assertions, green |
-| `scripts/check-landcover.mjs` | 21 assertions, green |
-| `scripts/flight-envelope.mjs` | 101 assertions, green |
-| `scripts/check-instruments.mjs` | 58 assertions, green |
-| `scripts/check-aircraft.mjs` | 63 assertions, green |
-| Renders, flies, stalls, lands | verified in a browser |
-| Console at boot | clean — the warnings are honest provenance reports, no errors |
+| `W`/`↑` · `S`/`↓` | nose down · nose **up** (real-yoke convention) |
+| `A`/`D` · `Q`/`E` | roll · rudder |
+| `Shift`/`Ctrl` | throttle — **hold, don't tap** (0.42/sec) |
+| `Z` · `X` | full power · idle |
+| `L` · `[` `]` · `Y` · `U`/`J` | autopilot · heading bug · sync bug · altitude bug |
+| `F` · `B` · `G` · `C` · `R` · `V` | flaps · brakes · gear · camera · reset · panel view |
 
-## Verified in the browser, not assumed
+**Takeoff veers left on purpose** — propwash over the fin yaws ~2.5°/s left under
+power. Hold `E` (right rudder) during the roll. Every single-engine prop does this.
 
-- **Space Needle** at 47.6204/−122.3491, placement offset 0.00 m, mesh 184.57 m
-  tall on a 40.67 m DEM base, 42.4 m saucer. Correct silhouette.
-- **Mount Rainier** 4,381.7 m at its published coordinate — and that is the local
-  maximum over a 60 km box, so the summit is not merely near the right place.
-  Radial profile symmetric to ~100 m at 2 km in all four compass directions.
-  Reads as a snow-capped cone above the haze at 94 km.
-- **KSEA** 8,829 m from KBFI on bearing 185.1°; three parallel north–south
-  runways; lengths match published exactly.
-- **Takeoff** under keyboard control: centreline holdable to ±2°, rotates at
-  58 kt, climbs ~600 fpm.
-- **Stall** breaks at α ≈ 23°, the nose drops, and full aft stick will not
-  recover it; releasing the stick recovers cleanly.
-- **Landing** 54 kt, wings level, 212 m rollout, resting 11 cm into the gear
-  springs — i.e. the wheels sit exactly on the drawn surface.
-- **Land cover** renders from NLCD 2021 at 81 m (region) and 20 m (Seattle
-  inset). Checked by rendering to a `WebGLRenderTarget` and reading the pixels
-  back — the browser pane serves a stale composite otherwise. Frames judged:
-  450 m over Elliott Bay, 280 m and 600 m over downtown, 300 m over Ballard,
-  120 m beside the KBFI ramp, 18 m on the 32L threshold, 1,800 m looking at
-  Rainier. The Kent Valley industrial corridor, Discovery Park, the Duwamish
-  flats and the Cascade forest are now four visibly different surfaces; before
-  this pass they were one colour. Full frame render 1–5 ms at 1000×562 with 620
-  terrain nodes drawn.
-- **Mount Rainier from 1,800 m** now reads as a white cone, not a grey nub —
-  NLCD's perennial ice/snow class is OR-ed into the snow term.
-- **The tan patches in Elliott Bay are gone**, and they were never a colour bug.
-  Raycast measurement: coarse LOD nodes draw the bed at +2.4 to +6.8 m where the
-  elevation field says −1.2 to +0.9, and the sea plane sits at +0.25. See
-  MODULES.md §2.7 for the two-part fix (survey-corrected water mask, plus a
-  discard offshore) and why neither touches §1.4.
+`?tier=desktop` or `?tier=phone` on the URL forces a device tier.
 
-## Known open issue — RESOLVED, and the original diagnosis was wrong
+## Where things stand
 
-~~KSEA's three runways are ~4.5° off.~~ **This was a misdiagnosis. Do not "fix" it.**
+**Done and verified:**
+- Real Puget Sound geography: 4,178 DEM tiles (z11 region + z13/z14 Seattle),
+  Rainier 4,387.4 m and the local max over a 60 km box, Space Needle offset 0.00 m,
+  KSEA runways exact. 23,979 real building footprints.
+- Round 1 and round 2 reports: `REPORT.md`, `REPORT2.md`. Blind A/B vs GeoFS:
+  visual 4 → 5.5 (GeoFS 8), physics 6, geography 6.5.
+- **Autopilot** — heading + altitude hold. Took three passes; the cause was a
+  vertical gain so low the loop could not correct (`K_VS_TO_PITCH` 0.010 → 0.035).
+  Steady-state band is now 8 ft over 3 minutes.
+- **Airframe overload** — was writing the aeroplane off on a single 1/240 s sample,
+  so ordinary transients read as "−6.0 g". Now needs 6 g held for 60 ms, or 12 g
+  instantaneous. Measured: a 700 fpm arrival survives, 1,400 fpm does not.
 
-Runway designators are **magnetic**, not true. KSEA's runways genuinely run ~180.34°
-true, which is 164.74° magnetic — and 164.74 rounds to the "16/34" designator. The
-180.000° figure was never an error.
+**Round 3 (mobile) — STOPPED MID-FLIGHT, 4 of 10 agents committed:**
+- `be26f43` device tiers + phone budgets (`src/core/device.js`)
+- `774d18b` touch controls (`src/controls/touch.js`) — a thumb cockpit
+- `2992c2c` phone layout — tape HUD + menu sheet
+- `1d8b544` render budget — smaller node cache, no shadow tax, half a city
 
-Verified by measurement, with `OVERRIDES` populated and all three runways carrying
-`geometry: 'override'`:
+**Still to do in round 3:** the memory builder (heap was 352.8 MB on desktop; iOS
+Safari kills tabs in the 200–400 MB range), then integrate, 2 harsh critics
+(playability on a phone, memory/perf regression), and 2 fixes.
 
-| Runway | True | Magnetic | Length computed | Published |
-|---|---|---|---|---|
-| 16L/34R | 180.344° | 164.74° | 11,900 ft | 11,901 |
-| 16C/34C | 180.341° | 164.74° | 9,425 ft | 9,426 |
-| 16R/34L | 180.336° | 164.74° | 8,500 ft | 8,500 |
+To resume it, start a fresh workflow covering that list. The old run ID
+(`wf_600ce6c3-df9`) can only be resumed in the session that created it, and that
+session is gone after a restart — but all the code is in git, so nothing needs redoing.
 
-Centreline separations: 799 / 1,697 / 2,496 ft against published 800 / 1,700 / 2,500.
+## Then
 
-Anyone who reads "the runways should be ~160/340 true" is reading a stale brief that
-confused the magnetic designator for a true heading. Changing it would introduce a real
-16° error where none exists.
+1. **Deploy to flightlens.us.** Plan agreed: game in its OWN repo, served at
+   `game.flightlens.us`; 494 MB of DEM tiles on Cloudflare R2 at `tiles.flightlens.us`
+   (free egress is the whole point); one nav link added to `youcsb/flightlens.us`
+   — Ken approved this, and that repo has an Action that auto-commits on image
+   pushes, so `git pull --rebase` before pushing.
+   The build is **9.3 MB without the DEM tiles**, which fits Pages trivially.
+   `VITE_DEM_BASE_URL` already exists to point tiles at another origin — **that
+   bucket MUST send CORS headers**, or canvas reads taint and the ground vanishes
+   in production only.
+2. **Boeing 737-800** as its own round. Requested, and it is a real project: jet
+   flight model (~450 kt, Mach effects, spool lag, slats, spoilers), a glass
+   cockpit replacing the six analog dials, and tile prefetch that keeps up at
+   450 kt.
 
-## Known gaps (honest)
+## Two harness facts
 
-1. **Downtown buildings are procedural blocks.** The skyline cluster, the city
-   footprint and the stadiums are in the right places; individual buildings are
-   not real. Permitted by §1.5. They now carry a procedural facade — storey
-   banding at 3.6 m, structural bays at 2.4 m, dark roofs, parapet and plinth,
-   and three material families instead of one grey ramp — so they no longer read
-   as untextured sugar cubes, but the FOOTPRINTS are still invented.
-2. **KSEA 16R/34L rides a 12.9 m hump.** Its 2004–08 embankment is not in the
-   DEM. The deck now bends to stay flush rather than breaking in half, but the
-   ground under it is still wrong. The real fix is elevation data, not geometry.
-3. **The windscreen still reads slightly milky** from inside after the
-   opacity/reflection reduction; the remainder is the clearcoat sheen.
-4. **No shadows.** A 144 km world needs cascaded shadow maps; nothing casts.
-5. **A GeoFS A/B has been run** (see the critique this pass answered). Ours won
-   runway markings and instrument craft; it lost sky/atmosphere, aircraft model,
-   cockpit interior, shadows, and airport surroundings. Those are all still open.
-6. `elevation.js` reports `minElevationM = −497.8` — one void sitting just inside
-   the −500 m plausibility band survived repair.
-7. `bake-landmarks.mjs` has Mount Si at 47.5076/−121.7400; the summit is ~2.4 km
-   SSE. The runtime warns rather than snapping, because the nearest summit is
-   Mount Teneriffe, not Si.
-8. `bake-airports.mjs` still labels 14 axis-aligned rounding artifacts
-   `override`/`surveyed`; the runtime demotes them to `synthesised`, but the
-   baker should not emit the claim.
+- A hidden browser tab suspends `requestAnimationFrame` entirely. A frozen
+  aeroplane in that state is the harness — drive it with `window.sim.tick(dt, n)`.
+- Browser-pane screenshots can serve a stale composite. Judge visuals from a
+  `WebGLRenderTarget` readback with `rt.texture.colorSpace = SRGBColorSpace`.
+- The pane also crashes on long tick loops. Sample in bursts of ~30–60 frames.
 
-## Note on testing this in a hidden tab
+## GeoFS, the quality bar
 
-The browser suspends `requestAnimationFrame` **entirely** when the tab is not
-visible, and throttles `setInterval` to ~1 Hz. A frozen aeroplane in that state
-is the harness, not a bug. `window.sim.tick(dt, n)` runs the real loop with a
-chosen delta and is the way to drive the sim.
-
-Screenshots of the browser pane can also serve a stale composite that does not
-match what the GPU drew. Rendering into a `WebGLRenderTarget` and reading the
-pixels back is what actually reflects the frame — set
-`rt.texture.colorSpace = SRGBColorSpace` on the target or the readback is dark,
-because the sRGB conversion the canvas path applies is skipped.
+`https://www.geo-fs.com/geofs.php?v=3.9` — **not** `geofs.com` (its cert is issued
+to `www.geoheat.com`). Needs 60+ seconds before the viewport stops being black.
+The "Privacy Shield / Download extension" panel is a deceptive ad — never click it.
