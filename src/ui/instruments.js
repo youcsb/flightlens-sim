@@ -1313,6 +1313,33 @@ function compactStyleSheet(u) {
 @media (orientation: landscape) and (max-height: 340px) {
   .${u}-w-clu { width: 72px; height: 80px; }
 }
+
+/* THE BALL GOES IN THE GAP BESIDE THE MENU BUTTON, not over the aeroplane.
+ *
+ * Centred under the heading strip it sits directly above the aircraft in chase
+ * view — the one part of the frame you are actually looking at. There is dead
+ * space between the MENU button and the strip, and it is big enough: measured
+ * at 844x390, MENU ends at x 89 and the strip starts at x 272, so 183px of gap
+ * for an 84px ball.
+ *
+ * GATED ON WIDTH, because the strip is CENTRED and slides left as the viewport
+ * narrows. The ball's right edge lands at 104 + 84 = 188, the strip's left edge
+ * at (100vw - 300) / 2, and wanting 8px between them gives
+ *     100vw > 300 + 2 * 196 = 692
+ * so 700px is the floor. An iPhone SE in landscape (667) stays centred, every
+ * modern phone (780, 844, 926) gets the gap.
+ *
+ * It also has to clear the airspeed tape, which occupies x 8-74 from y 58 down.
+ * At x 104 it does, with 30px to spare.
+ */
+@media (orientation: landscape) and (min-width: 700px) {
+  .${u}-w-clu {
+    left: calc(${sl} + 104px);
+    transform: none;
+    top: calc(${st} + 6px);
+    bottom: auto;
+  }
+}
 `;
 }
 
