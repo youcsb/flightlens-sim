@@ -504,6 +504,84 @@ function capture(startFt, bugOffsetFt, seconds, thr = 0.65) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// FRAME-RATE INDEPENDENCE. The gap that let the oscillation survive four
+// reports and three "fixes".
+//
+// The flight model integrates at a fixed 1/240 s. The autopilot used to be
+// called once per frame with the wall-clock delta, so it closed a loop around a
+// 240 Hz plant at the browser's frame rate — and a controller sampled too slowly
+// for its plant oscillates, whatever its gains.
+//
+// It hid because EVERY test here ran at DT = 1/60, and every manual browser
+// probe drove the sim through window.sim.tick(1/60, n) — the same fixed step.
+// The harness agreed with the probes and both disagreed with the game, because
+// a hidden tab never runs requestAnimationFrame and the live loop was never
+// actually observed.
+//
+// These assertions run the SAME manoeuvre at wildly different frame rates and
+// require the same result. That is the property that was missing.
+// ---------------------------------------------------------------------------
+console.log('\nautopilot — frame-rate independence');
+
+/** Fly a fixed-duration hold at a given frame rate, returning the envelope. */
+function holdAtFps(fps, seconds, jitter = 0) {
+  const rng = makeRng(4242);
+  const flight = airborne(0, 3000);
+  const ap = createAutopilot();
+  ap.toggle(flight.state);
+  const nominal = 1 / fps;
+  let t = 0;
+  let lo = Infinity, hi = -Infinity, rev = 0, last = 0;
+  let pLo = Infinity, pHi = -Infinity;
+  while (t < seconds) {
+    const dt = jitter ? nominal * (1 + (rng() - 0.5) * 2 * jitter) : nominal;
+    const inputs = { pitch: 0, roll: 0, yaw: 0, throttle: 0.75, flaps: 0, brakes: 0, gear: 1 };
+    ap.update(dt, flight.state, inputs);
+    flight.step(dt, inputs, GROUND_M);
+    t += dt;
+    if (t > 30) {
+      const s = flight.state;
+      lo = Math.min(lo, s.altitudeFt); hi = Math.max(hi, s.altitudeFt);
+      pLo = Math.min(pLo, s.pitchDeg); pHi = Math.max(pHi, s.pitchDeg);
+      const g = Math.sign(s.verticalSpeedFpm);
+      if (g && last && g !== last) rev += 1;
+      if (g) last = g;
+    }
+  }
+  return { altBand: hi - lo, pitchBand: pHi - pLo, reversals: rev, alt: flight.state.altitudeFt };
+}
+
+const RATES = [144, 60, 30, 20, 15];
+const results = RATES.map((f) => ({ fps: f, ...holdAtFps(f, 150) }));
+for (const r of results) {
+  ok(
+    `holds altitude at ${r.fps} fps`,
+    r.altBand < 60 && r.reversals < 25,
+    `band ${r.altBand.toFixed(0)} ft, ${r.reversals} reversals, pitch ${r.pitchBand.toFixed(2)} deg`,
+  );
+}
+{
+  // The real requirement: the SAME behaviour at every rate. A loop whose
+  // response depends on frame rate is the bug, even if each rate is stable.
+  const bands = results.map((r) => r.altBand);
+  const spread = Math.max(...bands) - Math.min(...bands);
+  ok(
+    'behaviour does not depend on frame rate',
+    spread < 45,
+    `altitude band spread across 15-144 fps: ${spread.toFixed(0)} ft`,
+  );
+}
+{
+  // And with jitter on top, which is what a real browser actually delivers.
+  const r = holdAtFps(30, 150, 0.6); // 30 fps +/- 60%
+  ok(
+    'holds altitude at 30 fps with +/-60% jitter',
+    r.altBand < 80 && r.reversals < 30,
+    `band ${r.altBand.toFixed(0)} ft, ${r.reversals} reversals`,
+  );
+}
+
 console.log('\nautopilot — engage rules and disconnect');
 
 {

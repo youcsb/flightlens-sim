@@ -132,6 +132,75 @@ const RATE_TAU = 0.08;
 const RATE_MIN_DT = 1 / 240;
 
 /**
+ * Fixed control-law step, seconds. THE AUTOPILOT SUBSTEPS, exactly like the
+ * flight model, and for the same reason.
+ *
+ * WHY THIS EXISTS — it is the actual cause of the oscillation reported four times.
+ *
+ * The flight model integrates at a fixed 1/240 s. The autopilot was called ONCE
+ * PER FRAME with the wall-clock delta, so it closed a loop around a 240 Hz plant
+ * at whatever rate the browser happened to be rendering: 60 Hz on a good frame,
+ * far less on a bad one, and never constant. A controller sampled too slowly for
+ * its plant accumulates phase lag, and phase lag is what turns damping into
+ * oscillation. Raising K_VS_TO_PITCH made it WORSE — more gain at the same phase
+ * margin is less stable, not more.
+ *
+ * This hid for so long because every test ran at a regular DT = 1/60 and every
+ * browser probe drove the sim through window.sim.tick(1/60, n) — the same fixed
+ * step. Harness and probes agreed with each other and both disagreed with the
+ * game, because a hidden tab never runs requestAnimationFrame, so the live loop
+ * was never once observed.
+ *
+ * Substepping at a fixed 120 Hz makes the response identical at 15 fps and at
+ * 144 fps, which is the only way this is testable at all.
+ */
+const AP_STEP_MAX_S = 1 / 30;
+
+/**
+ * Slew limit on the commanded surfaces, full-deflection units per second.
+ *
+ * This is what actually bounds the oscillation at a low frame rate. Phase lag
+ * from slow sampling is unavoidable — a 15 Hz controller on a 240 Hz plant WILL
+ * lag — but lag only becomes a violent oscillation if the controller is allowed
+ * to slam the surface between samples. Limiting how fast the command may move
+ * turns an unstable loop into a sluggish one, which is the right trade: a
+ * sluggish autopilot is usable, an oscillating one is not.
+ *
+ * 2.5 means the elevator can travel its full range in 400 ms, comfortably
+ * faster than any manoeuvre this aeroplane makes and far slower than the
+ * frame-to-frame slamming measured at 15 fps (pitch swinging 30 degrees).
+ */
+const CMD_SLEW_PER_S = 2.5;
+
+/**
+ * Sample period the gains are tuned for, and the floor the loop is de-tuned to
+ * when it cannot be sampled that fast.
+ *
+ * A PD loop is only stable up to a sample period set by its gains. The rate
+ * estimate lags by roughly half a sample, so as the period grows that lag eats
+ * the phase margin and the damping term stops damping and starts EXCITING —
+ * measured here as 240 vertical-speed reversals and 22 degrees of pitch swing
+ * at 20 fps, against 0 reversals and 0.13 degrees at 60.
+ *
+ * Slew limiting alone did not fix it (21.7 deg, still oscillating) because it
+ * bounds the command's SPEED, not the loop's phase. The gains themselves have
+ * to come down. Scaling P and D by (reference period / actual period) is the
+ * standard answer: full authority at 60 fps and above, quartered by 15 fps.
+ * The result is a sluggish autopilot on a slow machine rather than an
+ * oscillating one, which is the correct trade.
+ *
+ * The integral term is NOT scaled — it already multiplies by dt, so it is
+ * sample-rate correct by construction.
+ */
+const TUNE_REF_DT = 1 / 60;
+const TUNE_MIN = 0.25;
+
+/** Smoothing for the frame-time estimate the de-tune is based on. Using the
+ *  instantaneous delta would let jitter modulate the gains frame to frame,
+ *  which is its own source of roughness. */
+const DT_FILTER_TAU = 0.5;
+
+/**
  * Airspeed protection, knots.
  *
  * THIS AUTOPILOT HAS NO AUTOTHROTTLE, exactly like the real units fitted to
@@ -222,6 +291,18 @@ export function createAutopilot() {
   let pitchRateF = 0;
   let rollRateF = 0;
 
+  /** Fixed-step accumulator, and the commands the last control step produced.
+   *  update() re-applies these every frame; controlStep() recomputes them at a
+   *  constant AP_STEP_S regardless of frame rate. */
+  let cmdRoll = 0;
+  let cmdPitch = 0;
+  /** What was actually written to the controls, after slew limiting. */
+  let appliedRoll = 0;
+  let appliedPitch = 0;
+  /** Smoothed frame time, and the gain scale derived from it. */
+  let dtF = 0;
+  let tuneScale = 1;
+
   /** Why we last disengaged, for the HUD to show. */
   let lastReason = '';
 
@@ -231,6 +312,12 @@ export function createAutopilot() {
     haveRates = false;
     pitchRateF = 0;
     rollRateF = 0;
+    cmdRoll = 0;
+    cmdPitch = 0;
+    appliedRoll = 0;
+    appliedPitch = 0;
+    dtF = 0;
+    tuneScale = 1;
   }
 
   function disengage(why) {
@@ -315,7 +402,54 @@ export function createAutopilot() {
         return disengage('pilot input');
       }
 
-      const d = dt > 0 && dt < 0.5 ? dt : 1 / 60;
+      // --- one control step per frame, with a bounded step and a slew limit --
+      //
+      // ONE step, not several. `state` is only refreshed once per frame by
+      // flight.step(), so running the law repeatedly against it would read a
+      // zero attitude rate — no damping at all — while winding the integrator
+      // up once per substep. That was measurably worse than doing nothing.
+      //
+      // Instead the step is CLAMPED, so a very long frame advances the
+      // integrator by at most AP_STEP_MAX_S, and the resulting command is
+      // SLEW-LIMITED, which is what actually stops a slow sample rate turning
+      // into a violent oscillation. See CMD_SLEW_PER_S.
+      const frame = dt > 0 && dt < 0.5 ? dt : 1 / 60;
+      const d = Math.min(frame, AP_STEP_MAX_S);
+
+      // Smoothed frame time drives the de-tune, so jitter does not modulate the
+      // gains. Seeded on the first frame rather than ramping up from zero.
+      dtF = dtF > 0 ? dtF + (frame - dtF) * (1 - Math.exp(-frame / DT_FILTER_TAU)) : frame;
+      tuneScale = clamp(TUNE_REF_DT / Math.max(dtF, TUNE_REF_DT), TUNE_MIN, 1);
+
+      controlStep(d, state);
+
+      const maxMove = CMD_SLEW_PER_S * frame;
+      appliedRoll += clamp(cmdRoll - appliedRoll, -maxMove, maxMove);
+      appliedPitch += clamp(cmdPitch - appliedPitch, -maxMove, maxMove);
+
+      inputs.roll = appliedRoll;
+      inputs.pitch = appliedPitch;
+      inputs.yaw = 0;
+    },
+
+    status() {
+      return {
+        engaged,
+        headingBug,
+        altitudeBug,
+        lastReason,
+      };
+    },
+  };
+
+  /**
+   * One fixed-rate pass of the control law. Writes cmdRoll / cmdPitch, which
+   * update() then applies to `inputs` every frame.
+   *
+   * @param {number} d fixed step, seconds — always AP_STEP_S
+   * @param {Object} state flight-model state
+   */
+  function controlStep(d, state) {
 
       // Differentiate attitude for the damping terms. The model publishes no
       // angular rates, so we keep our own. First frame after engage has no
@@ -347,8 +481,7 @@ export function createAutopilot() {
       const bankErr = bankTarget - rollDeg;
 
       bankI = clamp(bankI + bankErr * d * K_BANK_I, -BANK_I_CLAMP, BANK_I_CLAMP);
-      const rollCmd = bankErr * K_BANK_P + bankI - rollRate * K_BANK_D;
-      inputs.roll = clamp(rollCmd, -1, 1);
+      cmdRoll = clamp((bankErr * K_BANK_P - rollRate * K_BANK_D) * tuneScale + bankI, -1, 1);
 
       // --- vertical: altitude -> vertical speed -> elevator ------------------
       const altErr = altitudeBug - (state.altitudeFt ?? 0);
@@ -397,8 +530,8 @@ export function createAutopilot() {
       const pitchErr = pitchTarget - pitchDeg;
       pitchI = clamp(pitchI + pitchErr * d * K_PITCH_I, -PITCH_I_CLAMP, PITCH_I_CLAMP);
 
-      inputs.pitch = clamp(
-        pitchErr * K_PITCH_P + pitchI - pitchRate * K_PITCH_D,
+      cmdPitch = clamp(
+        (pitchErr * K_PITCH_P - pitchRate * K_PITCH_D) * tuneScale + pitchI,
         -1,
         1,
       );
@@ -406,17 +539,7 @@ export function createAutopilot() {
       // Rudder: hold it neutral. The airframe already models adverse yaw and a
       // slipstream term; adding an uncalibrated coordination term on top of
       // those made it worse in testing, so the autopilot flies with its feet
-      // on the floor and accepts a little slip in the turn.
-      inputs.yaw = 0;
-    },
-
-    status() {
-      return {
-        engaged,
-        headingBug,
-        altitudeBug,
-        lastReason,
-      };
-    },
-  };
+      // on the floor and accepts a little slip in the turn. update() writes
+      // inputs.yaw = 0 every frame.
+  }
 }
