@@ -239,8 +239,15 @@ const C_CLU_H = 124;
 /** Portrait cluster size. Narrower than C_CLU_W so that, centred on a 375-390px
  *  screen, it clears the airspeed tape on the left and the altitude tape on the
  *  right rather than sitting on top of them. */
-const C_CLU_W_PORTRAIT = 168;
-const C_CLU_H_PORTRAIT = 100;
+/* Portrait shows the ball only (see applyCluCrop), so the wrapper is sized to
+   the ball's own 112-unit column rather than the full 208-unit cluster.
+   THE ASPECT RATIO IS THE CROP. With 'slice' the scale is max(w/208, h/124),
+   and the visible width in viewBox units is w/scale. At 112x112 height wins,
+   scale is 112/124 = 0.903, and 124 units show — which leaks the first 12 units
+   of the demoted column down the right edge. At 112x124 the scale is exactly 1
+   and precisely 112 units show: the ball, and nothing else. */
+const C_CLU_W_PORTRAIT = 112;
+const C_CLU_H_PORTRAIT = 124;
 /** Attitude ball centre and radius inside the cluster. */
 const C_AI_CX = 56;
 const C_AI_CY = 60;
@@ -1110,7 +1117,53 @@ function buildCompact(u) {
   add(`${u}-w-hdg`, `${C_HDG_W} ${C_HDG_H}`, C_HDG_W, C_HDG_H, cHeading(u));
   add(`${u}-w-asi`, `${C_ASI_W} ${C_TAPE_H}`, C_ASI_W, C_TAPE_H, cAirspeed(u));
   add(`${u}-w-alt`, `${C_ALT_W} ${C_TAPE_H}`, C_ALT_W, C_TAPE_H, cAltitude(u));
-  add(`${u}-w-clu`, `${C_CLU_W} ${C_CLU_H}`, C_CLU_W, C_CLU_H, cCluster(u), 'xMidYMid meet');
+  const cluBox = add(
+    `${u}-w-clu`,
+    `${C_CLU_W} ${C_CLU_H}`,
+    C_CLU_W,
+    C_CLU_H,
+    cCluster(u),
+    'xMidYMid meet',
+  );
+
+  /**
+   * PORTRAIT SHOWS THE BALL ONLY.
+   *
+   * The cluster is an attitude ball plus what this file calls the demoted
+   * column — RPM, flaps, gear/brake lamps, nearest field — and in portrait the
+   * whole thing sits under the heading strip, in the windscreen. Reported as
+   * "the gauge under the compass is too in the way", and it is: 168 x 100 on a
+   * 390 px screen is 43% of the width, parked exactly where you look when the
+   * aeroplane is banked over.
+   *
+   * The column is the half worth losing on a phone. FLAP and BRK are already
+   * touch buttons that show their own state, and the throttle slider carries
+   * its percentage — so the only things actually lost are RPM and the nearest
+   * field, both of which are in the menu sheet.
+   *
+   * Rather than build a second SVG (which would duplicate every element id the
+   * updater writes to) the same viewBox is CROPPED: 'xMinYMid slice' scales to
+   * cover and keeps the left edge, so a square wrapper shows the ball and cuts
+   * the column off. One attribute, switched with the orientation.
+   */
+  const cluSvg = cluBox.firstElementChild;
+  const portraitMq =
+    typeof window !== 'undefined' && window.matchMedia
+      ? window.matchMedia('(orientation: portrait)')
+      : null;
+  const applyCluCrop = () => {
+    if (!cluSvg) return;
+    const portrait = portraitMq ? portraitMq.matches : false;
+    cluSvg.setAttribute(
+      'preserveAspectRatio',
+      portrait ? 'xMinYMid slice' : 'xMidYMid meet',
+    );
+  };
+  applyCluCrop();
+  if (portraitMq) {
+    if (portraitMq.addEventListener) portraitMq.addEventListener('change', applyCluCrop);
+    else if (portraitMq.addListener) portraitMq.addListener(applyCluCrop);
+  }
 
   // The stall banner is plain DOM: it is a word on a red field that blinks, and
   // an SVG for that would cost a viewBox and buy nothing.
@@ -1232,6 +1285,9 @@ function compactStyleSheet(u) {
      Under the heading strip is clear, and it is where a real PFD puts the
      attitude indicator anyway. Narrowed to ${C_CLU_W_PORTRAIT}px so it clears
      both tapes horizontally. */
+  /* Square, and only as wide as the ball — see applyCluCrop(). The crop is what
+     removes the demoted column; this is what stops the wrapper reserving space
+     for it. */
   .${u}-w-clu {
     top: calc(${st} + 100px);
     bottom: auto;
