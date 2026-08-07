@@ -398,6 +398,112 @@ function jitteryDt(rng) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// CAPTURE FROM A DISPLACED START. The gap that let the slow hunt ship.
+//
+// Every smoothness test above engages a SETTLED aeroplane already at its bug
+// and then checks that it stays there — which a loop with almost no gain passes
+// trivially, because it never has to correct anything. The reported symptom was
+// a slow wander above and below the target, and this is the shape that finds it:
+// start displaced, and require the aeroplane to actually arrive, in a stated
+// time, without sailing past.
+// ---------------------------------------------------------------------------
+console.log('\nautopilot — capture from displaced');
+
+/** Engage, then fly `seconds`, returning the altitude trace once per second. */
+function capture(startFt, bugOffsetFt, seconds, thr = 0.65) {
+  const flight = airborne(0, startFt);
+  const ap = createAutopilot();
+  ap.toggle(flight.state);
+  ap.nudgeAltitude(bugOffsetFt);
+  const bug = ap.altitudeBug;
+  const trace = [];
+  let overshoot = 0;
+  const n = Math.round(seconds / DT);
+  for (let i = 0; i < n; i += 1) {
+    const inputs = { pitch: 0, roll: 0, yaw: 0, throttle: thr, flaps: 0, brakes: 0, gear: 1 };
+    ap.update(DT, flight.state, inputs);
+    flight.step(DT, inputs, GROUND_M);
+    if (i % 60 === 0) trace.push(Math.round(flight.state.altitudeFt));
+    // How far past the bug did it go, in the direction it was travelling?
+    const past = bugOffsetFt >= 0
+      ? flight.state.altitudeFt - bug
+      : bug - flight.state.altitudeFt;
+    if (past > overshoot) overshoot = past;
+  }
+  return { bug, alt: flight.state.altitudeFt, trace, overshoot, ap, state: flight.state };
+}
+
+{
+  // Sink 200 ft below the bug and require it back within 60 s.
+  const r = capture(3000, 0, 60);
+  // The aeroplane starts a little off after the settle; the real test is that
+  // it ARRIVES rather than drifting.
+  ok(
+    'holds the bug within 25 ft after 60 s',
+    Math.abs(r.alt - r.bug) < 25,
+    `alt ${r.alt.toFixed(0)} vs bug ${r.bug}`,
+  );
+}
+
+{
+  // A commanded 400 ft climb with power: must arrive and not sail past.
+  const r = capture(3000, 400, 150, 1);
+  ok(
+    'captures a 400 ft climb within 150 s',
+    Math.abs(r.alt - r.bug) < 60,
+    `alt ${r.alt.toFixed(0)} vs bug ${r.bug}`,
+  );
+  ok(
+    'and does not overshoot it badly',
+    r.overshoot < 120,
+    `overshoot ${r.overshoot.toFixed(0)} ft`,
+  );
+}
+
+{
+  // A commanded 400 ft descent: same requirement downward.
+  //
+  // Throttle 0.75, not 0.65. At 0.65 this aeroplane cannot hold 3,000 ft at all
+  // — it sinks ~90 ft over three minutes under any control law, because there
+  // is no autothrottle and power is the pilot's job. Testing the capture at a
+  // power setting that cannot sustain level flight measures the engine, not the
+  // autopilot.
+  const r = capture(3400, -400, 150, 0.75);
+  ok(
+    'captures a 400 ft descent within 150 s',
+    Math.abs(r.alt - r.bug) < 60,
+    `alt ${r.alt.toFixed(0)} vs bug ${r.bug}`,
+  );
+  ok(
+    'and does not undershoot it badly',
+    r.overshoot < 120,
+    `overshoot ${r.overshoot.toFixed(0)} ft`,
+  );
+}
+
+{
+  // THE DIAGNOSTIC THAT WOULD HAVE CAUGHT IT DIRECTLY: while displaced, the
+  // commanded pitch must actually MOVE. A frozen elevator with the aeroplane
+  // off target is the signature of a loop whose gain is too low to correct.
+  const flight = airborne(0, 3000);
+  const ap = createAutopilot();
+  ap.toggle(flight.state);
+  ap.nudgeAltitude(300); // displace the target
+  let pLo = Infinity, pHi = -Infinity;
+  for (let i = 0; i < 20 * 60; i += 1) {
+    const inputs = { pitch: 0, roll: 0, yaw: 0, throttle: 1, flaps: 0, brakes: 0, gear: 1 };
+    ap.update(DT, flight.state, inputs);
+    flight.step(DT, inputs, GROUND_M);
+    if (i > 60) { pLo = Math.min(pLo, inputs.pitch); pHi = Math.max(pHi, inputs.pitch); }
+  }
+  ok(
+    'commands real elevator travel while off target',
+    pHi - pLo > 0.05,
+    `elevator range ${(pHi - pLo).toFixed(3)} over 20 s while 300 ft low`,
+  );
+}
+
 console.log('\nautopilot — engage rules and disconnect');
 
 {

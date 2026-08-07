@@ -86,8 +86,28 @@ const K_ALT_TO_VS = 2.2;
  * an attitude, which is a request the aeroplane can satisfy without overshoot.
  */
 
-/** Degrees of pitch commanded per fpm of vertical-speed error. */
-const K_VS_TO_PITCH = 0.010;
+/**
+ * Degrees of pitch commanded per fpm of vertical-speed error.
+ *
+ * THIS WAS 0.010 AND IT WAS FAR TOO LOW. Worked through, at 0.010 an aeroplane
+ * sitting 16 ft below its bug and sinking at 77 fpm asks for:
+ *
+ *   altErr 16 ft -> vsTarget +35 fpm -> vsErr +112 fpm -> pitchTarget 1.12 deg
+ *
+ * and the aeroplane was already holding 1.2 deg. The loop concluded it was on
+ * target and stopped correcting. Observed in a browser as pitch frozen to the
+ * decimal for nineteen consecutive samples while the altitude kept drifting.
+ *
+ * That is the "still oscillates" report: not a fast wobble but a very slow
+ * hunt. Corrections took minutes, so the aeroplane wandered above and below the
+ * bug indefinitely — which is why it "worked briefly and then came back", and
+ * why cycling the autopilot off and on changed nothing.
+ *
+ * At 0.035 the same 112 fpm error asks for 3.9 deg, which the aeroplane can
+ * actually fly, and a 300 fpm error saturates the 8 deg limit. The inner
+ * attitude loop and its damping are what keep that from becoming an overshoot.
+ */
+const K_VS_TO_PITCH = 0.035;
 
 /** Steepest attitude the autopilot will command, degrees. */
 const MAX_PITCH_CMD_DEG = 8;
