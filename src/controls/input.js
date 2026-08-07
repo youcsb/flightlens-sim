@@ -1,14 +1,21 @@
 /**
- * input.js — the control-input layer: keyboard, mouse-yoke, gamepad.
+ * input.js — the control-input layer: keyboard, mouse-yoke, gamepad, touch.
  *
  * Contract: see MODULES.md § 2.12
  *
- *   createInput(domElement) -> { get(), dispose() }
+ *   createInput(domElement, opts) -> { get(), dispose(), ... }
  *   get() -> {pitch, roll, yaw, throttle, flaps, brakes, gear}
  *
  * This module is a PURE SENSOR. It never touches the scene, the flight model,
  * or the DOM beyond attaching listeners. `get()` returns the SAME object every
  * call, mutated in place — consume it within the frame, never stash it.
+ *
+ * ONE AMENDMENT TO "beyond attaching listeners": on a phone or a tablet this
+ * module constructs `controls/touch.js`, which DOES build an overlay of divs.
+ * A virtual stick has to be visible to be aimed at, so there is no version of
+ * touch input that draws nothing. The DOM is confined to touch.js; input.js
+ * itself still only attaches listeners, and on a desktop no overlay is created
+ * at all. See MODULES.md § 2.12a.
  *
  * ---------------------------------------------------------------------------
  * WHY THE RAMP IS SHAPED THE WAY IT IS
@@ -51,6 +58,16 @@
  *   F .................... cycle flaps    B (hold) ........... wheel brakes
  *   G .................... toggle gear    M .................. mouse-yoke mode
  *
+ * TOUCH (phones and tablets, automatic — see `resolveTouchTier`)
+ *   left pad ............. pitch + roll   bottom bar ......... rudder
+ *   right slider ......... throttle, LATCHING
+ *   FLAP / GEAR / BRK .... handled here   CAM / A/P / II ..... forwarded out
+ *
+ * Every touch axis is blended with `strongest()`, exactly like the gamepad, so
+ * a keyboard and a thumb can be on the same aeroplane at once and neither one
+ * has to be switched off. The throttle is the exception: it is a LEVER, not an
+ * axis, so the slider and the keys move the one shared lever position.
+ *
  * App-level keys live in main.js (`C` camera, `R` reset); view keys live in
  * camera/cameras.js (`V` panel view, right-drag look, wheel zoom). This module
  * claims none of them.
@@ -61,6 +78,8 @@
 
 import { clamp } from '../core/units.js';
 import { eventCode } from '../core/keycode.js';
+import { classifyTier, readSignals } from '../core/device.js';
+import { createTouchControls, shouldUseTouch } from './touch.js';
 
 // ---------------------------------------------------------------------------
 // Keyboard ramp tuning. See the header for the reasoning behind each number.
@@ -138,9 +157,53 @@ function strongest(a, b) {
 }
 
 /**
+ * Which tier's input scheme this device gets, honouring an explicit override.
+ *
+ * `?touch=1` / `?touch=0` (and `opts.touch === true|false`) exist because the
+ * only way to test a thumb cockpit on the machine that builds it is to force
+ * it on, and the only way to fly a touchscreen laptop with its keyboard is to
+ * force it off. Everything else defers to `core/device.js#classifyTier`, so
+ * the overlay appears on exactly the devices that get a phone or tablet budget.
+ *
+ * `gl: false` skips device.js's WebGL probe: creating a throwaway GL context
+ * to decide whether to draw a knob would be a real cost for no information.
+ *
+ * @param {boolean|'auto'|undefined} want
+ * @param {string} [search] defaults to location.search
+ * @returns {boolean}
+ */
+export function resolveTouchTier(want, search) {
+  if (want === true || want === false) return want;
+
+  const q = search ?? (typeof location !== 'undefined' ? location.search : '') ?? '';
+  const m = /[?&]touch=([^&]*)/.exec(q);
+  if (m) {
+    const v = decodeURIComponent(m[1]).toLowerCase();
+    if (v === '0' || v === 'off' || v === 'false') return false;
+    if (v === '1' || v === 'on' || v === 'true') return true;
+  }
+
+  try {
+    return shouldUseTouch(classifyTier(readSignals({ gl: false })));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * @param {HTMLElement} domElement The "game surface" — the renderer canvas.
  *        Used for pointer-lock and viewport sizing. Key events are bound to
  *        `window` so the sim keeps responding whatever has focus.
+ * @param {{
+ *   touch?: boolean|'auto',
+ *   touchParent?: HTMLElement,
+ *   onAction?: (name:string) => void,
+ * }} [opts] `touch` forces the thumb cockpit on or off (default: by device
+ *        tier). `touchParent` overrides where the overlay mounts (default: the
+ *        canvas's parent). `onAction` receives the app-level touch buttons —
+ *        'camera', 'autopilot', 'pause' — which this module has no business
+ *        implementing. Leave it out and they are delivered as synthetic
+ *        `keydown`s for C / L / P instead, so main.js needs no wiring at all.
  * @returns {{
  *   get: () => {pitch:number, roll:number, yaw:number, throttle:number,
  *               flaps:number, brakes:number, gear:number},
@@ -148,9 +211,11 @@ function strongest(a, b) {
  *   setMouseYoke: (on:boolean) => void,
  *   isMouseYoke: () => boolean,
  *   hasGamepad: () => boolean,
+ *   hasTouch: () => boolean,
+ *   setTouchVisible: (on:boolean) => void,
  * }}
  */
-export function createInput(domElement) {
+export function createInput(domElement, opts = {}) {
   const target = domElement || document.body;
   const keys = new Set();
 
@@ -204,6 +269,70 @@ export function createInput(domElement) {
   /** Previous button pressed-state, for edge detection on flaps/gear. */
   const padPrev = [];
 
+  // --- touch --------------------------------------------------------------
+  /** The thumb cockpit, or null on a desktop. See controls/touch.js. */
+  let touch = null;
+
+  // =========================================================================
+  // Discrete actions, shared by every source
+  // =========================================================================
+
+  function cycleFlaps() {
+    flapIndex = (flapIndex + 1) % FLAP_NOTCHES.length;
+    controls.flaps = FLAP_NOTCHES[flapIndex];
+  }
+
+  function toggleGear() {
+    controls.gear = controls.gear > 0.5 ? 0 : 1;
+  }
+
+  /**
+   * The app-level touch buttons. `camera`, `autopilot` and `pause` are not this
+   * module's to implement — they live in main.js, next to the C / L / P keys
+   * that already do them.
+   *
+   * With no `onAction` handler they are delivered as a synthetic `keydown`.
+   * That is not a shortcut around the contract, it is the contract: main.js
+   * resolves every key through `core/keycode.js#eventCode`, which exists
+   * precisely because `e.code` has to survive virtual keyboards and synthetic
+   * events (MODULES.md § 2.12). One dispatch reuses the real handler, the
+   * overlay toast and the autopilot's own refusal path, and it means a phone
+   * needs ZERO lines of wiring in main.js. Pass `onAction` if you would rather
+   * call the systems directly.
+   */
+  const TOUCH_KEY = { camera: 'KeyC', autopilot: 'KeyL', pause: 'KeyP' };
+
+  function onTouchAction(id, down) {
+    switch (id) {
+      case 'flaps':
+        if (down) cycleFlaps();
+        return;
+      case 'gear':
+        if (down) toggleGear();
+        return;
+      case 'brakes':
+        // Momentary: touch.js holds the flag, get() folds it into brakeWant so
+        // the BRAKE_RATE squeeze applies exactly as it does for the B key.
+        return;
+      default:
+        break;
+    }
+    if (!down) return;
+    if (typeof opts.onAction === 'function') {
+      opts.onAction(id);
+      return;
+    }
+    const code = TOUCH_KEY[id];
+    if (!code || typeof KeyboardEvent === 'undefined') return;
+    const init = { code, key: code, bubbles: true, cancelable: true };
+    window.dispatchEvent(new KeyboardEvent('keydown', init));
+    // The matching keyup is not politeness. Our OWN keydown listener is on
+    // `window` and will have added this code to `keys`; without the release it
+    // stays "held" forever. None of C/L/P drives an axis today, so the bug
+    // would be invisible until someone maps a touch button to one that does.
+    window.dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+
   // =========================================================================
   // Keyboard
   // =========================================================================
@@ -236,8 +365,7 @@ export function createInput(domElement) {
     // Discrete actions fire on the edge, not every frame.
     switch (code) {
       case 'KeyF':
-        flapIndex = (flapIndex + 1) % FLAP_NOTCHES.length;
-        controls.flaps = FLAP_NOTCHES[flapIndex];
+        cycleFlaps();
         break;
       case 'KeyX':
         controls.throttle = 0;
@@ -246,7 +374,7 @@ export function createInput(domElement) {
         controls.throttle = 1;
         break;
       case 'KeyG':
-        controls.gear = controls.gear > 0.5 ? 0 : 1;
+        toggleGear();
         break;
       case 'KeyM':
         // A keydown handler counts as a user gesture, so pointer lock is
@@ -414,6 +542,22 @@ export function createInput(domElement) {
     target.setAttribute('tabindex', '-1');
   }
 
+  // The thumb cockpit is built LAST, so that if it throws — a browser without
+  // Pointer Events, a detached target — the keyboard, mouse and gamepad paths
+  // above are already live and the sim is still flyable.
+  if (resolveTouchTier(opts.touch)) {
+    try {
+      touch = createTouchControls({
+        parent: opts.touchParent || target.parentElement || document.body,
+        onAction: onTouchAction,
+      });
+      touch.core.setThrottle(controls.throttle);
+    } catch (err) {
+      console.warn('[input] touch controls unavailable:', err);
+      touch = null;
+    }
+  }
+
   // =========================================================================
   // Per-frame axis integration
   // =========================================================================
@@ -512,14 +656,22 @@ export function createInput(domElement) {
 
       // B (1) brakes, X (2) flaps, Y (3) gear.
       if (padPressed(pad, 1)) brakeWant = 1;
-      if (padPressed(pad, 2) && !padPrev[2]) {
-        flapIndex = (flapIndex + 1) % FLAP_NOTCHES.length;
-        controls.flaps = FLAP_NOTCHES[flapIndex];
-      }
-      if (padPressed(pad, 3) && !padPrev[3]) {
-        controls.gear = controls.gear > 0.5 ? 0 : 1;
-      }
+      if (padPressed(pad, 2) && !padPrev[2]) cycleFlaps();
+      if (padPressed(pad, 3) && !padPrev[3]) toggleGear();
       for (let i = 0; i < 8; i += 1) padPrev[i] = padPressed(pad, i);
+    }
+
+    // --- touch ------------------------------------------------------------
+    // touch.js runs its ramps on the dt derived above, so touch and keyboard
+    // share one clock. Nothing here changes frame timing — check:autopilot
+    // depends on that.
+    if (touch) {
+      touch.update(dt);
+      const t = touch.core.axes;
+      pitch = strongest(pitch, t.pitch);
+      roll = strongest(roll, t.roll);
+      yaw = strongest(yaw, t.yaw);
+      if (touch.core.brakeHeld) brakeWant = 1;
     }
 
     // --- commit -----------------------------------------------------------
@@ -531,6 +683,17 @@ export function createInput(domElement) {
       0,
       1,
     );
+
+    // ONE lever, two ways to move it. While a finger owns the slider the
+    // slider IS the lever position; the rest of the time the slider follows
+    // the lever, so Shift/Ctrl/X/Z and setThrottle() all move the drawn knob
+    // and the pilot never sees the two disagree. Blending these with
+    // strongest() instead would be wrong: a lever at 0 is a legitimate
+    // command, and "whoever asks for more wins" can never select idle.
+    if (touch) {
+      if (touch.core.throttleGrabbed) controls.throttle = touch.core.throttle;
+      else touch.core.setThrottle(controls.throttle);
+    }
 
     // Brakes ramp so a tap on the rollout is a squeeze, not a stomp.
     const bStep = BRAKE_RATE * dt;
@@ -558,6 +721,10 @@ export function createInput(domElement) {
     if (document.pointerLockElement === target && document.exitPointerLock) {
       document.exitPointerLock();
     }
+    if (touch) {
+      touch.dispose();
+      touch = null;
+    }
     keys.clear();
   }
 
@@ -574,6 +741,7 @@ export function createInput(domElement) {
    */
   function setThrottle(v) {
     controls.throttle = clamp(Number.isFinite(v) ? v : 0, 0, 1);
+    if (touch) touch.core.setThrottle(controls.throttle);
   }
 
   /** Drop any flap selection back to clean, matching the F-key notch state. */
@@ -594,6 +762,14 @@ export function createInput(domElement) {
     setMouseYoke,
     isMouseYoke: () => mouseYoke,
     hasGamepad: () => readPad() !== null,
+    /** True when the thumb cockpit is mounted. */
+    hasTouch: () => touch !== null,
+    /** Hide/show the overlay — e.g. behind a pause screen. Releases the stick. */
+    setTouchVisible: (on) => touch?.setVisible(on),
+    /** The touch layout, for diagnostics. Null on a desktop. */
+    touchLayout: () => touch?.layout() ?? null,
+    /** The touch core, for diagnostics and the harness. Null on a desktop. */
+    touchCore: () => touch?.core ?? null,
   };
 }
 
