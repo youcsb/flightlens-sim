@@ -385,6 +385,48 @@ export const PHONE_BUILDING_MAJOR_CUTOFF_M = 8000;
 export const PHONE_BUILDING_MINOR_CUTOFF_M = 0;
 
 /**
+ * PROCEDURAL TEXTURE SCALE — 0.5 linear, so a quarter of the texels.
+ *
+ * MEASURED IN CHROME AT THE PHONE TIER, production build, by walking the scene
+ * graph and summing every texture's backing store. Nothing in this sim ships a
+ * texture file: every one of these is drawn or computed at boot, so every one
+ * of them is a number this project chose and can choose again.
+ *
+ *   texture                     size        kind          bytes
+ *   runway numeral atlas    1792 x 1536   CanvasTexture   10.5 MB
+ *   fuselage skin           2048 x 1024   CanvasTexture    8.0 MB
+ *   fuselage normal         2048 x 1024   DataTexture      8.0 MB  <- JS heap
+ *   terrain region field    1280 x 1280   DataTexture      6.6 MB  <- JS heap
+ *   land-cover region       1024 x 1280   DataTexture      5.0 MB  (already cut)
+ *   land-cover detail        768 x 1024   DataTexture      3.0 MB  (already cut)
+ *   wing skin               1024 x  512   CanvasTexture    2.0 MB
+ *   wing normal             1024 x  512   DataTexture      2.0 MB  <- JS heap
+ *   ---------------------------------------------------------------
+ *                                                         45.1 MB, and the GPU
+ * holds a copy of every row.
+ *
+ * A DataTexture's `image.data` is a typed array and lives on the JS heap for
+ * the life of the session — three keeps it so it can re-upload after a context
+ * loss. A CanvasTexture's pixels live in the canvas backing store, which the
+ * heap counter cannot see but iOS's tab ceiling most certainly can. Both are
+ * bytes this tier has to pay for, which is why the cut is applied to both.
+ *
+ * WHY 0.5 AND NOT LESS. The binding constraint is the fuselage skin, which is
+ * the only one of these a player ever sees close up. It is laid out in metres:
+ * 2048 texels over a 8.28 m hull is 247 texels/m, so at 0.5 it is 124 — and the
+ * chase camera sits 20–50 m back, where the whole aeroplane is at most 400 CSS
+ * px wide on a 393 px phone. 124 texels/m over 8.28 m is 1,024 texels across
+ * ~400 px: still 2.5x supersampled. At 0.25 it would be 1.3x and the panel
+ * lines would alias.
+ *
+ * The cut is applied by SCALING THE CANVAS TRANSFORM, not by reinterpreting the
+ * drawing coordinates — every font size, stroke width and rivet pitch in those
+ * generators is written in texels, and halving the canvas without halving the
+ * pen would double the size of "NO STEP" on the hull.
+ */
+export const PHONE_TEXTURE_SCALE = 0.5;
+
+/**
  * FRAME TARGET — 30 fps.
  *
  * A phone that holds 30 fps flat is a better flight sim than one that swings
@@ -419,6 +461,7 @@ export const PHONE_FRAME_BUDGET_MS = 1000 / PHONE_TARGET_FPS;
  * @property {string} shadowQuality     'off'|'low'|'medium'|'high'
  * @property {number} terrainLodQuality
  * @property {number} terrainViewRadiusM
+ * @property {number} textureScale      linear scale on every procedural texture
  * @property {{maxCount:number, tallCutoffM:number, majorCutoffM:number,
  *            minorCutoffM:number}} buildings
  * @property {boolean} logarithmicDepthBuffer
@@ -448,6 +491,7 @@ const PHONE_BUDGETS = freeze({
   shadowQuality: PHONE_SHADOW_QUALITY,
   terrainLodQuality: PHONE_TERRAIN_LOD_QUALITY,
   terrainViewRadiusM: PHONE_TERRAIN_VIEW_RADIUS_M,
+  textureScale: PHONE_TEXTURE_SCALE,
   buildings: {
     maxCount: PHONE_BUILDING_MAX_COUNT,
     tallCutoffM: PHONE_BUILDING_TALL_CUTOFF_M,
@@ -500,6 +544,10 @@ const TABLET_BUDGETS = freeze({
   shadowQuality: 'low',
   terrainLodQuality: 0.7,
   terrainViewRadiusM: 90000,
+  // A tablet is not short of texture memory in the way a phone is, and the one
+  // texture a tablet DOES see close up — the fuselage — is seen on a screen
+  // three times the area. Full size.
+  textureScale: 1,
   buildings: {
     maxCount: 23979,
     tallCutoffM: Infinity,
@@ -551,6 +599,7 @@ const DESKTOP_BUDGETS = freeze({
   shadowQuality: 'high',
   terrainLodQuality: 1,
   terrainViewRadiusM: 90000,
+  textureScale: 1,
   buildings: {
     maxCount: 23979,
     tallCutoffM: Infinity,

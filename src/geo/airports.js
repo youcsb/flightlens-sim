@@ -120,6 +120,7 @@ import {
 import { getElevation, getElevationLocal } from './elevation.js';
 import { fetchJsonOrNull } from '../core/assets.js';
 import { FT_TO_M, M_TO_FT, clamp } from '../core/units.js';
+import { texSize } from '../core/textureBudget.js';
 
 /**
  * @typedef {Object} Runway
@@ -1089,11 +1090,21 @@ function buildGlyphAtlas(glyphs) {
   const CELL = 256;
   const cols = Math.max(1, Math.ceil(Math.sqrt(list.length)));
   const rows = Math.max(1, Math.ceil(list.length / cols));
+
+  // THE ATLAS IS THE LARGEST TEXTURE IN THE SCENE — 7 x 6 cells is 1792 x 1536
+  // and 10.5 MB of backing store, more than the fuselage skin, for forty
+  // two-character glyphs seen at a slant from a moving aeroplane. `texSize`
+  // gives the tier's budget; everything below still lays out in the 256-texel
+  // DESIGN cell and the context is scaled to match, because the fitting code
+  // measures text in texels and the UVs come out of the same numbers.
+  const AW = cols * CELL;
+  const AH = rows * CELL;
   const canvas = document.createElement('canvas');
-  canvas.width = cols * CELL;
-  canvas.height = rows * CELL;
+  canvas.width = texSize(AW);
+  canvas.height = texSize(AH);
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.scale(canvas.width / AW, canvas.height / AH);
+  ctx.clearRect(0, 0, AW, AH);
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
@@ -1141,12 +1152,10 @@ function buildGlyphAtlas(glyphs) {
     const B = clamp(bottom + 1, y0, y0 + CELL);
 
     // CanvasTexture flips Y, so v = 0 is the BOTTOM row of the image as drawn.
-    cells.set(glyph, [
-      L / canvas.width,
-      1 - B / canvas.height,
-      Rt / canvas.width,
-      1 - T / canvas.height,
-    ]);
+    // Normalised against the DESIGN extent, which is the space L/Rt/T/B were
+    // measured in — dividing by canvas.width instead would put the UVs at the
+    // texture scale and every numeral would sample the wrong cell.
+    cells.set(glyph, [L / AW, 1 - B / AH, Rt / AW, 1 - T / AH]);
   });
 
   const tex = new THREE.CanvasTexture(canvas);

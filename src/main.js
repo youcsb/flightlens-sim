@@ -45,6 +45,7 @@ import * as THREE from 'three';
 import { setOrigin, DEFAULT_ORIGIN, distanceBetween, bearingBetween } from './geo/coords.js';
 import { getRegionStats, warmAt } from './geo/elevation.js';
 import { applyGeoBudgets, describeGeoBudgets } from './geo/geoBudgets.js';
+import { configureTextures, describeTextureBudget } from './core/textureBudget.js';
 import { loadAirports, buildRunwayMeshes, getSpawn } from './geo/airports.js';
 import { placeLandmarks } from './geo/landmarks.js';
 import { setBuildingBudget } from './geo/buildings.js';
@@ -259,6 +260,14 @@ async function boot() {
   // land-cover rasters, and both are boot-time-only decisions. See
   // geo/geoBudgets.js.
   console.info(describeGeoBudgets(applyGeoBudgets(budgets)));
+
+  // 1c. And the texture budget, for the four generators that draw one. Same
+  // rule as above and for the same reason: a texture is rasterised once, so
+  // this must precede createTerrain() (the region field), createAircraft()
+  // (the livery) and buildRunwayMeshes() (the numeral atlas). MEASURED at the
+  // phone tier: 45.1 MB of texture across the scene, 16.6 MB of it typed
+  // arrays that never leave the JS heap. See core/device.js § PHONE_TEXTURE_SCALE.
+  console.info(describeTextureBudget(configureTextures(budgets.tier)));
 
   // 2. Terrain loads the DEM and is the gate for every ground query below.
   overlay.setLoadingText('loading elevation tiles…');

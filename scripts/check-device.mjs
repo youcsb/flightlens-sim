@@ -468,6 +468,7 @@ console.log('\nbudget sets are complete, monotone and immutable');
   const NUMERIC = [
     'heapTargetMB', 'heapHardMB', 'demCapBytes', 'maxTriangles', 'maxDrawCalls',
     'maxShaderPrograms', 'pixelRatioMax', 'maxDrawingBufferPx', 'terrainLodQuality',
+    'textureScale',
   ];
   const SHADOW_RANK = { off: 0, low: 1, medium: 2, high: 3 };
 
@@ -501,6 +502,7 @@ console.log('\nbudget sets are complete, monotone and immutable');
   ok('desktop has no drawing-buffer ceiling', d.maxDrawingBufferPx === Infinity);
   ok('desktop MSAA is still on', d.antialias === true);
   ok('desktop DEM cap is still 96 MiB', d.demCapBytes === BASELINE.demCapBytes);
+  ok('desktop textures are still the design size', d.textureScale === 1);
   ok('desktop building cutoffs are unchanged', d.buildings.majorCutoffM === 25000 && d.buildings.minorCutoffM === 6000 && d.buildings.maxCount === BASELINE.buildings);
   ok('desktop ceilings sit above the measured baseline', d.maxTriangles > BASELINE.triangles && d.maxDrawCalls > BASELINE.drawCalls && d.maxShaderPrograms > BASELINE.programs && d.heapTargetMB > BASELINE.heapMB);
 
@@ -543,6 +545,65 @@ console.log('\neffectivePixelRatio — the framerate cliff');
   ok('degenerate viewport does not divide by zero', Number.isFinite(effectivePixelRatio(P, 3, 0, 0)));
   ok('missing budgets fall back to desktop behaviour', effectivePixelRatio(null, 3, 1440, 900) === 2);
   ok('a non-finite dpr is treated as 1', effectivePixelRatio(D, NaN, 1440, 900) === 1);
+}
+
+// ===========================================================================
+console.log('\ntextureBudget — the scale the four generators actually get');
+// ===========================================================================
+{
+  // WHAT THIS IS DEFENDING. Every texture in the sim is generated at boot, and
+  // the generators draw in TEXEL space — a `20px` placard on the hull, a
+  // 256-texel glyph cell. The cut is applied by scaling the canvas transform,
+  // so the only thing `texSize` may ever do is change how finely the same
+  // picture is sampled. Two ways that goes wrong and neither is visible in a
+  // screenshot of the desktop build:
+  //
+  //   1. The DEFAULT drifts off 1. Every number in MODULES.md was measured at
+  //      the design size, and every check script that imports a generator gets
+  //      whatever the module-scope default is.
+  //   2. An unknown tier is treated as small. `budgetsFor()` falls back to
+  //      desktop (§1.6), and this must inherit that, not invent a scale.
+  const TB = await import('../src/core/textureBudget.js');
+
+  ok('the default is the design size, before anyone configures anything',
+    TB.textureScale() === 1 && TB.texSize(2048) === 2048);
+
+  const phone = TB.configureTextures(TIER_PHONE);
+  ok('the phone takes device.js\'s own number', phone.scale === BUDGETS[TIER_PHONE].textureScale, `${phone.scale}`);
+  ok('and names the tier it took it from', phone.tier === TIER_PHONE);
+  ok('a power of two stays a power of two', TB.texSize(2048) === 1024 && TB.texSize(1024) === 512 && TB.texSize(512) === 256);
+  ok('the runway numeral atlas halves on both axes', TB.texSize(1792) === 896 && TB.texSize(1536) === 768);
+  ok('the terrain region field halves', TB.texSize(1280) === 640);
+  ok('every size stays even, so a mip chain has no odd level',
+    [2048, 1792, 1536, 1280, 1024, 700, 333].every((n) => TB.texSize(n) % 2 === 0),
+    [2048, 1792, 1536, 1280, 1024, 700, 333].map((n) => TB.texSize(n)).join(','));
+  ok('a small texture is floored, not scaled into nothing', TB.texSize(64) === TB.MIN_TEXTURE_PX && TB.texSize(16) === TB.MIN_TEXTURE_PX);
+  ok('and it never exceeds the design size', [64, 100, 256, 2048].every((n) => TB.texSize(n) <= Math.max(n, TB.MIN_TEXTURE_PX)));
+  ok('garbage in gives the floor, not NaN', TB.texSize(NaN) === TB.MIN_TEXTURE_PX && TB.texSize(-5) === TB.MIN_TEXTURE_PX && TB.texSize(undefined) === TB.MIN_TEXTURE_PX);
+
+  // THE ARITHMETIC THE ROUND EXISTS FOR. Measured in Chrome, phone tier: the
+  // scene held 45.1 MB of texture backing store, 16.6 MB of it typed arrays
+  // that never leave the JS heap.
+  {
+    const DESIGN = [[1792, 1536], [2048, 1024], [2048, 1024], [1280, 1280], [1024, 512], [1024, 512]];
+    const bytes = (list, f) => list.reduce((n, [w, h]) => n + f(w) * f(h) * 4, 0);
+    const full = bytes(DESIGN, (n) => n);
+    const cut = bytes(DESIGN, (n) => TB.texSize(n));
+    ok('the phone pays a quarter of the design texel bill',
+      Math.abs(cut / full - 0.25) < 1e-9,
+      `${(full / 1048576).toFixed(1)} -> ${(cut / 1048576).toFixed(1)} MB`);
+  }
+
+  ok('the tablet is back at the design size', TB.configureTextures(TIER_TABLET).scale === 1 && TB.texSize(2048) === 2048);
+  ok('an unknown tier keeps the desktop textures (§1.6)', TB.configureTextures('toaster').scale === 1 && TB.texSize(2048) === 2048);
+  ok('an explicit numeric scale is honoured, for a sweep', TB.configureTextures(0.25).scale === 0.25 && TB.texSize(2048) === 512);
+  ok('an out-of-range scale is refused, not applied', TB.configureTextures(4).scale === 0.25 && TB.configureTextures(0).scale === 0.25);
+  ok('the returned config is a copy — mutating it changes nothing',
+    (() => { const c = TB.getTextureConfig(); c.scale = 9; return TB.textureScale() === 0.25; })());
+
+  // Leave the module where every other check script expects to find it.
+  TB.configureTextures(TIER_DESKTOP);
+  ok('reset to desktop for anything downstream', TB.textureScale() === 1);
 }
 
 // ===========================================================================

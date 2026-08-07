@@ -1518,6 +1518,7 @@ the file; these are the numbers other modules must hit.
 | shadows | **off** | 4 cascades | one cascade is ~35 calls of a 120 budget |
 | terrain `lodQuality` | **0.40** | 1 | nodes ∝ q²; the node cache is the heap |
 | terrain `viewRadiusM` | **90,000** | 90,000 | **UNCHANGED** — Rainier is 84 km out |
+| `textureScale` | **0.5** | 1 | 45.1 → 21.3 MB of generated texture (§2.20) |
 | buildings | **tall+major**, 8 km | all, 25/6 km | minor is 57% of buffers, 0.6 px on a phone |
 
 `PHONE_SHARES` splits the frame per subsystem, because a ceiling nobody owns is
@@ -1545,7 +1546,151 @@ a lever that silently changes the next boot is hidden state.
 `window.sim.device`, `.tier`, `.budgets`, `.deviceSignals()` and
 `.pixelBudget()` expose all of it for the acceptance checks.
 
-Verified by `npm run check:device` — 191 assertions, no DOM and no GPU.
+Verified by `npm run check:device` — no DOM and no GPU.
+
+### 2.19 `src/geo/geoBudgets.js` — the tier, handed to the two geo modules
+
+```js
+applyGeoBudgets(budgets) -> {dem, landcover}   // ONCE, before createTerrain()
+describeGeoBudgets(applied?) -> string
+```
+
+`core/device.js` must stay pure (no imports, no three, no DOM) so
+`check-device.mjs` can run the shipping classifier in Node, and `elevation.js`
+must stay importable by `check-elevation.mjs`. So neither can reach the other,
+and the application joins them: one call that forwards `demCapBytes` /
+`demPagingPolicy` to `elevation.js#configurePaging()` and the tier NAME to
+`landcover.js#configureLandcover()`.
+
+**It must precede `createTerrain()`.** That call registers the DEM layers and
+decodes the land-cover rasters, and both are boot-time-only decisions.
+`configurePaging()` does cope with arriving late — it re-derives every paged
+layer and evicts on the spot — but there is nothing to re-apply to a raster that
+has already been decoded.
+
+### 2.20 `src/core/textureBudget.js` — how finely a generated texture is drawn
+
+```js
+MIN_TEXTURE_PX                    // 64
+configureTextures(tier|scale) -> {tier, scale}   // ONCE, at boot
+getTextureConfig() -> {tier, scale}
+textureScale()     -> number
+texSize(designPx)  -> integer     // even, floored at MIN_TEXTURE_PX
+describeTextureBudget(cfg?) -> string
+```
+
+**Nothing in this sim ships an image file.** The fuselage livery, the wing skin,
+the runway numeral atlas and the terrain's region field are all drawn or
+computed at boot, in four different modules, by functions that took no options.
+Rather than change four public shapes to move one scalar, this is the same seam
+`landcover.js` already uses for its raster tier: a module-scope setting whose
+default is the desktop behaviour exactly, so every check script that imports a
+generator still measures the numbers quoted in this document.
+
+**THE ONE RULE FOR CALLERS: scale the canvas, not the coordinates.** Every
+generator lays out in texels — a `20px` placard on the hull, a 256-texel glyph
+cell, `tx(z)` mapping a fuselage station onto texture X. Allocating a smaller
+canvas and leaving the drawing alone keeps the pen its original size and doubles
+every mark. The pattern is
+
+```js
+const W = 2048, H = 1024;                  // the DESIGN size, unchanged
+const cv = makeCanvas(texSize(W), texSize(H));
+cv.getContext('2d').scale(cv.width / W, cv.height / H);
+```
+
+and anything derived from the drawing must be normalised against the DESIGN
+extent, not `canvas.width`. `buildGlyphAtlas` is the case that proves it:
+dividing its ink boxes by `canvas.width` would put the numeral UVs at the
+texture scale and every runway designation would sample the wrong cell.
+Asserted — the `runway-numbers` UV buffer is **bit-identical** at phone and
+tablet while the atlas goes 1792×1536 → 896×768.
+
+**One derived quantity has to follow the resolution and it is not a UV.**
+`terrain.js`'s water shader jitters its lookup into the region field by a
+distance in WORLD METRES, tuned to be about one texel at 165 m — that jitter is
+what stopped Elliott Bay reading as "rectangular patches and streaks". At half
+the field resolution it would be half a texel, so `uFieldJitter` scales it. 1.0
+on the desktop, by construction.
+
+**`normalFromHeight` is resolution-dependent too.** It Sobels a height canvas
+per texel, so at half the texels a panel line spans half as many of them for the
+same amplitude, the finite difference doubles and the airframe comes out
+embossed like a coin. The callers pass the design width and the strength is
+scaled by the ratio.
+
+**Boot-time only, and that is not an apology.** A texture is rasterised once;
+re-running `configureTextures()` cannot change a canvas that exists.
+`?tier=phone` is how you get it from frame 0, exactly as for the DEM cap and
+`terrainLodQuality`.
+
+### 2.21 WHERE THE PHONE'S HEAP ACTUALLY GOES
+
+MEASURED in Chrome, `performance.memory`, **production build** (`npm run build`
++ `vite preview`), `?tier=phone`, driven by `window.sim.tick()`. The figure that
+means anything is the **post-GC floor** — `usedJSHeapSize` counts garbage that
+has not been collected yet, and a harness that runs 120 frames per 10 ms of wall
+clock gives the collector far less opportunity than a real session does.
+
+| | parked at KBFI | in flight, 664 s |
+|---|---|---|
+| before this round's texture cut | 158.3 MB | 172.6 MB |
+| **after** | **145.5–145.8 MB** | **149.8–151.9 MB** |
+| phone target / hard line | 160 / 190 MB | 160 / 190 MB |
+
+(Two runs of the same script, quoted as a range rather than picking the flatter
+one. The desktop baseline this is cut from is 352.8 MB.)
+
+and the decomposition, which is the part worth keeping, because three of the
+four terms are NOT what the budget was written against:
+
+| term | parked | in flight | who owns it |
+|---|---|---|---|
+| terrain LOD node cache | 45.8 | **77.9 (at its ceiling)** | `terrain.js` |
+| DEM resident | 46.1 | 33–47.8 (cap 48) | `elevation.js` |
+| generated textures, JS-heap part | 12.1 | 12.1 | `textureBudget.js` |
+| city + landmark buffers | 12.6 | 12.6 | `buildings.js` |
+| airports geometry | 3.1 | 3.1 | `airports.js` |
+| three, app code, DOM, misc | ~22 | ~22 | — |
+
+**The node cache is the largest term and it saturates.** §2.7's cap is
+`1400 · q^1.35` floored at 560, which at `q = 0.40` is the floor, not the
+formula: 608 built × 131.3 KiB = **77.9 MiB**, and a 664 s leg reaches it and
+stays there. §2.18's own arithmetic allocated that line ~32 MB. It is not wrong
+— the floor is measured, and an undersized cache settles on a coarser surface
+rather than thrashing — but it means the remaining road to 160 MB runs through
+the node's 30 bytes per vertex (`position` f32×3 + `normal` i16×3 + `aMorph`
+f32×3), not through anything the geo side still holds. `aMorph.y` alone is
+`node.morphEnd` repeated 4,481 times, 17.9 KB per node of one constant.
+
+**Textures were the second surprise: 45.1 MB before the cut**, 24.9 MB of it
+typed arrays that never leave the JS heap. A `DataTexture` keeps `image.data`
+alive for the life of the session so three can re-upload after a context loss;
+a `CanvasTexture`'s pixels sit in the canvas backing store, which
+`usedJSHeapSize` cannot see but an iOS tab ceiling most certainly can. Both are
+halved on this tier. After: **21.3 MB total, 12.1 MB of it on the heap.**
+
+**The DEM pager and the land-cover rasters were already inside their budgets**
+and are not where the money is: 46 MB and 8 MB against a 195 MB starting point.
+Verified as such, not assumed — see the leak evidence below.
+
+**THE LEAK TEST IS A FLIGHT, NOT A CODE READ.** Three laps of KBFI → KSEA →
+downtown → Mount Rainier at the phone tier, 1,898 page-ins:
+
+| place | lap 1 | lap 2 | lap 3 |
+|---|---|---|---|
+| Mount Rainier | 294 tiles | 292 | 292 |
+| KBFI | 314 | 314 | 314 |
+| downtown | 311 | 310 | 310 |
+| KSEA | 324 | 324 | 324 |
+
+`pageIns − evictions === residentTiles` exactly, at every sample; peak resident
+47.8 MiB of a 48 MiB cap; `capViolations` 0; the post-GC floor did not move off
+149.8 MB. That is the shape the orphaned-record bug would have broken — it
+created a record on QUEUE and rebuilt on "does a record exist" rather than "does
+data exist", so the same place held more on its second visit. It does not.
+`npm run check:geo-mobile` asserts the same identity in Node against the real
+baked tiles.
 
 ---
 
@@ -1555,6 +1700,12 @@ The dependencies are real. `main.js` does this and nothing else:
 
 ```
 setOrigin()             every projection below is relative to it
+resolveDevice()         the tier, and the budget it may spend       (§2.18)
+applyGeoBudgets()      ─┐ BOTH before createTerrain(): it registers  (§2.19)
+configureTextures()    ─┘ the DEM layers, decodes the land-cover     (§2.20)
+                          rasters and rasterises the region field,
+                          and all three are boot-time-only
+setBuildingBudget()     the decoder drops rings as it walks them
 await createTerrain()   loads the DEM; nothing can sit on the ground until
                         elevation is queryable
 createSky()

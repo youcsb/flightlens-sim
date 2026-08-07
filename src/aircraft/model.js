@@ -52,6 +52,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { clamp, DEG_TO_RAD } from '../core/units.js';
+import { texSize } from '../core/textureBudget.js';
 
 // ---------------------------------------------------------------------------
 // Control-surface travel. Real C172 figures, in radians.
@@ -615,6 +616,27 @@ function makeCanvas(w, h) {
 }
 
 /**
+ * A skin canvas at the tier's texel budget, with its 2D context PRE-SCALED so
+ * everything drawn afterwards is still written in design space.
+ *
+ * The livery generators below lay out in texels — `20px` placards, one-texel
+ * rivets, `tx(z)` mapping a fuselage station onto texture X. Allocating a
+ * smaller canvas without scaling the pen would keep every mark its original
+ * size in texels and therefore double it on the aeroplane. See
+ * core/textureBudget.js § THE ONE RULE FOR CALLERS.
+ *
+ * `getContext('2d')` returns the SAME context object on every call, so the
+ * transform set here is the one the caller receives.
+ */
+function makeSkinCanvas(w, h) {
+  const cw = texSize(w);
+  const ch = texSize(h);
+  const c = makeCanvas(cw, ch);
+  c.getContext('2d').scale(cw / w, ch / h);
+  return c;
+}
+
+/**
  * Derive a tangent-space normal map from a greyscale height canvas by Sobel.
  *
  * This is the detail that decides the 20-50 m chase shot. Panel lines and
@@ -622,9 +644,16 @@ function makeCanvas(w, h) {
  * moves; as height they catch a specular edge and the airframe reads as sheet
  * metal instead of a decal. Costs a few ms once at load.
  */
-function normalFromHeight(canvas, strength) {
+function normalFromHeight(canvas, strength, designW = 0) {
   const w = canvas.width;
   const h = canvas.height;
+  // THE SOBEL IS PER TEXEL, SO ITS STRENGTH IS RESOLUTION-DEPENDENT. At half
+  // the texels a panel line spans half as many of them for the same height
+  // amplitude, so the finite difference doubles and the airframe comes out
+  // embossed like a coin. Scaling `strength` by the resolution ratio makes the
+  // gradient an estimate of the same DESIGN-SPACE slope at every texture
+  // budget. `designW = 0` (or the desktop's scale 1) leaves it exactly alone.
+  if (designW > 0) strength *= w / designW;
   const src = canvas.getContext('2d').getImageData(0, 0, w, h).data;
   const out = new Uint8Array(w * h * 4);
   const at = (x, y) => src[((((y % h) + h) % h) * w + (((x % w) + w) % w)) * 4] / 255;
@@ -676,10 +705,12 @@ function drawRivets(ctx, x0, y0, x1, y1, colour, pitch, dot) {
  * Returns { map, height } — the height canvas feeds normalFromHeight.
  */
 function makeFuselageTexture(zMin, zMax, windows, reg) {
+  // The DESIGN size. What is allocated is `texSize(W) x texSize(H)`; the
+  // drawing below is unchanged because makeSkinCanvas scales the pen to match.
   const W = 2048;
   const H = 1024;
-  const map = makeCanvas(W, H);
-  const hgt = makeCanvas(W, H);
+  const map = makeSkinCanvas(W, H);
+  const hgt = makeSkinCanvas(W, H);
   const c = map.getContext('2d');
   const k = hgt.getContext('2d');
   const tx = (z) => ((z - zMin) / (zMax - zMin)) * W;
@@ -824,8 +855,8 @@ function makeFuselageTexture(zMin, zMax, windows, reg) {
 function makeWingTexture() {
   const W = 1024;
   const H = 512;
-  const map = makeCanvas(W, H);
-  const hgt = makeCanvas(W, H);
+  const map = makeSkinCanvas(W, H);
+  const hgt = makeSkinCanvas(W, H);
   const c = map.getContext('2d');
   const k = hgt.getContext('2d');
   c.fillStyle = '#ccced4';
@@ -1338,14 +1369,14 @@ export function createAircraft(scene, opts = {}) {
       fuseMap = track(new THREE.CanvasTexture(f.map));
       fuseMap.colorSpace = THREE.SRGBColorSpace;
       fuseMap.anisotropy = 8;
-      fuseNormal = track(normalFromHeight(f.height, 3.2));
+      fuseNormal = track(normalFromHeight(f.height, 3.2, 2048));
       fuseNormal.anisotropy = 8;
 
       const w = makeWingTexture();
       wingMap = track(new THREE.CanvasTexture(w.map));
       wingMap.colorSpace = THREE.SRGBColorSpace;
       wingMap.anisotropy = 8;
-      wingNormal = track(normalFromHeight(w.height, 2.6));
+      wingNormal = track(normalFromHeight(w.height, 2.6, 1024));
       wingNormal.anisotropy = 8;
 
       discMap = track(new THREE.CanvasTexture(makePropDiscTexture()));

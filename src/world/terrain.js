@@ -137,6 +137,7 @@ import {
 import { REGION_BBOX, llToLocal } from '../geo/coords.js';
 import { loadLandcover } from '../geo/landcover.js';
 import { clamp } from '../core/units.js';
+import { texSize } from '../core/textureBudget.js';
 
 /**
  * @typedef {Object} TerrainOpts
@@ -511,11 +512,37 @@ function skirtDepthFor(cellSize, errM) {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolution of the CPU-side region height/shore texture. 1280 over ~211 km is
- * ~165 m per texel. It is not used for geometry — only to tell the water shader
- * how deep it is and how far it is from land.
+ * DESIGN resolution of the CPU-side region height/shore texture. 1280 over
+ * ~211 km is ~165 m per texel. It is not used for geometry — only to tell the
+ * water shader how deep it is and how far it is from land.
+ *
+ * Read it through `fieldResolution()`, never directly: the tier's texture
+ * budget scales it, and `uFieldJitter` in the water shader is derived from what
+ * that returns.
  */
 const FIELD_N = 1280;
+
+/**
+ * The same field at the tier's texture budget.
+ *
+ * It costs more than its texture: `buildRegionField` allocates an n x n
+ * Float32Array of heights, another of shore distances and a Uint8Array mask to
+ * produce it, and `uploadField` a half-float Uint16Array that STAYS on the JS
+ * heap for the life of the session. At 1280 that is 6.6 MB resident and 13.1 MB
+ * of transient peak at boot; at 640 it is 1.6 and 3.3.
+ *
+ * WHAT IT IS ALLOWED TO COST. This field never touches geometry and never
+ * touches §1.4 — `getElevationLocal` is still the ground. It tells the water
+ * shader how deep it is and how far it is from land, which drives the deep/
+ * shallow gradient and the shoreline band. 1280 over ~211 km is 165 m/texel;
+ * 640 is 330 m, which at a phone's 2.684e-3 rad/px is one pixel at 123 km —
+ * further than the far plane has anything to show. The shoreline itself is not
+ * drawn from this: it comes from the land-cover water class and the terrain
+ * mesh, both of which keep their own resolution.
+ */
+function fieldResolution() {
+  return texSize(FIELD_N);
+}
 
 /**
  * Distance-to-shore is computed, rather than depth, because Terrarium's
@@ -2739,6 +2766,14 @@ function makeWaterMaterial(fieldTexture, rect, seaLevelM, lake) {
     uWaterY: { value: seaLevelM },
     uLake: { value: lake ? 1 : 0 },
     uShoreMax: { value: SHORE_MAX_M },
+    // How coarse the field actually is, relative to the 165 m/texel the
+    // shore-lookup jitter below was tuned against. The jitter is measured in
+    // WORLD METRES and its whole job is to be about one texel wide, so a tier
+    // that halves FIELD_N has to widen it by the same factor or Elliott Bay
+    // gets its rectangles back. 1.0 on the desktop, by construction.
+    uFieldJitter: {
+      value: (rect.xMax - rect.xMin) / (fieldResolution() - 1) / 165.0,
+    },
   };
 
   const mat = new THREE.MeshStandardMaterial({
@@ -2789,6 +2824,7 @@ function makeWaterMaterial(fieldTexture, rect, seaLevelM, lake) {
         uniform float uWaterY;
         uniform float uLake;
         uniform float uShoreMax;
+        uniform float uFieldJitter;
         varying vec3 vWaterWorld;
         vec3 wWaveNormal;
         float wFresnelOut;
@@ -2867,10 +2903,11 @@ const WATER_COLOUR_GLSL = /* glsl */ `
   // hangs off it. Jitter the LOOKUP the same way the land-cover fetch does —
   // two octaves at roughly a texel — and the rectangles become an irregular
   // edge instead. It costs two noise taps and no new data.
-  vec2 fjit = vec2(tNoise(wp * (1.0 / 260.0)) - 0.5,
-                   tNoise(wp * (1.0 / 260.0) + vec2(27.3, 6.1)) - 0.5) * 230.0
-            + vec2(tNoise(wp * (1.0 / 70.0) + vec2(4.7, 19.3)) - 0.5,
-                   tNoise(wp * (1.0 / 70.0) + vec2(33.1, 2.9)) - 0.5) * 95.0;
+  vec2 fjit = (vec2(tNoise(wp * (1.0 / 260.0)) - 0.5,
+                    tNoise(wp * (1.0 / 260.0) + vec2(27.3, 6.1)) - 0.5) * 230.0
+             + vec2(tNoise(wp * (1.0 / 70.0) + vec2(4.7, 19.3)) - 0.5,
+                    tNoise(wp * (1.0 / 70.0) + vec2(33.1, 2.9)) - 0.5) * 95.0)
+             * uFieldJitter;
   vec2 fuv = (wp + fjit - uFieldRect.xy) * uFieldRect.zw;
   vec2 fuvC = clamp(fuv, 0.0, 1.0);
   // Outside the baked region it is open ocean, not the edge texel repeated.
@@ -2998,7 +3035,7 @@ function computeDemRect(bbox, marginM) {
  * Columbia) it is all we have.
  */
 function buildRegionField(rect, seaLevelM, landcover) {
-  const n = FIELD_N;
+  const n = fieldResolution();
   const dx = (rect.xMax - rect.xMin) / (n - 1);
   const dz = (rect.zMax - rect.zMin) / (n - 1);
   const height = fillHeightGrid(rect.xMin, rect.zMin, dx, dz, n, n);
@@ -3042,8 +3079,9 @@ function markLakesAsWater(field, rect, lakes) {
 
 /**
  * Chamfer distance transform: two sweeps, 3-4 weights. Exact enough at 165 m
- * per texel and about 8 ms for 1.6 M cells — a full Euclidean transform would
- * cost more and change nothing anyone can see.
+ * per texel (and at the phone tier's 330) and about 8 ms for 1.6 M cells — a
+ * full Euclidean transform would cost more and change nothing anyone can see.
+ * The weights come from `field.dx`/`dz`, so they follow the resolution.
  */
 function computeShoreDistance(field) {
   const { n, dx, dz, water, shore } = field;
