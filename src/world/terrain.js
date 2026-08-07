@@ -1875,6 +1875,7 @@ function makeTerrainMaterial(exag, landcover, fieldTexture, rect) {
         vec3 tNormalOut;
         ${GLSL_NOISE}
         ${GLSL_RELIEF}
+        ${landcover ? GLSL_ROOF : ''}
         ${landcoverFetchGlsl(lcRegion, lcDetail)}
         `,
       )
@@ -1955,39 +1956,60 @@ function makeTerrainMaterial(exag, landcover, fieldTexture, rect) {
  * @param {Object|null} lcDetail  present when the Seattle inset loaded
  */
 /**
- * `tLcFetch(p, seed)` — one jittered nearest sample of the land-cover rasters,
- * returned as the raw texel (r = NLCD code/255, g = index/255, b = road/255).
- *
- * A function rather than inline code because the colour block calls it TWICE
- * with different seeds and blends the two albedos. One tap alone gives a
- * correct but hard-edged mosaic — real class boundaries are gradual, a forest
- * thins into scrub over a hundred metres — and two decorrelated taps produce
- * that gradient for the cost of one extra fetch.
+ * `tLcFetchS(p, seed, spread)` — one jittered nearest sample of the land-cover
+ * rasters, returned as the raw texel (r = NLCD code/255, g = index/255,
+ * b = road/255).
  *
  * The jitter is computed in TEXEL space (`base / texel`), which is what makes
- * it scale-invariant: the same expression gives ~1 texel of wobble on the 81 m
- * region raster and on the 20 m Seattle inset, instead of scrambling one and
- * barely touching the other.
+ * it scale-invariant: the same expression gives the same wobble in texels on
+ * the 81 m region raster and on the 20 m Seattle inset, instead of scrambling
+ * one and barely touching the other.
  *
  * With both rasters present the choice between them is DITHERED, not blended:
  * two class indices cannot be averaged into a third meaningful one, so a
  * per-fragment hash decides which side of the ~400 m transition band this pixel
  * takes and the seam dissolves into noise instead of drawing a rectangle around
  * Seattle.
+ *
+ * The class fetch, and the ONE knob that decides how hard a class boundary is.
+ *
+ * `spread` scales the jitter in texels. It exists because the two things this
+ * fetch is asked for want opposite answers:
+ *
+ *   spread = 1  the STRUCTURAL tap. Decides water, ice, developed, tree, which
+ *               near-field form to draw, and the roughness. Its jitter must
+ *               stay at roughly one texel, because at the coastline the class
+ *               boundary IS the coastline and that is geographic truth (§1.5).
+ *               Do not raise this to soften boundaries: it moves shorelines.
+ *
+ *   spread > 1  the COLOUR taps. Only ever feed the albedo, and the albedo is
+ *               the thing round 2's critic saw as "hard-edged polygonal
+ *               blotches — a camouflage-patch look" at 400–600 m. A 30 m survey
+ *               genuinely does have polygon edges; the real world does not, and
+ *               what is on the two sides of an NLCD boundary bleeds into the
+ *               other side for a couple of hundred metres. Three colour taps at
+ *               different spreads and different seeds, blended by a noise
+ *               field, dissolve the polygon without moving anything that has to
+ *               stay where the survey put it.
+ *
+ * Three octaves rather than two, because the failure mode of two is a smooth
+ * wobble — a boundary that is still obviously one line, just a wavy one. The
+ * third octave is what makes it finger and interlock at the scale of a block.
  */
 function landcoverFetchGlsl(lcRegion, lcDetail) {
   if (!lcRegion && !lcDetail) return '';
 
   const jitter = /* glsl */ `
     vec2 tp = base / texel + seed;
-    vec2 jit = vec2(tNoise(tp * 0.34) - 0.5, tNoise(tp * 0.34 + vec2(31.7, 12.9)) - 0.5) * 2.2
-             + vec2(tNoise(tp * 1.30) - 0.5, tNoise(tp * 1.30 + vec2(5.3, 47.1)) - 0.5) * 0.9;
-    vec2 p = base + jit * texel;
+    vec2 jit = vec2(tNoise(tp * 0.21) - 0.5, tNoise(tp * 0.21 + vec2(31.7, 12.9)) - 0.5) * 2.2
+             + vec2(tNoise(tp * 0.78) - 0.5, tNoise(tp * 0.78 + vec2(5.3, 47.1)) - 0.5) * 1.1
+             + vec2(tNoise(tp * 2.90) - 0.5, tNoise(tp * 2.90 + vec2(17.9, 3.7)) - 0.5) * 0.5;
+    vec2 p = base + jit * texel * spread;
   `;
 
   if (lcRegion && lcDetail) {
     return /* glsl */ `
-      vec3 tLcFetch(vec2 base, float seed) {
+      vec3 tLcFetchS(vec2 base, float seed, float spread) {
         vec2 dUv = (base - uLcDetailRect.xy) * uLcDetailRect.zw;
         float edge = min(min(dUv.x, dUv.y), min(1.0 - dUv.x, 1.0 - dUv.y));
         float useD = step(tHash21(floor(base * 0.5)) * 0.012, edge);
@@ -2003,13 +2025,42 @@ function landcoverFetchGlsl(lcRegion, lcDetail) {
 
   const T = lcRegion ? 'uLcRegion' : 'uLcDetail';
   return /* glsl */ `
-    vec3 tLcFetch(vec2 base, float seed) {
+    vec3 tLcFetchS(vec2 base, float seed, float spread) {
       vec2 texel = ${T}Texel;
       ${jitter}
       return texture2D(${T}, clamp((p - ${T}Rect.xy) * ${T}Rect.zw, 0.0, 1.0)).rgb;
     }
   `;
 }
+
+/**
+ * SIX PLAUSIBLE ROOF AND YARD SURFACES, chosen by one hash.
+ *
+ * This is the single largest source of the information round 2's critic
+ * measured us short on. A city seen from 1,000 ft is not a grey field with a
+ * street grid on it; it is a mosaic of roofs, and roofs are the most VARIED
+ * surface in the built landscape — tar-and-gravel next to white membrane next
+ * to galvanised steel next to oxide-red brick. The variance is not decoration,
+ * it is what the eye uses to read a city as a city.
+ *
+ * The distribution is roughly Seattle's, weighted toward dark tar and weathered
+ * concrete with white membrane and bare metal as the bright tail; the thresholds
+ * are the cumulative frequencies. sRGB in, so the caller linearises.
+ *
+ * Every step() is a select, no branch, and the whole thing is six mixes.
+ */
+const GLSL_ROOF = /* glsl */ `
+vec3 tRoofColour(float u) {
+  vec3 c = vec3(0.245, 0.238, 0.230);                    // 0.00  tar and gravel
+  c = mix(c, vec3(0.560, 0.550, 0.522), step(0.34, u));  // 0.34  weathered concrete
+  c = mix(c, vec3(0.455, 0.470, 0.487), step(0.58, u));  // 0.58  galvanised steel
+  c = mix(c, vec3(0.790, 0.795, 0.782), step(0.755, u)); // 0.755 white TPO membrane
+  c = mix(c, vec3(0.335, 0.238, 0.205), step(0.900, u)); // 0.900 oxide red / brick
+  c = mix(c, vec3(0.228, 0.272, 0.322), step(0.950, u)); // 0.950 blue-grey steel
+  c = mix(c, vec3(0.240, 0.292, 0.244), step(0.982, u)); // 0.982 green steel
+  return c;
+}
+`;
 
 function terrainColourGlsl(lcRegion, lcDetail) {
   const hasLc = !!(lcRegion || lcDetail);
@@ -2022,8 +2073,13 @@ function terrainColourGlsl(lcRegion, lcDetail) {
   // =======================================================================
   // Land cover — NLCD 2021, 30 m, baked by scripts/bake-landcover.mjs
   // =======================================================================
-  vec3 lcRaw = tLcFetch(wp, 0.0);
-  vec3 lcRawB = tLcFetch(wp, 61.7);
+  // Tap A is STRUCTURAL and stays at one texel of jitter — it decides where the
+  // water is. Taps B and C only ever touch the albedo, so they are free to
+  // wander far enough to dissolve the survey's polygon edges. See
+  // landcoverFetchGlsl.
+  vec3 lcRaw  = tLcFetchS(wp, 0.0, 1.0);
+  vec3 lcRawB = tLcFetchS(wp, 61.7, 2.6);
+  vec3 lcRawC = tLcFetchS(wp, 137.3, 5.4);
   vec2 lcCoverUv = (wp - ${coverRect}.xy) * ${coverRect}.zw;
   float lcInside = step(0.0, min(min(lcCoverUv.x, lcCoverUv.y),
                                  min(1.0 - lcCoverUv.x, 1.0 - lcCoverUv.y)));
@@ -2034,100 +2090,221 @@ function terrainColourGlsl(lcRegion, lcDetail) {
   float lcOn = lcInside * step(0.5, lcIdx);
 
   float lcU = (lcIdx + 0.5) * (1.0 / 16.0);
-  vec3 lcAlbedo = tSrgb(texture2D(uLcPalette, vec2(lcU, 0.25)).rgb);
-  vec4 lcParam  = texture2D(uLcPalette, vec2(lcU, 0.75));
+  vec3 lcAlbedo  = tSrgb(texture2D(uLcPalette, vec2(lcU, 0.125)).rgb);
+  vec4 lcParam   = texture2D(uLcPalette, vec2(lcU, 0.375));
+  vec4 lcHardP   = texture2D(uLcPalette, vec2(lcU, 0.625));
+  vec4 lcSoftP   = texture2D(uLcPalette, vec2(lcU, 0.875));
   float lcRough  = lcParam.r;
   float lcAmt    = lcParam.g;
   float lcForm   = lcParam.b * 2.0;   // 0 organic, 1 parcel, 2 street
   float lcCanopy = lcParam.a;         // how much of a developed class is trees
+  // The class's two ends — see the CLASSES header in geo/landcover.js. lcHard
+  // is the built/bare/lit end, lcSoft the vegetated/shadowed end, lcHardMix
+  // where the class sits between them on average, lcVary how far the
+  // near-field structure may swing.
+  vec3 lcHard = tSrgb(lcHardP.rgb);
+  vec3 lcSoft = tSrgb(lcSoftP.rgb);
+  float lcHardMix = lcHardP.a;
+  float lcVary    = lcSoftP.a;
 
   float lcIsWater = step(0.5, lcIdx) * (1.0 - step(1.5, lcIdx));
   float lcIsIce   = step(1.5, lcIdx) * (1.0 - step(2.5, lcIdx));
   float lcIsDev   = step(2.5, lcIdx) * (1.0 - step(6.5, lcIdx));
   float lcIsTree  = step(7.5, lcIdx) * (1.0 - step(10.5, lcIdx));
+  // Medium and high intensity only: the two classes that can be a port, a rail
+  // yard or a tank farm. Low intensity is houses and never is.
+  float lcIsHeavy = step(4.5, lcIdx) * (1.0 - step(6.5, lcIdx));
 
   // --- near-field structure ----------------------------------------------
-  // All three patterns are built from wp, not lp: lp is quantised to 32 m and
-  // a grid evaluated against it would jump a third of a block every time the
-  // camera crossed a quantum. Only the noise octaves may use lp (see
+  // All the grid patterns are built from wp, not lp: lp is quantised to 32 m
+  // and a grid evaluated against it would jump a third of a block every time
+  // the camera crossed a quantum. Only the noise octaves may use lp (see
   // GLSL_NOISE), and the canopy octaves below use frequencies that divide 32
   // exactly for that reason.
+  //
+  // EVERY FADE DISTANCE HERE WAS RAISED, and that alone is a large part of the
+  // fix. Round 2 faded the lot grid out between 600 and 2,000 m and the canopy
+  // between 350 and 1,800. From 610 m over downtown the ground in frame is 700
+  // to 6,000 m away, so at the exact altitude the sim is judged at, almost
+  // every structural term was already switched off and the city was painted by
+  // the class mean alone. The limit that matters is the PIXEL FOOTPRINT: at
+  // 1120x720 and 60 degrees a pixel covers dist * 0.00145 m, so a 24 m lot is
+  // still eight pixels wide at 2 km and two pixels at 8 km. These distances are
+  // set from that, with margin for the grazing case.
   float lcAng = (tNoise(wp * (1.0 / 6000.0)) - 0.5) * 0.5;
   float lcCa = cos(lcAng), lcSa = sin(lcAng);
   vec2 rp = vec2(lcCa * wp.x - lcSa * wp.y, lcSa * wp.x + lcCa * wp.y);
 
+  // ---- WHICH KIND OF DEVELOPED IS THIS ----------------------------------
+  // NLCD has no industrial class. It grades development by imperviousness and
+  // nothing else, so the port, the rail yards, the tank farms and the warehouse
+  // districts arrive labelled exactly the same as an apartment block. But in
+  // THIS region the distinction is carried by a second piece of real data:
+  // heavy industry sits on the flat fill at the head of the bay and along the
+  // Duwamish, essentially all of it under 30 m, and the housing is on the
+  // hills. Combining the survey's intensity with the DEM's elevation puts yards
+  // on Harbor Island, Georgetown, Interbay and the Kent valley floor and leaves
+  // Queen Anne, Capitol Hill and West Seattle residential — which is correct,
+  // and is why a 300 m pass over Georgetown can stop looking like a 300 m pass
+  // over Wallingford. The 1.6 km district noise keeps it off a contour line.
+  float lcDistrict = tNoise(wp * (1.0 / 1600.0));
+  float lcIndustrial = lcIsHeavy * smoothstep(30.0, 6.0, h)
+                     * smoothstep(0.18, 0.55, lcDistrict);
+
   // Street grid. A Seattle block is roughly 73 x 98 m of lots inside a 96 x
   // 128 m street-centre pitch, which is what these numbers are.
-  float fadeBlock = 1.0 - smoothstep(2200.0, 7000.0, camDist);
+  float fadeBlock = 1.0 - smoothstep(4000.0, 11000.0, camDist);
   vec2 bc = rp * vec2(1.0 / 96.0, 1.0 / 128.0);
   vec2 bf = abs(fract(bc) - 0.5);
   float street = smoothstep(0.452, 0.492, max(bf.x, bf.y)) * fadeBlock;
   float blockId = tHash21(floor(bc) + 0.13);
+
   vec2 lc2 = rp * vec2(1.0 / 24.0, 1.0 / 26.0);
-  float lotId = tHash21(floor(lc2) + 3.1);
-  float fadeLot = 1.0 - smoothstep(600.0, 2000.0, camDist);
-  // Lot boundaries: fences, driveways, the gap between two roofs. Only inside
-  // 250 m, where they are several pixels across and are the thing that keeps
-  // the ground from going smooth as you descend.
+  vec2 lcell = floor(lc2);
+  float lotId  = tHash21(lcell + 3.1);
+  float lotId2 = tHash21(lcell * 1.7 + 21.9);
+  float fadeLot = 1.0 - smoothstep(2500.0, 7000.0, camDist);
+  // Lot boundaries: fences, driveways, the gap between two roofs.
   // Masked per cell, so only some boundaries draw. An unmasked lattice reads
   // as a tiled floor — the regularity is the tell, not the spacing.
   vec2 lf = abs(fract(lc2) - 0.5);
   float lotEdge = smoothstep(0.42, 0.495, max(lf.x, lf.y))
-                * step(0.42, tHash21(floor(lc2) * 2.7 + 11.3))
-                * (1.0 - smoothstep(150.0, 500.0, camDist));
-  // Block-scale variation is deliberately weak and lot-scale strong: the other
-  // way round turns a city into a chessboard of 96 m squares, which is exactly
-  // what the eye picks out as procedural.
-  float urbanV = ((blockId - 0.5) * 0.14 + (lotId - 0.5) * 0.52 * fadeLot
-                  - lotEdge * 0.14) * fadeBlock;
+                * step(0.42, tHash21(lcell * 2.7 + 11.3))
+                * (1.0 - smoothstep(400.0, 1400.0, camDist));
+
+  // Warehouse, tank-farm and yard parcels: 90 x 150 m, which is the real
+  // footprint of a distribution shed, a container block or a group of sidings.
+  vec2 pc = rp * vec2(1.0 / 90.0, 1.0 / 150.0);
+  vec2 pcell = floor(pc);
+  float parcelId  = tHash21(pcell + 5.7);
+  float parcelId2 = tHash21(pcell * 3.3 + 41.1);
+  vec2 pf = abs(fract(pc) - 0.5);
+  float parcelEdge = smoothstep(0.445, 0.495, max(pf.x, pf.y));
+  // Container rows and rail sidings. 12.2 m is a forty-foot box, and siding
+  // centres run about the same. Only half the parcels are striped — the rest
+  // are sheds and apron, and an unbroken field of stripes reads as corduroy
+  // rather than as a port.
+  float fadeYard = 1.0 - smoothstep(1400.0, 4200.0, camDist);
+  float yardSel = step(0.60, parcelId2);
+  float stripePhase = mix(rp.x, rp.y, step(0.5, parcelId)) * (1.0 / 12.2);
+  float stripe = abs(fract(stripePhase) - 0.5) * 2.0;
+
+  // Block-scale variation stays weak and lot-scale strong: the other way round
+  // turns a city into a chessboard of 96 m squares, which is exactly what the
+  // eye picks out as procedural.
+  // A HOUSE IS NOT A LOT. Filling the whole 24 x 26 m cell with roof turned
+  // Wallingford into a chessboard of solid tiles; a Seattle single-family roof
+  // covers a third of its lot and the rest is garden, which is precisely why
+  // the neighbourhood reads green from the air with roofs IN it. So the roof is
+  // a sub-rectangle, jittered off centre per lot so the footprints do not line
+  // up into a lattice.
+  float fadeHouse = 1.0 - smoothstep(2000.0, 5500.0, camDist);
+  vec2 lfrac = fract(lc2) - 0.5 - (vec2(lotId, lotId2) - 0.5) * 0.20;
+  float house = 1.0 - smoothstep(0.22, 0.30, max(abs(lfrac.x), abs(lfrac.y)));
+  float resV = (lotId - 0.5) * 1.4 * fadeLot
+             + (house - 0.30) * 1.6 * fadeHouse
+             + (blockId - 0.5) * 0.50 - lotEdge * 0.55;
+  float indV = (parcelId - 0.5) * 1.75
+             + (stripe - 0.5) * 1.05 * yardSel * fadeYard
+             - parcelEdge * 0.50;
+  float urbanV = (mix(resV, indV, lcIndustrial) - street * 0.9) * fadeBlock;
 
   // Field parcels. Kent/Snoqualmie valley fields run 250-400 m on a side.
   vec2 fc = rp * vec2(1.0 / 300.0, 1.0 / 380.0);
   float fieldId = tHash21(floor(fc) + 1.7);
   float fieldEdge = smoothstep(0.455, 0.497, max(abs(fract(fc.x) - 0.5), abs(fract(fc.y) - 0.5)));
-  float fadeRow = 1.0 - smoothstep(250.0, 900.0, camDist);
+  float fadeRow = 1.0 - smoothstep(700.0, 2600.0, camDist);
   float rowPhase = mix(rp.x, rp.y, step(0.5, fieldId)) * (1.0 / 7.5);
   float rows = abs(fract(rowPhase) - 0.5) * 2.0;
-  float parcelV = (fieldId - 0.5) * 0.62 + (rows - 0.5) * 0.34 * fadeRow - fieldEdge * 0.16;
+  float parcelV = (fieldId - 0.5) * 1.8 + (rows - 0.5) * 0.7 * fadeRow - fieldEdge * 0.45;
 
   // Canopy. 1/16 and 1/4 divide the 32 m noise quantum exactly.
   float standId = tNoise(wp * (1.0 / 220.0));
-  float fadeCanopy = 1.0 - smoothstep(350.0, 1800.0, camDist);
+  float fadeCanopy = 1.0 - smoothstep(1200.0, 5000.0, camDist);
   float canopy = tNoise(lp * (1.0 / 16.0)) * 0.6 + tNoise(lp * 0.25) * 0.4;
-  float organicV = (standId - 0.5) * 0.55 + (canopy - 0.5) * 0.9 * fadeCanopy;
+  float organicV = (standId - 0.5) * 0.9 + (canopy - 0.5) * 1.5 * fadeCanopy;
 
   float wStreet  = smoothstep(1.25, 1.75, lcForm);
   float wParcel  = smoothstep(0.25, 0.75, lcForm) * (1.0 - wStreet);
   float wOrganic = 1.0 - smoothstep(0.25, 0.75, lcForm);
 
-  float lcVar = (wOrganic * organicV + wParcel * parcelV + wStreet * urbanV) * lcAmt;
+  // The signed structure field, -1 = fully the class's soft end, +1 = fully its
+  // hard end.
+  float sVar = clamp(wOrganic * organicV + wParcel * parcelV + wStreet * urbanV, -1.0, 1.0);
 
-  // The second tap only softens the ALBEDO. Structure, roughness and the
-  // canopy fraction all follow tap A, so a boundary blends in colour without
-  // half-drawing two different street grids on top of each other.
+  // ---- ONE CLASS, TWO MATERIALS -----------------------------------------
+  // This is the change round 2's critic asked for by name. A class is no longer
+  // a colour, it is a SPAN between a built/bare/lit end and a vegetated/
+  // shadowed end (geo/landcover.js CLASSES), and the near-field structure
+  // decides where in that span each lot, parcel or stand sits.
+  //
+  // The delta is ZERO MEAN BY CONSTRUCTION — it is measured against the same
+  // mix the class averages to — so nothing about the far field moves. At 8 km
+  // a lot is a fifth of a pixel, sVar has faded to zero, and the ground is
+  // still exactly the published class mean. All the new variance lands in the
+  // 300-2,000 ft band, which is where it was missing.
+  float mixHS = clamp(lcHardMix + sVar * lcVary * 0.5, 0.0, 1.0);
+  vec3 lcDelta = mix(lcSoft, lcHard, mixHS) - mix(lcSoft, lcHard, lcHardMix);
+
+  // ---- THE CLASS BOUNDARY, DISSOLVED ------------------------------------
+  // Three taps at increasing jitter, weighted by two noise fields at 260 m and
+  // 95 m. Only the MEAN is softened; every structural decision above followed
+  // tap A, so a boundary blends in colour without half-drawing two different
+  // street grids on top of each other, and the coastline does not move.
   float lcU2 = (floor(lcRawB.g * 255.0 + 0.5) + 0.5) * (1.0 / 16.0);
-  vec3 lcAlbedoB = tSrgb(texture2D(uLcPalette, vec2(lcU2, 0.25)).rgb);
-  vec3 lcBase = mix(lcAlbedo, lcAlbedoB, 0.34);
+  float lcU3 = (floor(lcRawC.g * 255.0 + 0.5) + 0.5) * (1.0 / 16.0);
+  vec3 lcAlbedoB = tSrgb(texture2D(uLcPalette, vec2(lcU2, 0.125)).rgb);
+  vec3 lcAlbedoC = tSrgb(texture2D(uLcPalette, vec2(lcU3, 0.125)).rgb);
+  float bw = tNoise(wp * (1.0 / 260.0) + vec2(3.1, 8.4));
+  float cw = tNoise(wp * (1.0 / 95.0) + vec2(17.7, 2.3));
+  vec3 lcBase = mix(mix(lcAlbedo, lcAlbedoB, 0.15 + 0.22 * bw),
+                    lcAlbedoC, 0.10 + 0.16 * cw)
+              + lcDelta;
 
   // grain carries the octaves that only exist near the camera (32 m, 8 m and
   // 4 m). Weighting it this hard is the point of the whole file: below ~500 m
   // this is the term that keeps producing new detail, where a 1 m/px photo
   // drape has already run out of source.
-  vec3 lcCol = lcBase * (1.0 + lcVar * 0.58 + grain * 0.60 * lcAmt);
+  vec3 lcCol = lcBase * (1.0 + grain * 0.55 * lcAmt + sVar * 0.16 * lcAmt);
   // Stand-age hue drift: some conifer stands read yellow-brown, and a forest
   // that is one flat hue is the other half of why procedural ground looks fake.
   lcCol *= mix(vec3(1.0), vec3(1.09, 1.0, 0.84),
                wOrganic * lcIsTree * clamp((standId - 0.52) * 2.0, 0.0, 1.0) * 0.55);
 
+  // ---- ROOFS AND YARD SURFACES ------------------------------------------
+  // Roofs are the most varied surface in the built landscape — tar and gravel
+  // beside white membrane beside galvanised steel beside oxide-red brick — and
+  // their colour is the single strongest piece of information in a frame taken
+  // from a light aircraft over a city. Nothing else in this shader had any
+  // chroma to give, which is why a block interior measured sRGB 99,101,101
+  // before this: perfectly neutral, over a class whose own albedo is not.
+  //
+  // Gated on mixHS, so only lots that came out BUILT get a roof and gardens
+  // never do; and faded out by 5 km, before a roof drops under a pixel and the
+  // whole thing degenerates into chroma noise.
+  float roofId = mix(lotId2, parcelId2, lcIndustrial);
+  float roofCover = wStreet * (1.0 - smoothstep(3000.0, 8500.0, camDist))
+                  * smoothstep(0.34, 0.78, mixHS)
+                  * mix(0.58, 0.82, lcIndustrial)
+                  * mix(mix(0.10, 1.0, house * fadeHouse), 1.0, lcIndustrial)
+                  * (1.0 - street);
+  // Pulled 20% back toward the class's own built colour. A roof read straight
+  // from the table is the right hue and the wrong amount of it: the first cut
+  // of this turned Georgetown into a patchwork of red and white rectangles,
+  // which is the same failure as a flat grey quilt with the sign flipped.
+  vec3 roofC = mix(lcHard, tSrgb(tRoofColour(roofId)), 0.88);
+  lcCol = mix(lcCol, roofC * (0.88 + 0.24 * lotId), roofCover);
+
   // Street trees and back gardens. Without this, everything NLCD calls
   // developed comes out pavement-coloured, and Wallingford from 300 m looks
   // like a car park instead of the tree canopy with roofs in it that it is.
-  vec3 cUrbanTree = tSrgb(vec3(0.145, 0.215, 0.125));
-  float treeFrac = lcCanopy * smoothstep(0.30, 0.82, canopy * 0.5 + lotId * 0.5) * (1.0 - street * 0.8);
-  lcCol = mix(lcCol, cUrbanTree * (0.85 + 0.35 * standId), treeFrac);
+  vec3 cUrbanTree = tSrgb(vec3(0.128, 0.205, 0.108));
+  float treeFrac = lcCanopy * smoothstep(0.30, 0.82, canopy * 0.5 + lotId * 0.5)
+                 * (1.0 - street * 0.8) * (1.0 - lcIndustrial * 0.75);
+  lcCol = mix(lcCol, cUrbanTree * (0.80 + 0.45 * standId), treeFrac);
 
   vec3 asphalt = tSrgb(vec3(0.118, 0.118, 0.124));
-  lcCol = mix(lcCol, asphalt * (0.95 + 0.6 * blockId), wStreet * street * 0.38);
+  lcCol = mix(lcCol, asphalt * (0.95 + 0.6 * blockId), wStreet * street * 0.42);
 
   // Real centrelines: TIGER/Line primary (Interstates, 255) and secondary
   // (US and state highways, 160). The mask is one texel wide by construction —
@@ -2580,7 +2757,19 @@ const WATER_COLOUR_GLSL = /* glsl */ `
   wWaveNormal = normalize(vec3(-g.x, 1.0, -g.y));
 
   // Region field: R = bed elevation, G = metres to the nearest land.
-  vec2 fuv = (wp - uFieldRect.xy) * uFieldRect.zw;
+  //
+  // THE FIELD IS 165 m PER TEXEL AND IT SHOWS. Round 2's critic saw Elliott Bay
+  // as "a pale mint mottle with hard blocky edges … rectangular patches and
+  // streaks that follow tile/LOD boundaries", and that is exactly what a
+  // nearest-ish read of a 165 m field looks like when the shallow/deep ramp
+  // hangs off it. Jitter the LOOKUP the same way the land-cover fetch does —
+  // two octaves at roughly a texel — and the rectangles become an irregular
+  // edge instead. It costs two noise taps and no new data.
+  vec2 fjit = vec2(tNoise(wp * (1.0 / 260.0)) - 0.5,
+                   tNoise(wp * (1.0 / 260.0) + vec2(27.3, 6.1)) - 0.5) * 230.0
+            + vec2(tNoise(wp * (1.0 / 70.0) + vec2(4.7, 19.3)) - 0.5,
+                   tNoise(wp * (1.0 / 70.0) + vec2(33.1, 2.9)) - 0.5) * 95.0;
+  vec2 fuv = (wp + fjit - uFieldRect.xy) * uFieldRect.zw;
   vec2 fuvC = clamp(fuv, 0.0, 1.0);
   // Outside the baked region it is open ocean, not the edge texel repeated.
   float outside = (fuv.x != fuvC.x || fuv.y != fuvC.y) ? 1.0 : 0.0;
@@ -2591,13 +2780,23 @@ const WATER_COLOUR_GLSL = /* glsl */ `
   float depth = max(uWaterY - bed, 0.0);
   // Distance to shore, not bathymetry: Terrarium reads a flat zero across the
   // main basin, so depth alone would paint the whole Sound as shallows.
-  float openness = smoothstep(60.0, 1400.0, shore);
+  //
+  // THE RAMP WAS ALSO FIVE TIMES TOO LONG. Elliott Bay is 2.5 km across, so
+  // 60 -> 1400 m left the ENTIRE bay somewhere in the shallow half of the ramp
+  // and the shallow colour — a pale mint — was what the eye actually saw across
+  // the whole basin. Puget Sound drops to 60 m within a couple of hundred
+  // metres of shore almost everywhere; the visible shallow band is a fringe,
+  // not half the water. 30 -> 420 m puts the bay in deep water where it belongs
+  // and keeps a real shallow edge along the beaches.
+  float openness = smoothstep(30.0, 420.0, shore);
   float deepness = (uLake > 0.5) ? openness : max(openness, smoothstep(1.0, 20.0, depth));
 
-  vec3 shallowSalt = tSrgb(vec3(0.29, 0.50, 0.50));
-  vec3 deepSalt    = tSrgb(vec3(0.040, 0.105, 0.160));
-  vec3 shallowFresh= tSrgb(vec3(0.24, 0.40, 0.36));
-  vec3 deepFresh   = tSrgb(vec3(0.055, 0.135, 0.150));
+  // And the shallow colour itself was a tropical lagoon. Puget Sound shallows
+  // are glacial-silt green over a dark bed, not Caribbean mint.
+  vec3 shallowSalt = tSrgb(vec3(0.115, 0.235, 0.240));
+  vec3 deepSalt    = tSrgb(vec3(0.028, 0.072, 0.118));
+  vec3 shallowFresh= tSrgb(vec3(0.105, 0.205, 0.195));
+  vec3 deepFresh   = tSrgb(vec3(0.040, 0.105, 0.120));
   vec3 shallowC = mix(shallowSalt, shallowFresh, uLake);
   vec3 deepC    = mix(deepSalt, deepFresh, uLake);
 

@@ -192,7 +192,7 @@ import { createShadows } from './shadows.js';
  *           is what makes t=0.25 exactly sunrise and t=0.75 exactly sunset.
  *           +23.4 = June solstice, -23.4 = December.
  * @property {number} [sunIntensity]   Peak DirectionalLight intensity. Default 2.6.
- * @property {number} [ambientIntensity] Peak HemisphereLight intensity. Default 1.05.
+ * @property {number} [ambientIntensity] Peak HemisphereLight intensity. Default 0.66.
  * @property {number} [nightAmbientIntensity] Night floor. Default 0.055.
  * @property {number} [moonIntensity]  Peak moonlight DirectionalLight. Default 0.1.
  * @property {number} [moonPhaseOffset] Moon's offset along the day, 0..1. Default 0.5
@@ -212,9 +212,10 @@ import { createShadows } from './shadows.js';
  *           base, metres. 0 makes the deck a vertical extrusion. Default 900.
  * @property {number} [cloudSunDepth]  Optical depth per unit macro density along the
  *           ray to the sun; drives self-shadowing. Default 2.4.
- * @property {number} [cloudRadiusM]   Near-field slab half-width. Default 30000.
+ * @property {number} [cloudRadiusM]   Near-field slab half-width. Default 34000.
  * @property {number} [cloudHandoverM] Distance the near field hands over to the dome.
- *           Default 20000; the fade runs to +4 km.
+ *           Default 12000; the fade runs to `* CLOUD_HANDOVER_WIDTH` = 31.2 km,
+ *           staggered per slab.
  * @property {number} [cloudWindMs]    Deck drift speed. Default 7.
  * @property {number} [cloudWindDirDeg] Bearing the deck drifts TOWARD. Default 215.
  * @property {number} [inCloudVisibilityM] Visibility inside cloud. Default 190.
@@ -248,7 +249,23 @@ const DEFAULTS = {
   declinationDeg: 0,
 
   sunIntensity: 2.6,
-  ambientIntensity: 1.05,
+  // AMBIENT FILL, AND WHY IT CAME DOWN FROM 1.05.
+  //
+  // Two of round 2's findings were the same number. At 1.05 against a sun of
+  // 2.6, a horizontal surface with the sun 40 degrees up took 41% of its light
+  // from a near-white hemisphere. That does two things, both bad and both
+  // measured. It made the four-cascade CSM invisible — toggling shadows moved
+  // 16.7% of pixels by a mean of 9.3 sRGB levels, under 4% contrast, and no
+  // building shadow could be identified in a CBD frame. And it bleached the
+  // ground: a downtown block interior rendered sRGB 99,101,101, perfectly
+  // neutral, over a class albedo of 80,84,65 — the chroma was being washed out
+  // by the fill, not missing from the palette.
+  //
+  // 0.66 puts the diffuse fraction at about 30%, which is also closer to the
+  // measured clear-sky diffuse-to-global ratio at this latitude and sun angle.
+  // The sun's own intensity is untouched: check-sky.mjs ties the cloud-top
+  // brightness to sunLight.intensity / 2.6.
+  ambientIntensity: 0.66,
   nightAmbientIntensity: 0.055,
   moonIntensity: 0.1,
   moonPhaseOffset: 0.5,
@@ -268,8 +285,12 @@ const DEFAULTS = {
   cloudShearM: 900,
   /** Optical depth per unit of macro density along the ray to the sun. */
   cloudSunDepth: 2.4,
-  cloudRadiusM: 30000,
-  cloudHandoverM: 20000,
+  // The slab quad has to outlast the hand-over band, which now ends at
+  // cloudHandoverM * CLOUD_HANDOVER_WIDTH = 31.2 km. 34 km of half-width clears
+  // that on the short axis with margin, and the slabs discard rather than
+  // shade, so the extra area costs geometry and no fill.
+  cloudRadiusM: 34000,
+  cloudHandoverM: 12000,
   cloudWindMs: 7,
   cloudWindDirDeg: 215,
   inCloudVisibilityM: 190,
@@ -313,6 +334,21 @@ const PREETHAM_CONTRAST = 1.2;
  * the CPU would have gone on believing in a deck shape the GPU had stopped
  * drawing.
  */
+/**
+ * The near/far hand-over band, as a MULTIPLE of `cloudHandoverM` rather than a
+ * number of metres added to it.
+ *
+ * The near slabs fade out and the dome's analytic deck fades in across
+ * `[H, H * this]`. Proportional because the band has to look the same width
+ * wherever it is seen, and near the horizon a fixed number of metres of range
+ * subtends almost no angle at all — which is how round 2 ended up with eight
+ * hard rings stacked inside a degree of sky. 2.6 puts the band at 12–31 km.
+ *
+ * `cloudRadiusM` must stay comfortably larger than `cloudHandoverM * this`, or
+ * the slab's own square edge comes into view before it has faded out.
+ */
+const CLOUD_HANDOVER_WIDTH = 2.6;
+
 const CLOUD_ENVELOPE = {
   /** Rounded bottoms: cover ramps in over the first this-much of the deck. */
   base: 0.18,
@@ -681,6 +717,7 @@ const SKY_FRAG = /* glsl */ `
   uniform float uCloudTop;
   uniform float uCloudOpacity;
   uniform float uCloudHandover;
+  uniform float uCloudHandWidth;
   uniform vec3 uCloudLit;
   uniform vec3 uCloudShadow;
 
@@ -835,20 +872,53 @@ const SKY_FRAG = /* glsl */ `
     if ( abs( dy ) < 1e-4 ) return vec4( 0.0 );
     float t = ( planeY - camY ) / dy;
     if ( t <= 0.0 ) return vec4( 0.0 );
-    // Clamped well inside the fog budget: at 120 km the deck is already 82%
-    // haze, and a shorter ray keeps the macro sines' arguments small enough
-    // that float32 trig stays accurate.
-    t = min( t, 120000.0 );
 
-    float handIn = smoothstep( uCloudHandover, uCloudHandover + 4000.0, t );
+    // THE HARD RECTANGLES AT THE HORIZON WERE THIS CLAMP.
+    //
+    // Round 2 clamped t at 120 km "well inside the fog budget". A flat deck seen
+    // from below sends t to infinity as the ray approaches the horizon, so every
+    // ray in the last fraction of a degree hit the clamp — and once t is a
+    // CONSTANT, the hit point sweeps a circle of fixed radius and the density
+    // becomes a function of AZIMUTH ALONE. That draws the deck as vertical bars
+    // with hard left and right edges, sitting in a band above the horizon,
+    // bounded below by the horizon and above by the ray where the clamp stops
+    // binding. It is visible in three of five round-2 frames and unmistakable in
+    // a 14-degree readback. Raising cloud coverage put more bars in view, which
+    // is why more coverage made it worse.
+    //
+    // A clamp cannot be made to work here: any finite value produces the same
+    // degenerate ring. What is needed is for the deck's CONTRIBUTION to reach
+    // zero before the ray does anything strange. Past ~55 km a stratocumulus
+    // deck subtends a third of a degree and is 80% airlight; past 105 km it is
+    // below the noise floor of the sky it sits in. So it is faded out over that
+    // span and the clamp beyond it never has anything left to draw.
+    t = min( t, 140000.0 );
+    float farFade = 1.0 - smoothstep( 55000.0, 105000.0, t );
+    if ( farFade <= 0.0 ) return vec4( 0.0 );
+
+    // HAND-OVER IS PROPORTIONAL, NOT ADDITIVE, and that is the other half of
+    // the horizon artifact. A fixed 4 km fade band is a wide, soft gradient
+    // overhead and a razor edge at the horizon, because near the horizon 4 km of
+    // RANGE is a few arcminutes of ANGLE. Multiplying instead makes the band
+    // constant in log-range, so it subtends a similar angle wherever it is seen
+    // — a genuine gradient at the horizon instead of eight stacked ring edges.
+    float handIn = smoothstep( uCloudHandover, uCloudHandover * uCloudHandWidth, t );
     if ( handIn <= 0.0 ) return vec4( 0.0 );
 
     // WORLD XZ, not camera-relative. The near slabs sample the same world XZ,
     // and that is the only reason the two representations of the deck line up
     // across the hand-over band.
     vec2 hit = cameraPosition.xz + dir.xz * t;
-    float d = cloudDensity( hit, sampleH, 0.55 );
-    float a = d * uCloudOpacity * handIn;
+    // DETAIL HAS TO MATCH THE NEAR SLABS AT THE SEAM. The near field draws the
+    // deck with the fBm fluff at full strength and this used to draw it at a
+    // flat 0.55 everywhere, so even once the hand-over was a smooth gradient the
+    // TEXTURE still changed across it and the eye read the change as an edge.
+    // Ramp instead: full detail where the slabs are handing over, dropping away
+    // with range because at 70 km the fluff is well under a pixel and can only
+    // alias.
+    float det = mix( 0.95, 0.30, smoothstep( 18000.0, 70000.0, t ) );
+    float d = cloudDensity( hit, sampleH, det );
+    float a = d * uCloudOpacity * handIn * farFade;
     if ( a <= 0.001 ) return vec4( 0.0 );
 
     // The same sunward march the near slabs use, at the same hNorm the near
@@ -992,6 +1062,7 @@ const CLOUD_FRAG = /* glsl */ `
   uniform float uLayerAlpha;
   uniform float uSelfFadeM;    // dissolve within this many metres of the camera's altitude
   uniform float uHandover;
+  uniform float uHandWidth;    // hand-over ends at uHandover * uHandWidth
   uniform float uWhiteout;
   uniform float uDeckThickness;
 
@@ -1010,7 +1081,17 @@ const CLOUD_FRAG = /* glsl */ `
 
     // Hand the deck over to the dome's analytic version before the slab's own
     // edge can come into view.
-    float handOut = 1.0 - smoothstep( uHandover, uHandover + 4000.0, dist );
+    //
+    // PROPORTIONAL, and JITTERED PER SLAB. Both matter, and both are about the
+    // horizon. A fixed 4 km band is a few arcminutes of angle out there, so each
+    // slab ended at what was effectively a hard ring; eight slabs at eight
+    // altitudes drew eight of those rings stacked inside about a degree of sky,
+    // which is the horizontal half of the "hard rectangles" the round-2 critic
+    // saw. Multiplying the band instead makes it constant in log-range and
+    // therefore a real angular gradient, and staggering uHandover per slab
+    // (see createSky) smears what is left of the eight edges across 10 km of
+    // range so they can never line up into a visible step.
+    float handOut = 1.0 - smoothstep( uHandover, uHandover * uHandWidth, dist );
     if ( handOut <= 0.0 ) discard;
 
     float d = cloudDensity( vWorld.xz, uLayerH, 1.0 );
@@ -1379,6 +1460,7 @@ export function createSky(scene, renderer, opts = {}) {
     uCloudTop: { value: cfg.cloudTopM },
     uCloudOpacity: { value: 0.92 },
     uCloudHandover: { value: cfg.cloudHandoverM },
+    uCloudHandWidth: { value: CLOUD_HANDOVER_WIDTH },
     uCloudLit: { value: new THREE.Color(1, 1, 1) },
     uCloudShadow: { value: new THREE.Color(0.45, 0.47, 0.52) },
     uCloudCoverage: { value: cfg.cloudCoverage },
@@ -1472,7 +1554,12 @@ export function createSky(scene, renderer, opts = {}) {
           uLayerH: { value: h },
           uLayerAlpha: { value: perLayerAlpha },
           uSelfFadeM: { value: Math.max(20, thickness / n) },
-          uHandover: { value: cfg.cloudHandoverM },
+          // Staggered by the golden-ratio sequence so no two adjacent slabs
+          // hand over at the same range — see CLOUD_FRAG's handOut.
+          uHandover: {
+            value: cfg.cloudHandoverM * (0.82 + 0.36 * ((i * 0.6180339887) % 1)),
+          },
+          uHandWidth: { value: CLOUD_HANDOVER_WIDTH },
           uDeckThickness: { value: thickness },
         },
         vertexShader: CLOUD_VERT,

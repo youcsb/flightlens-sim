@@ -605,7 +605,32 @@ flow: derivatives in non-uniform control flow are undefined.
 
 Colour is procedural, but it is **told what it is painting**. Below the treeline
 the albedo comes from `geo/landcover.js` (§2.14): class index in, palette colour
-plus a near-field structure out. Above it, elevation and slope keep the last
+plus a near-field structure out.
+
+**A class is painted as a SPAN between two materials, not as one colour**, and
+the near-field structure decides where each lot, parcel or stand sits in that
+span (§2.14). Three consequences bind:
+
+1. **The delta is zero-mean.** It is measured against the mix the class averages
+   to, so nothing about the far field moves when the near field gains variance.
+2. **Only the COLOUR taps may wander.** The class fetch takes a `spread`
+   argument. Tap A stays at one texel because it decides where the water is, and
+   the coastline is geographic truth (§1.5). Taps B and C — spread 2.6 and 5.4,
+   blended by noise at 260 m and 95 m — feed the albedo only, and are what
+   dissolve the survey's polygon edges without moving a shoreline.
+3. **"Industrial" is a reading of two real datasets, not a label.** NLCD grades
+   development by imperviousness and has no industrial class, so a container
+   terminal arrives tagged identically to an apartment block. Heavy intensity
+   *below 30 m of DEM elevation* is the honest reading in this region: it puts
+   yards on Harbor Island, Georgetown, Interbay and the Kent valley floor and
+   leaves Queen Anne, Capitol Hill and West Seattle residential. Yard and
+   warehouse structure keys off that scalar; roof and garden structure off its
+   complement. It is a heuristic and it is labelled as one in the shader.
+
+Every structural fade distance is set from the PIXEL FOOTPRINT, `dist * 0.00145`
+at 1120x720 and 60 degrees. Round 2 faded the lot grid out from 600 m and the
+canopy from 350 m, which switched almost every structural term off at exactly
+the altitude the sim is judged from; a 24 m lot is eight pixels wide at 2 km. Above it, elevation and slope keep the last
 word, because a 30 m classification has nothing useful to say about a 45° rock
 rib — with one exception, NLCD's perennial ice/snow class, which is a survey of
 where the glaciers are and beats any snowline estimate. Steep faces still go to
@@ -668,7 +693,7 @@ river reflecting noon at dusk.
 ```js
 loadLandcover() -> Promise<{
   region, detail,             // {texture, rect, texelM, width, height, data} | null
-  palette,                    // 16x2 RGBA DataTexture: albedo / (rough, detail, form, canopy)
+  palette,                    // 16x4 RGBA DataTexture, one row per line below
   classAtLocal(x, z) -> idx,  // -1 where no raster covers
   isOpenWaterLocal(x, z) -> boolean,
   manifest, dispose()
@@ -680,6 +705,34 @@ bbox, `detail` at ~20 m/texel over the Seattle inset. Encoding is documented in
 the file header and in `public/landcover/manifest.json`; the short version is
 `R` = NLCD code (provenance), `G` = compact class index (what the shader
 indexes), `B` = road mask.
+
+**The palette is four rows, and a class is a SPAN rather than a colour.**
+
+| row | v | contents |
+|---|---|---|
+| 0 | 0.125 | `albedo` — the class mean. What the far field paints. |
+| 1 | 0.375 | `(rough, detail, form / 2, canopy)` |
+| 2 | 0.625 | `hard` — the built / bare / lit end, alpha = `hardMix` |
+| 3 | 0.875 | `soft` — the vegetated / shadowed end, alpha = `vary` |
+
+Rows 2 and 3 exist because no real land-cover class is one material.
+"Developed, Low Intensity" is roofs AND gardens; a fir stand is sunlit crown AND
+the near-black gap between crowns. What a pilot at 1,000 ft reads is the
+CONTRAST between the two at the scale of a lot or a stand, not the average — and
+round 2 measured a downtown block interior at sRGB 99,101,101, perfectly
+neutral, against a class albedo of 80,84,65. The mean was never the problem.
+
+`terrain.js` mixes `hard` ↔ `soft` per lot, per parcel or per stand and adds the
+result as a **zero-mean delta** measured against `mix(soft, hard, hardMix)`. That
+is the invariant to preserve if you retune the table: the far field must not
+move, because at 8 km a lot is a fifth of a pixel and `albedo` is the only
+honest answer there.
+
+Three properties of the textures are load-bearing: `colorSpace = NoColorSpace`
+(an sRGB curve applied to a class *index* turns class 9 into class 2),
+`NearestFilter` with no mipmaps (linear filtering an index map invents a texel
+of barren rock along every boundary — the shader dissolves the grid with a
+noise-jittered lookup instead), and `flipY = false` so image row 0 is north.
 
 Three properties of the textures are load-bearing: `colorSpace = NoColorSpace`
 (an sRGB curve applied to a class *index* turns class 9 into class 2),
@@ -712,8 +765,43 @@ opts = { turbidity = 8, fogDensity = 8e-6, timeOfDay = 0.42,
          sunDistance = 120000, sunAzimuthDeg = 180, dayLengthSec = 0,
          rayleigh = 1.2, mieCoefficient = 0.002, exposure = 0.95,
          fogViewBlend = 0.7, cloudLayers = 8, cloudShearM = 900,
+         cloudRadiusM = 34000, cloudHandoverM = 12000, ambientIntensity = 0.66,
          shadows = true, shadowQuality = 'high', aircraftReceivesShadow = true }
 ```
+
+**THE NEAR/FAR CLOUD HAND-OVER IS PROPORTIONAL, AND THE FAR DECK IS NEVER
+CLAMPED.** Both rules exist because of the same artifact, and both are easy to
+undo by accident.
+
+The deck has two representations (see the file header): `cloudLayers` horizontal
+slabs near the camera, and an analytic ray/plane intersection on the sky dome
+beyond. Round 2 crossed them over across a fixed 4 km band and clamped the
+dome's ray length at 120 km. Near the horizon a flat deck sends the ray length
+to infinity, so **every** ray in the last fraction of a degree hit that clamp;
+once the range is constant the hit point sweeps a circle of fixed radius and
+cloud density becomes a function of AZIMUTH ALONE, which draws the deck as
+vertical bars with hard edges in a band above the horizon. The same geometry
+turned the fixed 4 km cross-over band into eight hard rings — one per slab —
+stacked inside about a degree of sky.
+
+So: the band runs `[H, H * CLOUD_HANDOVER_WIDTH]` (2.6, i.e. 12–31 km), which is
+constant in log-range and therefore a real angular gradient wherever it is seen;
+each slab's `H` is staggered by the golden-ratio sequence so no two edges can
+line up; and the dome fades the deck's alpha out between 55 and 105 km, where it
+subtends a third of a degree and is 80% airlight, so the clamp beyond it never
+has anything left to draw. `cloudRadiusM` must stay comfortably above
+`cloudHandoverM * CLOUD_HANDOVER_WIDTH` or the slab's own square edge appears.
+
+Measured on the matched 610 m downtown camera, mean |dLuma/dx| in the sky-only
+band immediately above the horizon: **0.673 → 0.427**, p99 6.14 → 4.86, and the
+bars are absent from a 14-degree-fov readback that showed them plainly before.
+
+**Ambient is 0.66, not 1.05.** At 1.05 against a sun of 2.6 a horizontal surface
+took 41% of its light from a near-white hemisphere, which bleached the ground's
+chroma — see the 99,101,101 measurement in §2.14. 0.66 puts the diffuse fraction
+near 30%, closer to the measured clear-sky diffuse-to-global ratio at this
+latitude. Do not raise `sunIntensity` to compensate: `check-sky.mjs` ties the
+cloud-top brightness to `sunLight.intensity / 2.6`.
 
 This module owns `scene.background`, `scene.fog` and **every light**. No other
 module may add one. `sunLight` / `ambientLight` are exposed so others can read
