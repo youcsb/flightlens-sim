@@ -534,7 +534,11 @@ export function createTouchControls(opts = {}) {
     // The root itself is inert. Only the controls below opt back in, which is
     // what keeps the HUD, the menus and the canvas reachable.
     pointerEvents: 'none',
-    zIndex: '20',
+    // Between the instrument panel (20) and the chrome (30), so a menu sheet,
+    // the boot screen and the crash banner all cover the thumbs, and the
+    // thumbs cover the tapes. main.js mounts this inside #hud so the three
+    // numbers are actually in one stacking context — see the note there.
+    zIndex: '25',
     overflow: 'hidden',
   });
   root.setAttribute('data-touch-controls', '1');
@@ -733,6 +737,11 @@ export function createTouchControls(opts = {}) {
   const scratch = { u: 0, v: 0 };
 
   function bindZone(node, zone) {
+    // Named, so anything outside this module can find a control without
+    // pattern-matching on inline styles. The buttons already carry
+    // `data-touch-button`; the three continuous zones had nothing, which is
+    // why check-touch.mjs was identifying the stick by "border-radius is 50%".
+    node.setAttribute('data-touch-zone', zone);
     function down(e) {
       // Multi-button mice: only the primary button flies.
       if (e.pointerType === 'mouse' && e.button !== 0) return;

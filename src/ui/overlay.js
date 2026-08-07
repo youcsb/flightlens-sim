@@ -45,7 +45,9 @@
  * "W / S nose down / up" to someone who cannot press W is worse than showing
  * nothing. On a coarse pointer the sheet shows TAPPABLE actions instead, which
  * synthesise the keystroke their desktop equivalent would send (or call
- * `o.onAction(code)` if the integrator supplies one).
+ * `o.onAction(code, repeat)` if the integrator supplies one) — `repeat` is
+ * true for every tick of a press-and-hold after the first, exactly as a
+ * keyboard's auto-repeat reports it.
  *
  * THE TWO BOTTOM CORNERS BELONG TO THE TOUCH CONTROLS. Nothing in this file is
  * positioned into TOUCH_RESERVE; the sheet is centred and the chips are along
@@ -538,9 +540,9 @@ export function createOverlay(container, o = {}) {
   }
 
   // --- action buttons ------------------------------------------------------
-  wireActions(acts, (code) => {
-    if (typeof o.onAction === 'function') o.onAction(code);
-    else fireKey(code);
+  wireActions(acts, (code, repeat) => {
+    if (typeof o.onAction === 'function') o.onAction(code, repeat);
+    else fireKey(code, repeat);
     if (code === 'KeyR' || code === 'KeyP') closeSheet();
   });
 
@@ -678,8 +680,11 @@ export function createOverlay(container, o = {}) {
  * handles — the flight controls (W/A/S/D, throttle, flaps, brakes) are NOT
  * here, because they belong to `controls/input.js` and its touch layer.
  *
- * `hold` marks the two that repeat: the heading bug steps one degree per press
- * and swinging it 90 degrees by tapping is not a control.
+ * `hold` marks the four that repeat — both bug pairs. The heading bug steps one
+ * degree and the altitude bug 100 feet per press, and setting either by tapping
+ * is not a control: 054 to 234 is 180 taps, 1,000 ft to 8,000 ft is 70. Held,
+ * both accelerate (main.js ramps the step on the repeat count) and land in
+ * about a second and a half.
  */
 const ACTIONS = [
   ['KeyC', 'VIEW'],
@@ -690,8 +695,8 @@ const ACTIONS = [
   ['KeyR', 'RESET'],
   ['KeyL', 'A/P'],
   ['KeyY', 'BUG=HDG'],
-  ['KeyU', 'ALT +100'],
-  ['KeyJ', 'ALT −100'],
+  ['KeyU', 'ALT +100', true],
+  ['KeyJ', 'ALT −100', true],
   ['BracketLeft', 'HDG −', true],
   ['BracketRight', 'HDG +', true],
 ];
@@ -712,20 +717,30 @@ const KEY_CHAR = {
  * `controls/input.js` uses the same trick for its own touch buttons
  * (`TOUCH_KEY`), so the pattern is the house pattern, not an invention here.
  */
-function fireKey(code) {
+function fireKey(code, repeat = false) {
   if (typeof window === 'undefined' || typeof KeyboardEvent !== 'function') return;
-  const init = { code, key: KEY_CHAR[code] || '', bubbles: true, cancelable: true };
+  const init = {
+    code, key: KEY_CHAR[code] || '', bubbles: true, cancelable: true,
+    // A held thumb IS an auto-repeat, and saying so is what earns the phone
+    // main.js's acceleration ramp instead of 180 identical one-degree nudges.
+    // The `keyup` deliberately never carries it: a repeat is a press that has
+    // not ended, and input.js's key set would keep a released key "held".
+    repeat,
+  };
   window.dispatchEvent(new KeyboardEvent('keydown', init));
-  window.dispatchEvent(new KeyboardEvent('keyup', init));
+  window.dispatchEvent(new KeyboardEvent('keyup', { ...init, repeat: false }));
 }
 
 /**
  * Wire the action grid. Tap fires once; press-and-hold on a `data-hold`
- * button repeats and accelerates, which is how the heading bug is usable at
- * all with a thumb.
+ * button repeats and accelerates, which is how either bug is usable at all
+ * with a thumb.
  *
- * NB: `main.js#onKeyDown` returns early on `e.repeat`, so a synthetic repeat
- * flag would be swallowed. Each tick is therefore a fresh non-repeat event.
+ * `run(code, repeat)` — every tick after the first says it is a repeat, so the
+ * phone gets the same accelerating step a desktop keyboard's auto-repeat gets.
+ * That flag used to be pointless because `main.js#onKeyDown` dropped every
+ * repeat at the door; it now passes the four bug keys through, which is also
+ * what made the DESKTOP ramp work for the first time.
  */
 function wireActions(host, run) {
   const buttons = host.querySelectorAll ? host.querySelectorAll('button[data-code]') : [];
@@ -734,7 +749,7 @@ function wireActions(host, run) {
     if (!b.getAttribute('data-hold')) {
       b.addEventListener('click', () => {
         b.blur();
-        run(code);
+        run(code, false);
       });
       continue;
     }
@@ -746,7 +761,7 @@ function wireActions(host, run) {
       n = 0;
     };
     const step = () => {
-      run(code);
+      run(code, n > 0);
       n += 1;
       timer = setTimeout(step, n < 4 ? 190 : n < 14 ? 90 : 55);
     };

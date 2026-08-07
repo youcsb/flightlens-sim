@@ -221,20 +221,14 @@ function mountOverlay(w = 375, h = 812, onAction) {
       if (onAction) onAction(id, down);
     },
   });
-  const byZone = {
-    stick: tc.root.find((n) => n.getAttribute('data-touch-controls') === null && n.style.borderRadius === '50%' && n.style.position === 'absolute' && n.style.pointerEvents === 'auto'),
-  };
-  // The zones are the three surfaces appended directly to root after the
-  // buttons; find them by their placed rects instead of guessing.
+  // Every control is addressable by name: `data-touch-zone` on the three
+  // continuous surfaces, `data-touch-button` on the six buttons. The previous
+  // version of this helper matched the stick on "border-radius is 50% and
+  // pointer-events is auto", which would have silently found the wrong element
+  // the day anything else in the overlay went round.
   const L = tc.layout();
-  const match = (r) => tc.root.find((n) => {
-    const g = n.getBoundingClientRect();
-    return g.width === r.w && g.height === r.h && g.left === r.x && g.top === r.y
-      && n.style.pointerEvents === 'auto';
-  });
-  byZone.stick = match(L.stick);
-  byZone.rudder = match(L.rudder);
-  byZone.throttle = match(L.throttle);
+  const byZone = {};
+  for (const z of ZONES) byZone[z] = tc.root.find((n) => n.getAttribute('data-touch-zone') === z);
   const buttons = new Map();
   for (const b of BUTTONS) {
     buttons.set(b.id, tc.root.find((n) => n.getAttribute('data-touch-button') === b.id));
@@ -733,6 +727,24 @@ console.log('\n\x1b[1mdrawing and teardown\x1b[0m');
   ok('the knob returns to the centre when the axis does', knob.style.transform === 'translate3d(0.0px,0.0px,0)', knob.style.transform);
 }
 {
+  // THE STACKING CONTRACT. Three modules draw into the same corner of the same
+  // page and each picked its own z-index in a different week: instruments.js
+  // 20, touch.js 25, overlay.js 30. Those numbers only sort correctly if all
+  // three share one stacking context, which is why main.js mounts this overlay
+  // into #hud rather than taking input.js's default of the canvas's parent
+  // (#hud carries z-index 10 and traps its children). Assert the middle
+  // number here so a well-meaning bump to 40 has to come past a red check.
+  const m = mountOverlay(375, 812);
+  const root = m.parent.children.find((n) => n.getAttribute('data-touch-controls') === '1');
+  ok('the touch root sits above the instrument panel', Number(root.style.zIndex) > 20, root.style.zIndex);
+  ok('and below the chrome, so a menu sheet covers the thumbs', Number(root.style.zIndex) < 30, root.style.zIndex);
+  ok('the root itself is inert — the canvas keeps everything the thumbs miss',
+    root.style.pointerEvents === 'none');
+  for (const z of ZONES) {
+    ok(`the ${z} is addressable by name`, m.zones[z]?.getAttribute('data-touch-zone') === z);
+  }
+}
+{
   const m = mountOverlay(375, 812);
   const before = m.win.listenerCount() + m.tc.root.listenerCount();
   ok('the overlay attached listeners', before > 20, `${before}`);
@@ -893,18 +905,16 @@ function frames(input, n) {
     && Object.keys(first).length === 7);
 
   // Fly it: stick back-left, rudder right, throttle up.
-  const surf = (r) => input.touchLayout() && findByRect(canvasParent, r);
-  function findByRect(rootEl, r) {
-    return rootEl.find((n) => {
-      const g = n.getBoundingClientRect();
-      return g.left === r.x && g.top === r.y && g.width === r.w && g.height === r.h
-        && n.style.pointerEvents === 'auto';
-    });
-  }
-  const stickEl = surf(L.stick);
-  const rudderEl = surf(L.rudder);
-  const throttleEl = surf(L.throttle);
+  const surf = (z) => canvasParent.find((n) => n.getAttribute('data-touch-zone') === z);
+  const stickEl = surf('stick');
+  const rudderEl = surf('rudder');
+  const throttleEl = surf('throttle');
   ok('the overlay mounted into the canvas’s parent', !!stickEl && !!rudderEl && !!throttleEl);
+  ok('and every control it placed is where the layout says it is',
+    [[stickEl, L.stick], [rudderEl, L.rudder], [throttleEl, L.throttle]].every(([n, r]) => {
+      const g = n.getBoundingClientRect();
+      return g.left === r.x && g.top === r.y && g.width === r.w && g.height === r.h;
+    }));
 
   let p = at(stickEl, 0, 1);
   fire(stickEl, 'pointerdown', { id: 1, x: p.x, y: p.y });

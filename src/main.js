@@ -73,6 +73,19 @@ const hudEl = document.getElementById('hud');
 
 /** Consecutive auto-repeats of the heading-bug key, for the acceleration ramp. */
 let hdgRepeat = 0;
+/** Consecutive auto-repeats of the altitude-bug key. Same ramp, coarser steps. */
+let altRepeat = 0;
+
+/**
+ * The only keys a HELD press should keep firing. Everything else in
+ * `onKeyDown` is a toggle or a teleport, and a repeat on one of those is a
+ * bug — see the guard in `onKeyDown` for what this replaced and why.
+ *
+ * All four are bug setters: they nudge a target the autopilot will fly to.
+ * Nudging is inherently a "do it again until it looks right" gesture, so it is
+ * the one thing here that has to survive a finger left on the button.
+ */
+const REPEATABLE_KEYS = new Set(['BracketLeft', 'BracketRight', 'KeyU', 'KeyJ']);
 
 // ---------------------------------------------------------------------------
 // Places you can start from.
@@ -375,7 +388,22 @@ async function boot() {
   flight.reset();
 
   const instruments = createInstruments(hudEl);
-  const input = createInput(renderer.domElement);
+  // THE THUMB COCKPIT MOUNTS INTO #hud, NOT INTO #app.
+  //
+  // input.js's default parent is the canvas's parent — #app — and that is the
+  // right default for a module that cannot assume this page's markup. Here it
+  // is wrong, and silently: #hud carries `z-index: 10`, which makes it a
+  // stacking context, so overlay.js's `z-index: 30` chrome is trapped inside
+  // it and loses to ANY positive z-index on a sibling of #hud. The touch root
+  // is `z-index: 25`. Left in #app it would draw over the boot screen, over
+  // the menu sheet and over the crash banner — a stick painted across a modal.
+  // Inside #hud the three layers finally sort the way each module thought they
+  // did: tapes 20, thumbs 25, chrome 30.
+  //
+  // #hud is `pointer-events: none`; every control surface sets `auto` on
+  // itself (touch.js#surface), so the fingers still land and the canvas still
+  // gets everything they miss.
+  const input = createInput(renderer.domElement, { touchParent: hudEl });
   const cameras = createCameras(aircraft.group, renderer);
   const sound = createSoundscape();
   const autopilot = createAutopilot();
@@ -502,16 +530,32 @@ async function boot() {
   // cameras.js. What is left over — where am I, what time is it, is it
   // running — belongs to the composition root.
   function onKeyDown(e) {
-    if (e.repeat || e.metaKey || isEditable(e.target)) return;
-
-    // Any keystroke is a user gesture, and a user gesture is the only thing
-    // that can start an AudioContext. Cheap and idempotent.
-    if (!muted) sound.resume();
+    if (e.metaKey || isEditable(e.target)) return;
 
     // `e.code` is empty on virtual keyboards and some accessibility paths —
     // see core/keycode.js. Same normalisation input.js and cameras.js use, so
     // all three agree on what key was pressed.
     const code = eventCode(e);
+
+    // AUTO-REPEAT IS DROPPED FOR EVERYTHING EXCEPT THE FOUR BUG KEYS.
+    //
+    // The blanket `if (e.repeat) return` this replaces was right for the
+    // toggles — leaning on C would cycle the camera thirty times a second —
+    // and it silently killed the one place that WANTED repeats. The `[`/`]`
+    // case below reads `e.repeat` to accelerate its step from 1 degree to 5,
+    // and it could never once have run: the guard returned before the switch
+    // was reached, so `hdgRepeat` was permanently 0 and holding `]` on a
+    // desktop keyboard moved the bug exactly one degree and then stopped.
+    //
+    // Now the four bug keys are let through and the acceleration works — on
+    // the keyboard, and on the phone, where overlay.js's press-and-hold sends
+    // the same repeats and a 180-degree swing is one thumb-press instead of
+    // 180 taps.
+    if (e.repeat && !REPEATABLE_KEYS.has(code)) return;
+
+    // Any keystroke is a user gesture, and a user gesture is the only thing
+    // that can start an AudioContext. Cheap and idempotent.
+    if (!muted) sound.resume();
 
     switch (code) {
       case 'KeyC':
@@ -582,7 +626,18 @@ async function boot() {
       }
       case 'KeyU':
       case 'KeyJ': {
-        const bug = autopilot.nudgeAltitude(code === 'KeyU' ? 100 : -100);
+        // Same ramp as the heading bug. 100 ft a press is right for trimming a
+        // cruise; it is 40 presses to climb from pattern altitude to 8,000 ft,
+        // which is why holding has to be worth something.
+        //
+        // The top step is 300, not 500. overlay.js's hold fires every 55 ms
+        // once it is up to speed, so 500 is 9,000 ft per second of thumb —
+        // measured, and it flew the bug from 1,000 to 11,700 in a press that
+        // felt like a tap. 300 crosses the whole useful band, ground to
+        // 15,000 ft, in about four seconds, which is a thumb you can aim.
+        altRepeat = e.repeat ? Math.min(altRepeat + 1, 60) : 0;
+        const step = altRepeat > 30 ? 300 : altRepeat > 12 ? 200 : 100;
+        const bug = autopilot.nudgeAltitude(code === 'KeyU' ? step : -step);
         overlay.toast(`ALT bug ${bug} ft`);
         break;
       }
