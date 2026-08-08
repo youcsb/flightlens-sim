@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "node scripts/check-contract.mjs",
-    "check:all": "npm run check && npm run check:device && npm run check:elevation && npm run check:landcover && npm run check:geo-mobile && npm run check:terrain && npm run check:airports && npm run check:buildings && npm run check:sky && npm run check:shadows && npm run check:aircraft && npm run check:instruments && npm run check:autopilot && npm run check:touch && npm run check:trim && npm run envelope && npm run check:jet",
+    "check:all": "npm run check && npm run check:device && npm run check:elevation && npm run check:landcover && npm run check:geo-mobile && npm run check:terrain && npm run check:airports && npm run check:buildings && npm run check:sky && npm run check:shadows && npm run check:aircraft && npm run check:instruments && npm run check:autopilot && npm run check:touch && npm run check:trim && npm run envelope && npm run check:jet && npm run check:b738",
     "check:aircraft": "node scripts/check-aircraft.mjs",
     "check:device": "node scripts/check-device.mjs",
     "check:airports": "node scripts/check-airports.mjs",
@@ -32,7 +32,8 @@
     "check:autopilot": "node scripts/check-autopilot.mjs",
     "upload:tiles": "node scripts/upload-tiles-r2.mjs",
     "check:trim": "node scripts/check-trim.mjs",
-    "check:jet": "node scripts/jet-envelope.mjs"
+    "check:jet": "node scripts/jet-envelope.mjs",
+    "check:b738": "node scripts/check-b738.mjs"
   },
   "dependencies": {
     "three": "^0.185.1"
