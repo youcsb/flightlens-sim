@@ -125,3 +125,51 @@ memory/perf regression) and their fixes.
 `https://www.geo-fs.com/geofs.php?v=3.9` — **not** `geofs.com` (its cert is issued
 to `www.geoheat.com`). Needs 60+ seconds before the viewport stops being black.
 The "Privacy Shield / Download extension" panel is a deceptive ad — never click it.
+
+## Boeing 737-800 — plan of record (started 2026-08-07)
+
+**BOTH AIRCRAFT, SELECTABLE. The Cessna is not being replaced.** Ken was
+explicit: "make sure we can pick between the current cesna or a 737, don't just
+change the only option." Every step below preserves the C172 as the default.
+
+**Local only for now** — no deploying to flightlens.us until the kinks are out.
+game.flightlens.us keeps serving the Cessna-only build.
+
+### Step 1 (in progress) — parameterize the flight model
+
+flightModel.js had 67 module-scope constants describing exactly one aeroplane.
+`DEFAULTS` already carried mass, wing area, span, power, cd0 and the inertias;
+what stayed hardcoded were the aero derivatives, control travel, flaps, the prop
+model, the gear contact table, and the limits.
+
+The refactor makes an airframe a DATA FILE (`src/physics/airframes/c172.js`), so
+a 737 is a sibling file rather than a code change.
+
+**Gate: behaviour-preserving.** A baseline of envelope / trim / autopilot output
+was captured before the change; the diff must be empty. Every number — rotate
+55 kt, best climb 743 fpm, climb 764 → 297 fpm with altitude, the stall break,
+the landing — has to come out identical, because only the LOCATION of the
+numbers changed.
+
+### Then, in order
+
+2. **737 flight model** — `airframes/b738.js`: Mach drag rise above ~M0.7,
+   turbofan spool lag (N1 takes 5–8 s, not a prop's instant response), slats as
+   well as flaps, spoilers, ~250–450 kt envelope, Vne ~340 KIAS / M0.82.
+3. **737 3D model** — swept wings, two underwing nacelles, winglets, larger
+   gear. A sibling of the procedural C172 in `aircraft/model.js`.
+4. **Aircraft picker** — in the place picker / menu, and it must survive a
+   `reset`. Per-aircraft spawns: a jet wants KSEA's long runway or an airborne
+   start, not KBFI 32L at idle.
+5. **Per-aircraft autopilot gains** — the current ones are tuned for 40–160 kt
+   and its airspeed protection floor is 58 kt. A jet needs its own set.
+6. **Tile prefetch at 450 kt** — the DEM pager was tuned for ~100 kt and is
+   untested at 4.5x that. Genuinely unknown; expect this to need work.
+
+### Deliberately deferred
+
+**The glass cockpit.** A 737 wants a PFD/ND, which is effectively a new
+2,000-line module. Skipping it is roughly half the work, and a real 737 carries
+standby analog instruments for exactly these readings — so the existing six-pack
+is not a cop-out. Its own round later, better for having a flying jet to build
+against.
