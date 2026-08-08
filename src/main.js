@@ -453,6 +453,7 @@ async function boot() {
 
   overlay.setAircraft?.(type.name);
   instruments.setEngineGauge?.(flight.state.engineGauge);
+  autopilot.setProfile?.(type.autopilot);
 
   const dem = getRegionStats();
   console.info(
@@ -558,6 +559,9 @@ async function boot() {
     cameras.update(0, flight.state);
 
     instruments.setEngineGauge?.(flight.state.engineGauge);
+    // Gains for the aeroplane that now exists. Also re-zeros the integrators,
+    // which were wound up for the one that does not.
+    autopilot.setProfile?.(type.autopilot);
     overlay.setAircraft?.(type.name);
     overlay.toast(`${type.name} · ${p.label}`);
     console.info(`[sim] aircraft -> ${type.name} (${typeId})`);

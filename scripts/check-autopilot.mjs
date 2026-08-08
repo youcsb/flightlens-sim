@@ -20,6 +20,8 @@
 
 import { createFlightModel } from '../src/physics/flightModel.js';
 import { createAutopilot } from '../src/systems/autopilot.js';
+import { B738 } from '../src/physics/airframes/b738.js';
+import { getAircraftType } from '../src/aircraft/types.js';
 
 const GROUND_M = 0;
 const DT = 1 / 60;
@@ -780,6 +782,117 @@ console.log('\nautopilot — engage rules and disconnect');
       Number.isFinite(flight.state.headingDeg) &&
       Number.isFinite(flight.state.rollDeg),
   );
+}
+
+// ---------------------------------------------------------------------------
+// The 737 — the same autopilot, different gains
+//
+// The gains live in aircraft/types.js and this section reads them from there,
+// so it guards the SHIPPED profile rather than a copy of it. What is asserted
+// is the pair of properties the profile exists for: that the loop does not
+// hunt on a heavy aeroplane, and that the airspeed protection is set to a
+// speed this aeroplane can actually reach.
+// ---------------------------------------------------------------------------
+{
+  const JET = getAircraftType('b738').autopilot;
+  const jetAirborne = (kts = 250, altFt = 10000) => {
+    const f = createFlightModel({ airframe: B738 });
+    f.reset(47.53, -122.30, 0, {
+      altitudeMslM: altFt * 0.3048,
+      airspeedMs: kts * 0.514444,
+    });
+    for (let i = 0; i < 30; i += 1) {
+      f.step(DT, { pitch: 0, roll: 0, yaw: 0, throttle: 0.75, flaps: 0, brakes: 0 }, GROUND_M);
+    }
+    return f;
+  };
+
+  /** Fly level for `secs` and count how badly the vertical loop hunts. */
+  const hunt = (profile, secs = 120) => {
+    const f = jetAirborne();
+    const ap = createAutopilot();
+    ap.setProfile(profile);
+    const r = ap.toggle(f.state);
+    if (!r.ok) return { refused: r.reason };
+    const step = () => {
+      const inp = { pitch: 0, roll: 0, yaw: 0, throttle: 0.75, flaps: 0, brakes: 0 };
+      ap.update(DT, f.state, inp);
+      f.step(DT, inp, GROUND_M);
+    };
+    for (let i = 0; i < 30 / DT; i += 1) step(); // settle
+    let rev = 0, last = 0, peak = 0, lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < secs / DT; i += 1) {
+      step();
+      const vs = f.state.verticalSpeedFpm;
+      if (last * vs < 0) rev += 1;
+      last = vs;
+      if (Math.abs(vs) > peak) peak = Math.abs(vs);
+      if (f.state.altitudeFt < lo) lo = f.state.altitudeFt;
+      if (f.state.altitudeFt > hi) hi = f.state.altitudeFt;
+    }
+    return { rev, peak, band: hi - lo, engaged: ap.status().engaged };
+  };
+
+  const withJet = hunt(JET);
+  const withCessna = hunt(null);
+  ok(
+    'the jet profile does not hunt',
+    withJet.rev <= 6,
+    `${withJet.rev} vertical-speed reversals in 2 min, peak ${withJet.peak.toFixed(0)} fpm`,
+  );
+  ok(
+    '  and it holds altitude',
+    withJet.band < 120,
+    `${withJet.band.toFixed(0)} ft band over 2 minutes at 250 kt`,
+  );
+  ok('  and it stays engaged', withJet.engaged === true);
+  // The comparison IS the justification for the profile existing. If the
+  // Cessna gains ever stop hunting on this airframe, the profile is carrying
+  // its own weight for a reason nobody wrote down and should be re-derived.
+  ok(
+    '  and the Cessna gains demonstrably would',
+    withCessna.rev > withJet.rev * 5,
+    `Cessna gains: ${withCessna.rev} reversals, peak ${withCessna.peak.toFixed(0)} fpm`,
+  );
+
+  // AIRSPEED PROTECTION. Command a climb the aeroplane has no energy for and
+  // check it gives up the climb rather than decaying into the stall. A 58 kt
+  // floor — the Cessna's — cannot fire on an aeroplane that stalls at 143.
+  ok('the jet floor is above the jet stall speed', JET.vsFloorKts > 143,
+    `floor ${JET.vsFloorKts} kt vs Vs 143 kt`);
+  {
+    const f = jetAirborne(180);
+    const ap = createAutopilot();
+    ap.setProfile(JET);
+    ap.toggle(f.state);
+    ap.nudgeAltitude(6000);
+    let min = Infinity;
+    for (let i = 0; i < 180 / DT; i += 1) {
+      const inp = { pitch: 0, roll: 0, yaw: 0, throttle: 0.25, flaps: 0, brakes: 0 };
+      ap.update(DT, f.state, inp);
+      f.step(DT, inp, GROUND_M);
+      if (f.state.indicatedAirspeedKts < min) min = f.state.indicatedAirspeedKts;
+      if (f.state.stalled || f.state.crashed) break;
+    }
+    ok('a climb it cannot afford does not stall it', !f.state.stalled && !f.state.crashed,
+      `held ${min.toFixed(0)} KIAS at 25% thrust`);
+    // The floor is not a wall. It scales the COMMANDED climb to zero, and an
+    // aeroplane already slowing at 25% thrust carries a little past it before
+    // the pitch comes off. What matters is the margin over the 143 kt stall,
+    // which is what the floor was chosen to buy.
+    ok('  and it kept a real margin over the stall', min > 150,
+      `${min.toFixed(0)} KIAS, floor ${JET.vsFloorKts}, stall 143`);
+  }
+
+  // A profile is optional. An aeroplane that supplies none must still fly.
+  {
+    const f = jetAirborne();
+    const ap = createAutopilot();
+    ap.setProfile(undefined);
+    const r = ap.toggle(f.state);
+    ok('setProfile(undefined) restores the defaults, it does not zero them',
+      r.ok === true);
+  }
 }
 
 console.log(

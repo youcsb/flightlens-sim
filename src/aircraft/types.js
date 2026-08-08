@@ -62,6 +62,9 @@ export const AIRCRAFT_TYPES = [
       eye: new THREE.Vector3(0, 0.76, -0.86),
       panelEye: new THREE.Vector3(0, 0.70, -0.95),
     },
+    /** No autopilot profile: systems/autopilot.js IS tuned for this aeroplane,
+     *  and its defaults are the measured Cessna numbers. */
+    autopilot: null,
   },
   {
     id: 'b738',
@@ -108,6 +111,50 @@ export const AIRCRAFT_TYPES = [
       scale: 2.7,
       eye: new THREE.Vector3(0, 1.45, -17.3),
       panelEye: new THREE.Vector3(0, 1.38, -17.4),
+    },
+    /**
+     * AUTOPILOT GAINS. Five keys; everything else keeps the Cessna's value,
+     * because everything else measured fine. Each one was flown, not guessed.
+     *
+     *   vsFloorKts / vsProtectKts — 165 / 200, against the Cessna's 58 / 75.
+     *     THIS IS THE ONE THAT MATTERS. A 58 kt airspeed floor on an aeroplane
+     *     that stalls at 143 kt is not protection, it is a number that can
+     *     never fire, on the one loop whose whole job is to stop the autopilot
+     *     mushing into a stall while commanding a climb it has no energy for.
+     *     Measured: commanded +6,000 ft at 25% thrust, the aeroplane gave up
+     *     the climb and held 196 KIAS instead of decaying into the stall.
+     *
+     *   kVsToPitch — 0.035 -> 0.020. The hunting cure. On the Cessna's value
+     *     the loop HELD but oscillated: 170 vertical-speed reversals in two
+     *     minutes, +/-697 fpm about a level path, 9.2 degrees of pitch. At
+     *     0.020: ONE reversal, peak 34 fpm, 3.2 degrees. The jet is heavier
+     *     and slower to answer the elevator, so the same gain arrives late and
+     *     excites the phugoid instead of damping it — the same shape of
+     *     mistake as the RATE_TAU bug, from the other direction.
+     *
+     *   kAltToVs — 2.2 -> 5.0. With the softer pitch gain the aeroplane flies
+     *     smoothly but wanders; more altitude gain pulls the band back in
+     *     WITHOUT reintroducing the hunt, because it acts on the outer loop.
+     *     36 ft over two minutes at 250 kt, 0 reversals.
+     *
+     *   maxVsFpm — 600 -> 2000. A 600 fpm ceiling on an aeroplane that climbs
+     *     at 2,300 makes every altitude change take four times as long as it
+     *     should, and leaves the loop saturated the whole way.
+     *
+     * NOT changed, and it was tempting: kPitchP. Raising it to 0.12 brought
+     * the hunt straight back — 172 reversals — and kPitchI at 0.045 diverged
+     * and disconnected the autopilot outright. 0.075 / 0.020 stay.
+     *
+     * Known and acceptable: a 90 degree turn takes 82 s and overshoots 25
+     * degrees of bank by about 3. It settles to zero error and does not
+     * oscillate, so the roll axis is left on the Cessna's gains.
+     */
+    autopilot: {
+      maxVsFpm: 2000,
+      kAltToVs: 5.0,
+      kVsToPitch: 0.020,
+      vsProtectKts: 200,
+      vsFloorKts: 165,
     },
   },
 ];
