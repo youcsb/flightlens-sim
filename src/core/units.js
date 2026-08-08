@@ -66,12 +66,51 @@ export function damp(current, target, rate, dt) {
   return lerp(current, target, 1 - Math.exp(-rate * dt));
 }
 
+/** ISA tropopause: where the temperature lapse stops, metres and kelvin. */
+export const TROPOPAUSE_M = 11000;
+export const TROPOPAUSE_K = 288.15 - 0.0065 * TROPOPAUSE_M; // 216.65 K
+/** Density at the tropopause, from the troposphere formula. */
+const RHO_TROPOPAUSE = RHO_SEA_LEVEL * Math.pow(TROPOPAUSE_K / 288.15, 4.256);
 /**
- * ISA air density at a given geometric altitude in METRES.
- * Troposphere-only approximation, good to ~11 km. Returns kg/m^3.
+ * Stratospheric scale height, metres: R*T/g with R = 287.053 J/kg/K.
+ * Above the tropopause temperature is constant, so density decays exponentially
+ * rather than as a power of it.
+ */
+const STRATO_SCALE_M = (287.053 * TROPOPAUSE_K) / GRAVITY;
+
+/** ISA temperature, kelvin, at a geometric altitude in METRES. */
+export function airTemperature(altitudeM) {
+  const t = 288.15 - 0.0065 * altitudeM;
+  return t > TROPOPAUSE_K ? t : TROPOPAUSE_K;
+}
+
+/**
+ * ISA air density at a given geometric altitude in METRES. Returns kg/m^3.
+ *
+ * Below 11 km this is the troposphere power law and is bit-for-bit what it
+ * always was — every Cessna number in the harnesses depends on that. Above it
+ * the old formula kept extrapolating a temperature lapse that physically stops,
+ * which read as too THIN: at FL410 it was 12% low, and a jet spends its whole
+ * cruise up there. The stratosphere branch is isothermal, which is the actual
+ * ISA definition of that layer.
  */
 export function airDensity(altitudeM) {
-  const t = 288.15 - 0.0065 * altitudeM; // K
-  if (t <= 0) return 0;
-  return RHO_SEA_LEVEL * Math.pow(t / 288.15, 4.256);
+  if (altitudeM <= TROPOPAUSE_M) {
+    const t = 288.15 - 0.0065 * altitudeM; // K
+    if (t <= 0) return 0;
+    return RHO_SEA_LEVEL * Math.pow(t / 288.15, 4.256);
+  }
+  return RHO_TROPOPAUSE * Math.exp(-(altitudeM - TROPOPAUSE_M) / STRATO_SCALE_M);
+}
+
+/**
+ * Speed of sound, m/s, at a geometric altitude in METRES.
+ *
+ * a = sqrt(gamma * R * T), and for air gamma*R = 401.87, so a = 20.047*sqrt(T).
+ * 340.3 m/s at sea level, 295.1 m/s at the tropopause — which is why a jet's
+ * Mach limit bites at a LOWER true airspeed the higher it climbs, and why Mmo
+ * and Vne cross over somewhere around FL260.
+ */
+export function speedOfSound(altitudeM) {
+  return 20.046796 * Math.sqrt(airTemperature(altitudeM));
 }
