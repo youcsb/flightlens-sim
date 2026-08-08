@@ -206,7 +206,28 @@ The refactor makes an airframe a DATA FILE (`src/physics/airframes/c172.js`), so
 a 737 is a sibling file rather than a code change.
 
 **Gate: behaviour-preserving.** A baseline of envelope / trim / autopilot output
-was captured before the change; the diff must be empty. Every number — rotate
+was captured before the change and lives at:
+
+```
+/private/tmp/claude-501/-Users-KenAltmann-Desktop-Ken-Flight-Sim/ab3e450b-5ca2-43df-8ed0-8fb9d26a6eb6/scratchpad/baseline/
+    envelope.txt   trim.txt   autopilot.txt
+```
+
+Verify it yourself with:
+
+```bash
+export PATH="$HOME/.local/node/bin:$PATH"
+B=/private/tmp/claude-501/-Users-KenAltmann-Desktop-Ken-Flight-Sim/ab3e450b-5ca2-43df-8ed0-8fb9d26a6eb6/scratchpad/baseline
+npm run envelope 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | diff "$B/envelope.txt" -
+```
+
+An empty diff means the refactor moved WHERE the numbers live without changing
+what they are. A non-empty diff means behaviour changed — find out why; do not
+update the baseline and do not relax an assertion. (That scratchpad is
+session-scoped and may be cleaned up; if it is gone, regenerate a baseline from
+the last commit before the refactor.)
+
+The diff must be empty. Every number — rotate
 55 kt, best climb 743 fpm, climb 764 → 297 fpm with altitude, the stall break,
 the landing — has to come out identical, because only the LOCATION of the
 numbers changed.
