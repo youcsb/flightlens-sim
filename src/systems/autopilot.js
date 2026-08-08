@@ -342,6 +342,14 @@ export function createAutopilot() {
    * protection below is what stops it mushing, and it is the honest limiter.
    */
   let vsBug = 0;
+  /**
+   * Set per step when V/S is flying FREE — no altitude bug ahead to capture.
+   * Declared up here with the rest of the state on purpose: controlStep() is a
+   * hoisted function declaration that lives below the `return`, so a `let`
+   * placed beside it never executes and every call hits the temporal dead
+   * zone. That is a ReferenceError on the first autopilot frame.
+   */
+  let vsFree = false;
 
   // Integrator state. Zeroed on every engage — see the header note.
   let bankI = 0;
@@ -576,6 +584,7 @@ export function createAutopilot() {
    * @param {Object} state flight-model state
    */
   function controlStep(d, state) {
+    vsFree = false;
 
       // Differentiate attitude for the damping terms. The model publishes no
       // angular rates, so we keep our own. First frame after engage has no
@@ -612,18 +621,34 @@ export function createAutopilot() {
       // --- vertical: altitude -> vertical speed -> elevator ------------------
       const altErr = altitudeBug - (state.altitudeFt ?? 0);
       /**
-       * V/S MODE, with altitude capture.
+       * V/S MODE — two behaviours, and the second one is the whole point.
        *
-       * With a rate selected, fly it — but only in the direction of the bug,
-       * and never past it. `room` below already stops the automatic law
-       * overshooting the target altitude; the same clamp is applied here, so
-       * selecting +2,000 fpm with the bug 300 ft above you levels off at the
-       * bug instead of blowing through it. Selecting a climb when the bug is
-       * BELOW you does nothing, which is the sane reading of a contradiction.
+       * 1. There IS an altitude bug ahead of you in the selected direction:
+       *    fly the rate and CAPTURE the bug. `room` below already stops the
+       *    automatic law overshooting; the same clamp bounds the selected rate
+       *    so +2,000 fpm with the bug 300 ft up levels off instead of blowing
+       *    through it.
+       *
+       * 2. There is NOT — you are already at the bug: fly the rate anyway and
+       *    DRAG THE BUG ALONG. This is what a real V/S mode does when no
+       *    altitude is armed, and it is the case that matters, because
+       *    ENGAGING THE AUTOPILOT SNAPS THE BUG TO YOUR CURRENT ALTITUDE. The
+       *    first version of this required an altitude error that engaging
+       *    guarantees you do not have, so the HUD read "V/S +1500" while the
+       *    aeroplane held altitude — reported as "the instruments moved but the
+       *    plane didn't". Measured then: 308 fpm peak, 47 ft LOST.
+       *
+       *    Dragging the bug is what makes cancelling sane: press back to AUTO
+       *    and the bug is wherever you have climbed to, so it holds there
+       *    rather than diving back to where you started.
        */
       let vsTarget;
-      if (vsBug !== 0 && Math.abs(altErr) > 20 && Math.sign(vsBug) === Math.sign(altErr)) {
-        vsTarget = vsBug;
+      const towardBug = vsBug !== 0 && Math.sign(vsBug) === Math.sign(altErr);
+      if (vsBug !== 0 && towardBug && Math.abs(altErr) > 20) {
+        vsTarget = vsBug;                       // case 1: climb to the bug
+      } else if (vsBug !== 0) {
+        vsTarget = vsBug;                       // case 2: free V/S
+        vsFree = true;
       } else {
         vsTarget = clamp(altErr * G.kAltToVs, -G.maxVsFpm, G.maxVsFpm);
       }
@@ -643,8 +668,10 @@ export function createAutopilot() {
       // Do not fly toward the bug faster than the remaining altitude justifies
       // — this is the capture, and it has to bound a SELECTED rate as well as
       // an automatic one or V/S mode sails straight through the target.
-      const capture = clamp(altErr * G.kAltToVs, -Math.abs(vsTarget), Math.abs(vsTarget));
-      if (Math.abs(capture) < Math.abs(vsTarget)) vsTarget = capture;
+      if (!vsFree) {
+        const capture = clamp(altErr * G.kAltToVs, -Math.abs(vsTarget), Math.abs(vsTarget));
+        if (Math.abs(capture) < Math.abs(vsTarget)) vsTarget = capture;
+      }
 
       const kts = state.airspeedKts ?? 0;
       const room = (kts - G.vsFloorKts) / (G.vsProtectKts - G.vsFloorKts);
@@ -658,6 +685,10 @@ export function createAutopilot() {
       // Stage 2: vertical-speed error asks for a PITCH ATTITUDE, not for an
       // elevator deflection. See the cascade note above — this is the stage
       // whose absence caused the porpoising.
+      // Free V/S drags the altitude bug with the aeroplane, so cancelling the
+      // rate holds the altitude you climbed to rather than diving back.
+      if (vsFree) altitudeBug = Math.round((state.altitudeFt ?? altitudeBug) / 10) * 10;
+
       const vsErr = vsTarget - (state.verticalSpeedFpm ?? 0);
       let pitchTarget = clamp(
         vsErr * G.kVsToPitch,
