@@ -218,6 +218,79 @@ a62b918  b738: a Boeing 737-800, as data, flown until the numbers were true
 Gates: `npm run build` green, `npm run check:all` green — **1,313 assertions
 across 19 harnesses**, up from 1,208 across 16.
 
+### Flown 2026-08-08 — seven fixes, and ONE STILL OPEN
+
+Ken flew it and found in an hour what a night of headless measurement had not.
+All fixed and committed except the last, which is genuinely unsolved.
+
+`1ff21e9` six of them:
+- **The fuselage was glass.** buildFuselage's window box uses `u` = the WHOLE
+  circumference, so `u0:0, u1:1` deleted 26 m of cabin. Apertures removed; the
+  windows are painted on now.
+- **The textures had NEVER worked, on either aircraft.** lofting.js uses
+  `texSize()` and I did not carry its import across when I extracted those
+  functions in `9aaa108`. ReferenceError on the first skin, both aircraft
+  caught it and fell back to untextured, both went white. **Invisible to every
+  harness, because the canvas path is behind `HAS_CANVAS` which is false under
+  Node.** Under it: the canvas helpers return the CANVAS not `{canvas, ctx}`,
+  `makeSkinCanvas` pre-scales the pen, and canvas Y is `(1 - v) * H`.
+- **The ASI read zero at 256 kt** — wrapped, not pegged, past the end of a
+  Cessna's 40-200 kt face. Per-aircraft `ASI_SCALES` now, plus flap gates.
+- **The left winglet pointed down.** The cant mirrors across the centreline;
+  the quarter-turn that stands it upright does not.
+- **Titles read backwards.** The RIGHT flank is the one needing a mirror:
+  outside it, screen-right is `cross(d, up)` = -Z, the nose.
+- **It dived hands-off.** `cm0` 0.045 put the hands-off trim speed at 308 kt,
+  so released at 250 it pitched down to find it — losing 1,688 ft. 0.10 lands
+  it at 250 kt: 29 ft lost instead of 1,688. Spawn throttle 0.80 -> 0.30.
+
+`4469065` **the visual flaps followed the LEVER, not the aeroplane.** main.js
+drove `setControlSurfaces` from `inputs.flaps`; the model applies travel rate
+and BLOW-BACK, and above Vfe (200 kt on the jet) the flaps refuse to extend.
+The wing deflected, the physics kept them stowed, and the gauge — which reads
+`state.flapsPos` — was the only honest thing in the loop. **The Cessna has had
+this since its Vfe was 85 kt.**
+
+**THE PATTERN, worth internalising: five of these are a display or a mesh
+reading a DIFFERENT SOURCE than the physics.** spinProp fed rpm on a turbofan,
+the ASI on a Cessna scale, the flap gates, the flap position, the camera aim.
+b738model.js's header names it: "the aeroplane you see stops being the one you
+fly." Check the data source first.
+
+#### STILL OPEN: the belly (flyby) view ghosts
+
+`2e12c39`..`c05260f` fixed the judder in chase, cockpit and orbit. **Flyby
+still shows a doubled aeroplane, and only when it is small and distant.** A
+still frame cannot capture it — Ken worked that out himself, which is the right
+diagnosis: it is ghosting across frames, not two objects.
+
+What IS established:
+- `flightModel.renderTransform()` interpolates between the last two substeps.
+  Measured with jittered dt: 60 cm -> 3.7 cm of per-frame slip at 250 kt. Real,
+  and it is what cleared the other three views.
+- cameras.js now frames the DRAWN pose, not `state.position`. A real
+  inconsistency, worth keeping, **but not the cause.**
+- Residual flyby shake, measured with realistic frame times: 10.4 cm at 374 m
+  = 57 arcsec = **~0.4 px.** Far too small to be what he is seeing.
+
+**A TRAP THAT COST ME A WRONG ANSWER: do not verify jitter with
+`sim.tick(1/60, n)`.** 1/60 is EXACTLY four 1/240 s substeps, so it leaves zero
+accumulator residue — the one case that cannot show the bug. It will pass
+whether or not the fix works. Drive with varying dt.
+
+**Next step, ~30 min and decisive:** capture consecutive frames via
+`WebGLRenderTarget` readback (technique already documented below) and diff
+them. That separates "drawn twice in one frame" from "alternating between two
+positions across frames" — different causes, and guessing between them is how
+I got it wrong once already. Two candidates specific to flyby: its
+replant/ground-clamp logic, and `shadowStats` showing cascades 2 and 3 render
+only every third frame (`period: 3`), which is exactly the shape of thing that
+leaves a lagging second image.
+
+Ken's call on fix-vs-remove is open. Removing the view is ~5 min, but it is the
+only view with enough magnification to show something probably present in all
+of them.
+
 ### Fly it
 
 ```bash
