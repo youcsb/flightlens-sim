@@ -244,6 +244,32 @@ const DR_MAX = 0.4; // rudder, 23 deg
 /** Control surfaces have mass; the stick is not the surface. rad/s at full travel. */
 const SURFACE_RATE = 4.0;
 
+/**
+ * ELEVATOR TRIM.
+ *
+ * Without a trim axis this aeroplane is permanently rigged for one speed. CM0 =
+ * 0.05 puts that at about 91 kt hands-off, so anywhere else the stick has to be
+ * held — which is why level flight drifts, and why the autopilot needed an
+ * integrator "standing in for the trim the airframe does not have". This is
+ * that trim.
+ *
+ * MODELLED AS A BIAS ON THE ELEVATOR, which is what a trim tab physically does:
+ * it moves the deflection the surface sits at with no stick force, so the
+ * aeroplane holds a different speed hands-off.
+ *
+ * AUTHORITY is 35% of full elevator travel, not 100%. A real trim tab cannot
+ * fly the aeroplane on its own, and full-travel trim would let a player hold
+ * the stick against a trim that can out-pull them — which is a way to make a
+ * simulator feel broken. 35% covers roughly 55 kt to 130 kt hands-off, the
+ * whole speed range this aircraft actually flies.
+ *
+ * RATE is deliberately slow. A trim wheel is a wheel: 8 seconds end to end
+ * means a tap is a fine adjustment rather than a lurch, which is the entire
+ * point of trimming instead of just holding the stick.
+ */
+const TRIM_AUTHORITY = 0.35;
+const TRIM_RATE = 1 / 8;
+
 /** Flap system. */
 const FLAP_TRAVEL_RATE = 0.2; // full travel in 5 s
 const FLAP_DCL0 = 0.72; // lift-curve shift at full flap
@@ -697,6 +723,9 @@ export function createFlightModel(opts = {}) {
     groundSpeedKts: 0,
     /** Load factor along the body vertical, in g. 1.0 in level flight. */
     loadFactor: 1,
+    /** Elevator trim, -1 (nose down) .. +1 (nose up). What the wheel is set to,
+     *  not where the surface has reached — see TRIM_RATE. */
+    trim: 0,
     /** Seconds the airframe has been continuously beyond its manoeuvring
      *  limit. Diagnostic: non-zero here without a crash means a transient was
      *  correctly absorbed rather than written off. */
@@ -782,6 +811,8 @@ export function createFlightModel(opts = {}) {
 
   // Control-surface positions (rate-limited images of the stick), -1..+1.
   let surfPitch = 0;
+  /** Trim position, -1 (nose down) .. +1 (nose up). Moves slowly; see TRIM_RATE. */
+  let trimPos = 0;
   let surfRoll = 0;
   let surfYaw = 0;
   let flapPos = 0;
@@ -793,6 +824,7 @@ export function createFlightModel(opts = {}) {
   let engineSpool = 0;
   // Parsed inputs for the current step(), read by every substep.
   let inPitch = 0;
+  let inTrim = 0;
   let inRoll = 0;
   let inYaw = 0;
   let inThrottle = 0;
@@ -1078,6 +1110,8 @@ export function createFlightModel(opts = {}) {
 
     // --- control surfaces lag the stick -----------------------------------
     surfPitch = moveToward(surfPitch, inPitch, SURFACE_RATE * h);
+    trimPos = moveToward(trimPos, inTrim, TRIM_RATE * h);
+    state.trim = trimPos;
     surfRoll = moveToward(surfRoll, inRoll, SURFACE_RATE * h);
     surfYaw = moveToward(surfYaw, inYaw, SURFACE_RATE * h);
 
@@ -1168,7 +1202,11 @@ export function createFlightModel(opts = {}) {
     // Stick +1 pitch = nose up. Elevator TE-down is positive, so pull is
     // negative deflection. Stick +1 yaw = RIGHT rudder, and CN_DR is negative,
     // so right rudder is negative deflection too.
-    let de = -surfPitch * DE_MAX;
+    // Trim biases the elevator: with the stick released the surface sits here,
+    // so the aeroplane holds this speed hands-off. Clamped WITH the stick so a
+    // fully trimmed aeroplane cannot exceed the surface's real travel.
+    const pitchSurface = clamp(surfPitch + trimPos * TRIM_AUTHORITY, -1, 1);
+    let de = -pitchSurface * DE_MAX;
     const da = surfRoll * DA_MAX;
     const dr = -surfYaw * DR_MAX;
 
@@ -1639,6 +1677,9 @@ export function createFlightModel(opts = {}) {
    * @param {{altitudeAglM?:number, altitudeMslM?:number, airspeedMs?:number}} [placement]
    */
   function reset(lat, lon, headingDeg, placement) {
+    trimPos = 0;
+    inTrim = 0;
+    state.trim = 0;
     overGSeconds = 0;
     state.overGSeconds = 0;
     const useLat = Number.isFinite(lat) ? lat : cfg.startLat;
@@ -1749,6 +1790,7 @@ export function createFlightModel(opts = {}) {
     // allocate every frame (MODULES.md §1.8).
     if (inputs) {
       inPitch = clamp(numOr(inputs.pitch, 0), -1, 1);
+      inTrim = clamp(numOr(inputs.trim, 0), -1, 1);
       inRoll = clamp(numOr(inputs.roll, 0), -1, 1);
       inYaw = clamp(numOr(inputs.yaw, 0), -1, 1);
       inThrottle = clamp(numOr(inputs.throttle, 0), 0, 1);

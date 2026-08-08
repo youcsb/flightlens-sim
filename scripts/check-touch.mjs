@@ -912,9 +912,14 @@ function frames(input, n) {
   const first = input.get();
   const second = input.get();
   ok('get() still returns the SAME object every frame', first === second);
-  ok('the contract object still has exactly the seven fields',
-    ['pitch', 'roll', 'yaw', 'throttle', 'flaps', 'brakes', 'gear'].every((k) => k in first)
-    && Object.keys(first).length === 7);
+  // EIGHT since elevator trim was added. The count is asserted, not just the
+  // membership, because a field appearing by accident is how the contract rots:
+  // flightModel reads this object by name, so a stray key is a silent input.
+  // Updating this number is a deliberate act — if you are here because it
+  // failed, make sure you MEANT to change what the aeroplane is flown by.
+  ok('the contract object still has exactly the eight fields',
+    ['pitch', 'roll', 'yaw', 'throttle', 'trim', 'flaps', 'brakes', 'gear'].every((k) => k in first)
+    && Object.keys(first).length === 8);
 
   // Fly it: stick back-left, rudder right, throttle up.
   const surf = (z) => canvasParent.find((n) => n.getAttribute('data-touch-zone') === z);

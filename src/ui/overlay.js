@@ -363,6 +363,10 @@ export function createOverlay(container, o = {}) {
      into the menu sheet, so they are one tap away rather than in the view. */
   const stNear = row(status, 'FIELD');
   const stRpm = row(status, 'RPM');
+  /* Trim has no needle of its own — the six-pack has no trim gauge, and a real
+     one is a wheel with a paint mark. A signed readout says the same thing and
+     costs no windscreen. */
+  const stTrim = row(status, 'TRIM');
   root.appendChild(status);
 
   // --- key legend ---------------------------------------------------------
@@ -627,6 +631,16 @@ export function createOverlay(container, o = {}) {
      */
     setFlightInfo(info) {
       if (!info) return;
+      if (Number.isFinite(info.trim)) {
+        const t = info.trim;
+        // Neutral is the common case and deserves a word, not "0.00".
+        const txt =
+          Math.abs(t) < 0.02
+            ? 'neutral'
+            : `${t > 0 ? 'UP' : 'DN'} ${Math.round(Math.abs(t) * 100)}%`;
+        if (stTrim.textContent !== txt) stTrim.textContent = txt;
+        stTrim.classList.toggle('warn', Math.abs(t) > 0.75);
+      }
       const near = info.nearestSub ? `${info.nearest} ${info.nearestSub}` : info.nearest;
       if (stNear.textContent !== near) stNear.textContent = near;
       const rpm = String(info.rpm ?? 0);
@@ -717,13 +731,19 @@ const ACTIONS = [
   ['KeyJ', 'ALT −100', true],
   ['BracketLeft', 'HDG −', true],
   ['BracketRight', 'HDG +', true],
+  // Trim is what lets a phone hold altitude without a thumb parked on the
+  // stick, so it belongs here rather than being desktop-only. Held, like the
+  // bugs, because settling on a trim is a nudge-until-it-looks-right gesture.
+  ['Comma', 'TRIM ▼', true],
+  ['Period', 'TRIM ▲', true],
+  ['KeyK', 'TRIM 0'],
 ];
 
 /** `e.code` is preferred by core/keycode.js, but send `key` too — §2.0. */
 const KEY_CHAR = {
   KeyC: 'c', KeyV: 'v', KeyT: 't', KeyN: 'n', KeyP: 'p', KeyR: 'r',
-  KeyL: 'l', KeyY: 'y', KeyU: 'u', KeyJ: 'j',
-  BracketLeft: '[', BracketRight: ']',
+  KeyL: 'l', KeyY: 'y', KeyU: 'u', KeyJ: 'j', KeyK: 'k',
+  BracketLeft: '[', BracketRight: ']', Comma: ',', Period: '.',
 };
 
 /**
@@ -848,6 +868,8 @@ const KEYMAP = [
   ['R · P', 'reset · pause'],
   ['T · N', 'time of day · mute'],
   ['M', 'mouse yoke'],
+  [', · .', 'trim nose down / up'],
+  ['K', 'trim to neutral'],
   ['L', 'autopilot on / off'],
   ['[ · ]', 'heading bug −/+ (hold)'],
   ['Y', 'bug to present heading'],

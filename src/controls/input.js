@@ -114,6 +114,29 @@ const BRAKE_RATE = 6.0;
 /** Flap notches, as fractions of full extension. */
 const FLAP_NOTCHES = [0, 0.34, 0.67, 1];
 
+/**
+ * Trim step per keypress, and the accelerated step once a key auto-repeats.
+ *
+ * EDGE-DRIVEN, NOT SAMPLED, and that is not a style choice. The phone fires its
+ * menu actions through `overlay.js#fireKey`, which sends a keydown and its
+ * keyup back to back so a released button can never stay "held". A control read
+ * as `keys.has(...)` once a frame would therefore never see a phone tap at all.
+ * Nudging on the keydown edge — the same thing the heading and altitude bugs
+ * do — works for a desktop hold (the OS auto-repeats) and a thumb equally.
+ *
+ * A tap is 0.03, about 1.5 kt of trimmed speed: fine enough to settle on a
+ * number. Held, the repeat accelerates to 0.09 and crosses the range in roughly
+ * two seconds. The flight model then moves the SURFACE toward this at its own
+ * slower rate (8 s end to end), so even a slammed key changes smoothly.
+ */
+/** The only keys whose auto-repeat is meaningful here. See the guard in
+ *  onKeyDown for what repeats do to everything else. */
+const REPEATABLE_CODES = new Set(['Comma', 'Period']);
+
+const TRIM_STEP = 0.03;
+const TRIM_STEP_FAST = 0.09;
+const TRIM_REPEAT_FAST = 8;
+
 // ---------------------------------------------------------------------------
 // Mouse-yoke tuning
 // ---------------------------------------------------------------------------
@@ -257,6 +280,12 @@ export function createInput(domElement, opts = {}) {
     yaw: 0,
     /** 0 = idle, 1 = full power. */
     throttle: 0,
+    /**
+     * Elevator trim, -1 (nose down) .. +1 (nose up). LATCHES, like the
+     * throttle and unlike the stick: a trim wheel stays where you left it.
+     * That is the whole point — it is what lets you take your hand off.
+     */
+    trim: 0,
     /** 0 = clean, 1 = full flaps. Quantised to FLAP_NOTCHES. */
     flaps: 0,
     /** 0 = off, 1 = full wheel braking. Ramped, not switched. */
@@ -267,6 +296,9 @@ export function createInput(domElement, opts = {}) {
      */
     gear: 1,
   };
+
+  /** Consecutive auto-repeats of a trim key, for the acceleration ramp. */
+  let trimRepeats = 0;
 
   // Internal, pre-blend axis state for the keyboard ramp.
   const kb = { pitch: 0, roll: 0, yaw: 0 };
@@ -381,7 +413,12 @@ export function createInput(domElement, opts = {}) {
     // remote-desktop clients. eventCode() falls back to `e.key` so those can
     // still fly; see core/keycode.js.
     const code = eventCode(e);
-    if (e.repeat) {
+    if (e.repeat && !REPEATABLE_CODES.has(code)) {
+      // Everything else in the switch below is a toggle or a set-to-value, and
+      // a held key firing those repeatedly is a bug — a leaned-on F would cycle
+      // the flaps forever. The trim keys are the exception: nudging until it
+      // looks right is inherently a repeat gesture, and dropping the repeats is
+      // what made a held trim key do nothing at all.
       if (HANDLED_CODES.has(code)) e.preventDefault();
       return;
     }
@@ -401,6 +438,22 @@ export function createInput(domElement, opts = {}) {
       case 'KeyG':
         toggleGear();
         break;
+      case 'KeyK':
+        // Trim to neutral. Recovering from a badly trimmed aeroplane by holding
+        // a key and guessing is miserable; one key to get back to a known state
+        // is worth a binding.
+        controls.trim = 0;
+        trimRepeats = 0;
+        break;
+      case 'Comma':
+      case 'Period': {
+        // Comma nose down, period nose up — the way they sit on the keyboard,
+        // left/down and right/up.
+        trimRepeats = e.repeat ? Math.min(trimRepeats + 1, 60) : 0;
+        const step = trimRepeats >= TRIM_REPEAT_FAST ? TRIM_STEP_FAST : TRIM_STEP;
+        controls.trim = clamp(controls.trim + (code === 'Period' ? step : -step), -1, 1);
+        break;
+      }
       case 'KeyM':
         // A keydown handler counts as a user gesture, so pointer lock is
         // allowed to be requested from here.
