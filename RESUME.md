@@ -26,6 +26,13 @@ and `npm run check:all` (~620 assertions across 15 harnesses) both pass at HEAD.
 | `Z` · `X` | full power · idle |
 | `L` · `[` `]` · `Y` · `U`/`J` | autopilot · heading bug · sync bug · altitude bug |
 | `F` · `B` · `G` · `C` · `R` · `V` | flaps · brakes · gear · camera · reset · panel view |
+| `,` · `.` · `K` | **trim** nose down · nose up · neutral |
+
+**Trim is how you hold altitude.** Set power, then tap `,` / `.` until the VSI
+reads zero, then let go of the stick. Measured: 32 ft of drift over 60 s at
+throttle 0.8 / trim +0.30. Before trim existed the hands-off speed was fixed at
+~91 kt by CM0 and everything else drifted — that was the "won't maintain
+altitude" report.
 
 **Takeoff veers left on purpose** — propwash over the fin yaws ~2.5°/s left under
 power. Hold `E` (right rudder) during the roll. Every single-engine prop does this.
@@ -111,6 +118,59 @@ memory/perf regression) and their fixes.
    flight model (~450 kt, Mach effects, spool lag, slats, spoilers), a glass
    cockpit replacing the six analog dials, and tile prefetch that keeps up at
    450 kt.
+
+## Deploying (only when asked — see the 737 plan, currently LOCAL ONLY)
+
+- Game repo: `youcsb/flightlens-sim`. Source on `main`, built site on `gh-pages`.
+  `git remote` in this project: `deploy`.
+- Live at **https://game.flightlens.us** (CNAME file on gh-pages; Cloudflare has
+  a grey-cloud CNAME `game` -> `youcsb.github.io`). Linked from the Flight Sim
+  tab on flightlens.us (`youcsb/flightlens.us`, `assets/site.js`, `SIM_URL`).
+- **Never proxy (orange-cloud) the apex, `www`, or `game`** — GitHub cannot renew
+  its certificate behind the proxy. Cloudflare's dashboard nags about this;
+  ignore it.
+- Deploy = build, copy `dist/index.html` + `dist/assets` over the gh-pages
+  worktree, `rm -rf dem/13`, strip z13 from `dem/manifest.json`, commit, push.
+- **After every deploy: `Cmd + Shift + R`.** Pages sends
+  `cache-control: max-age=600`, so `index.html` goes stale for 10 minutes. This
+  has caused two false "it didn't work" reports.
+
+## Terrain data — z13 is NOT deployed
+
+The bake is 4,178 tiles / 411 MB. The deployed build ships **z11 (region) +
+z14 (Seattle inset) only, 89 MB** — z13 alone is 344 MB. So terrain outside
+Seattle is coarse: Rainier is the right HEIGHT but smoother than it should be.
+
+`npm run upload:tiles` (scripts/upload-tiles-r2.mjs) is written and ready. It
+needs two things a human must do: `npx wrangler login` (browser OAuth) and
+`npx wrangler r2 bucket create flightlens-tiles`. An S3 API token would automate
+it and is deliberately NOT used — a writable bucket credential is not worth
+leaving in a config. Then connect `tiles.flightlens.us` in the R2 dashboard
+(it creates its own DNS record), apply the CORS policy the script prints, and
+rebuild with `VITE_DEM_BASE_URL=https://tiles.flightlens.us`.
+**CORS is not optional** — without it canvas reads taint and the ground vanishes
+in production only.
+
+## Mobile draw calls — measured, still over
+
+Phone tier over downtown: **167 draw calls against a 120 budget**, 557k
+triangles against 460k. Flattening the landmark models took it from 189; range
+culling past 15 km bought one more call.
+
+The remaining calls are things genuinely on screen: terrain 42, aircraft 24,
+visible Seattle landmarks, city chunks. Two levers are SPENT — materials are
+already shared via a memoizer (the 34 that remain are per-building glass, whose
+texture repeat encodes real storey heights), and the city is already 26 meshes
+for 23,979 footprints. Going further means simplifying the landmark models
+themselves for phones, which is a visual-fidelity decision, not a tuning one.
+
+Two measurement traps that cost real time:
+- `terrain.stats().triangles` counts what the SELECTOR emitted;
+  `renderer.info.render.triangles` counts what survives FRUSTUM CULLING. Over
+  downtown they differ by ~4x. A headless number and a browser number can
+  disagree while both are right.
+- The aspect ratio IS the crop for `preserveAspectRatio: slice`. Visible width
+  in viewBox units is `w / max(w/vbW, h/vbH)`.
 
 ## Two harness facts
 
