@@ -486,57 +486,134 @@ function makeFuselageTexture(zMin, zMax, windows, reg) {
   }
 
   // --- flight deck --------------------------------------------------------
-  // The 737's glazing is the most recognisable thing about its nose: two big
-  // forward windscreens either side of a centre post, then a sliding side
-  // window and a small third pane, all sloping down as they go aft.
-  //
-  // Both sides again, mirrored about the crown at v = 0.5. `d` is the distance
-  // BELOW the crown in v, so the right side is 0.5 - d and the left 0.5 + d.
-  const pane = (z0, z1, d0, d1, dh) => {
+  /**
+   * THE 737 NOSE. It is the most recognisable thing about the type and the
+   * hardest part of it to fake, because what you recognise is not the panes —
+   * it is the DARK SURROUND they sit in, the narrow posts between them, and
+   * the way the whole assembly rakes down as it goes aft.
+   *
+   * The first version drew three separate parallelograms straight onto white
+   * paint. Each was individually plausible and together they read as three
+   * stickers, because a real flight deck has no white between its windows: the
+   * frames, posts and the anti-glare surround are all one dark mass.
+   *
+   * So: lay down the surround first, then cut the panes out of it.
+   *
+   * GEOMETRY. Distances are `d` BELOW THE CROWN as a fraction of the local
+   * ring, and the ring at the nose is far smaller than the 3.76 m barrel — at
+   * z = -18.5 the section is about 2.2 m across — so d = 0.10 is roughly half
+   * a metre of glass, not the 1.2 m it would be amidships. That is why these
+   * numbers look small next to the cabin windows.
+   *
+   * Four panes a side on the real aeroplane; three here. The EYEBROW window
+   * above the No.1 is deliberately absent: Boeing plugged them from the mid
+   * 2000s and most -800s in service have them plated over, so drawing one
+   * would date the aeroplane wrongly.
+   */
+  const deckSurround = () => {
     for (const side of [-1, 1]) {
       ctx.beginPath();
-      ctx.moveTo(zToX(z0), vToY(0.5 + side * d0));
-      ctx.lineTo(zToX(z1), vToY(0.5 + side * d1));
-      ctx.lineTo(zToX(z1), vToY(0.5 + side * (d1 + dh)));
-      ctx.lineTo(zToX(z0), vToY(0.5 + side * (d0 + dh)));
+      ctx.moveTo(zToX(-19.15), vToY(0.5 + side * 0.012));
+      ctx.lineTo(zToX(-17.9), vToY(0.5 + side * 0.030));
+      ctx.lineTo(zToX(-16.9), vToY(0.5 + side * 0.055));
+      ctx.lineTo(zToX(-16.15), vToY(0.5 + side * 0.076));
+      ctx.lineTo(zToX(-16.15), vToY(0.5 + side * 0.150));
+      ctx.lineTo(zToX(-17.0), vToY(0.5 + side * 0.166));
+      ctx.lineTo(zToX(-18.2), vToY(0.5 + side * 0.160));
+      ctx.lineTo(zToX(-19.15), vToY(0.5 + side * 0.120));
       ctx.closePath();
-      ctx.fillStyle = '#0b1017';
+      ctx.fillStyle = '#1b2027';
       ctx.fill();
-      ctx.strokeStyle = '#9aa4ae';
-      ctx.lineWidth = Math.max(1.5, W / 900);
-      ctx.stroke();
-      // A cold reflection across the upper half of each pane.
-      ctx.save();
-      ctx.clip();
-      ctx.fillStyle = 'rgba(120,160,200,0.30)';
-      ctx.fillRect(zToX(z0), vToY(0.5 + side * d0) - (side < 0 ? 0 : 0), zToX(z1) - zToX(z0), side * vToY(dh) * 0.45);
-      ctx.restore();
-      // Frame in the height map so the posts stand proud.
-      hx.strokeStyle = '#5e5e5e';
-      hx.lineWidth = Math.max(2, W / 700);
-      hx.beginPath();
-      hx.moveTo(zToX(z0), vToY(0.5 + side * d0));
-      hx.lineTo(zToX(z1), vToY(0.5 + side * d1));
-      hx.lineTo(zToX(z1), vToY(0.5 + side * (d1 + dh)));
-      hx.lineTo(zToX(z0), vToY(0.5 + side * (d0 + dh)));
-      hx.closePath();
-      hx.stroke();
+      // The surround stands proud of the skin, so the posts catch a highlight.
+      hx.fillStyle = '#6b6b6b';
+      hx.fill();
     }
   };
-  //     z from      z to     below crown at z0/z1     pane depth
-  pane(-18.95, -17.85, 0.030, 0.055, 0.098);  // No.1 windscreen
-  pane(-17.72, -16.95, 0.058, 0.072, 0.092);  // No.2 sliding window
-  pane(-16.85, -16.25, 0.075, 0.086, 0.076);  // No.3 quarter light
 
-  // Anti-glare shield: the flat black panel ahead of the windscreens that
-  // every airliner has, and without which the nose reads as a bare egg.
-  ctx.fillStyle = '#161b21';
+  /**
+   * One pane. Top and bottom depth are given at BOTH ends so a window can
+   * taper, which every one of these does — a windscreen is deeper at its
+   * forward edge and a quarter light narrows to almost nothing aft.
+   */
+  const pane = (z0, z1, t0, t1, b0, b1) => {
+    for (const side of [-1, 1]) {
+      const path = () => {
+        ctx.beginPath();
+        ctx.moveTo(zToX(z0), vToY(0.5 + side * t0));
+        ctx.lineTo(zToX(z1), vToY(0.5 + side * t1));
+        ctx.lineTo(zToX(z1), vToY(0.5 + side * b1));
+        ctx.lineTo(zToX(z0), vToY(0.5 + side * b0));
+        ctx.closePath();
+      };
+      path();
+      ctx.fillStyle = '#0a0e14';
+      ctx.fill();
+
+      // Sky reflected off raked glass: a bright wedge along the TOP edge,
+      // fading down. Flat glass on a nose that curves away catches the light
+      // in a band, not evenly, and the band is what makes it read as glass
+      // rather than as a hole.
+      ctx.save();
+      path();
+      ctx.clip();
+      const yTop = vToY(0.5 + side * Math.min(t0, t1));
+      const yBot = vToY(0.5 + side * Math.max(b0, b1));
+      const g = ctx.createLinearGradient(0, yTop, 0, yBot);
+      // Strong at the top, because raked glass on a nose that curves away is
+      // mostly showing you the sky. Too subtle and the panes read as holes cut
+      // in the frame rather than as windows — which is how the first pass of
+      // this looked from anywhere but head on.
+      g.addColorStop(0.0, 'rgba(198,224,246,0.92)');
+      g.addColorStop(0.28, 'rgba(150,186,218,0.62)');
+      g.addColorStop(0.62, 'rgba(96,126,158,0.30)');
+      g.addColorStop(1.0, 'rgba(58,78,100,0.10)');
+      ctx.fillStyle = g;
+      ctx.fillRect(zToX(z0) - 4, Math.min(yTop, yBot), zToX(z1) - zToX(z0) + 8, Math.abs(yBot - yTop));
+      ctx.restore();
+
+      // A thin bright frame — the polished sill every one of these sits in.
+      ctx.lineWidth = Math.max(1.2, W / 1100);
+      ctx.strokeStyle = 'rgba(190,200,210,0.55)';
+      path();
+      ctx.stroke();
+    }
+  };
+
+  deckSurround();
+  //     z from     z to      top d0/d1        bottom d0/d1
+  pane(-19.02, -18.02, 0.030, 0.049, 0.126, 0.146);  // No.1 windscreen
+  pane(-17.90, -17.10, 0.055, 0.070, 0.147, 0.152);  // No.2 sliding window
+  pane(-16.98, -16.32, 0.077, 0.098, 0.150, 0.132);  // No.3 quarter light
+
+  /**
+   * The anti-glare shield: the matt black panel on top of the nose ahead of
+   * the windscreens. Every airliner has one and without it the nose reads as a
+   * bare egg — it is the single cheapest thing that makes a fuselage look like
+   * a flight deck from outside.
+   *
+   * Drawn as a taper from a point at the radome back to the windscreen sill,
+   * spanning the crown rather than sitting either side of it.
+   */
   ctx.beginPath();
-  ctx.moveTo(zToX(-19.45), vToY(0.5));
-  ctx.lineTo(zToX(-18.9), vToY(0.5 - 0.028));
-  ctx.lineTo(zToX(-18.9), vToY(0.5 + 0.028));
+  ctx.moveTo(zToX(-19.58), vToY(0.5));
+  ctx.lineTo(zToX(-19.05), vToY(0.5 - 0.034));
+  ctx.lineTo(zToX(-18.9), vToY(0.5 - 0.030));
+  ctx.lineTo(zToX(-18.9), vToY(0.5 + 0.030));
+  ctx.lineTo(zToX(-19.05), vToY(0.5 + 0.034));
   ctx.closePath();
+  ctx.fillStyle = '#12161c';
   ctx.fill();
+
+  // Wipers. Two of them, parked at the base of each windscreen. Tiny, and the
+  // sort of thing you do not notice until it is missing from a close pass.
+  ctx.strokeStyle = 'rgba(30,34,40,0.85)';
+  ctx.lineWidth = Math.max(1.2, W / 1300);
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(zToX(-18.10), vToY(0.5 + side * 0.140));
+    ctx.lineTo(zToX(-18.62), vToY(0.5 + side * 0.104));
+    ctx.stroke();
+  }
 
   // --- doors --------------------------------------------------------------
   // Four passenger doors and two overwing exits, at the real stations. Outline
