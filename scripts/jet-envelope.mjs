@@ -582,26 +582,27 @@ head('8. arrivals — the gear is the fuse, and it fails before the wing');
 }
 
 // ---------------------------------------------------------------------------
-head('8b. the flap placard is a STAIRCASE, not one number');
+head('8b. flaps are available at every speed — a deliberate choice');
 // ---------------------------------------------------------------------------
 {
-  // A 737 may select flaps 1 and 5 at 250 kt, 15 at 200, 40 at 162. A single
-  // Vfe cannot say that, and collapsing the table to its lowest step made the
-  // aeroplane refuse ALL flap at the 250 kt it spawns and descends at — which
-  // is what "flaps work on the ground but not over downtown" was.
+  // THE JET FLIES WITHOUT FLAP PLACARDS ON PURPOSE. b738.js sets vfeMs above
+  // Vmo so the flaps never blow back. Flying to a real placard table turned
+  // every arrival into a speed-management exercise, and this is a simulator
+  // someone flies for fun.
   //
-  // Measured as the most flap the lever can actually get out, held at a speed.
+  // The staircase that models the real limits is still implemented in
+  // flightModel (VFE_SCHEDULE) and the real table is still in b738.js as
+  // `vfeScheduleRealistic`. This section guards the SHIPPED behaviour and the
+  // fact that turning it back on is a rename.
   const maxFlapAt = (kts) => {
     const m = jet();
     air(m, 2000, kts);
     let best = 0;
-    for (let i = 0; i < 60 * 25; i++) {
-      // Hold the speed rather than let it decay: the whole point is what is
-      // permitted AT a speed, and a jet with flaps out sheds 50 kt in 25 s.
+    for (let i = 0; i < 60 * 30; i++) {
       const err = kts - m.state.indicatedAirspeedKts;
       m.step(1 / 60, inputs({
-        pitch: vsHold(-500)(m.state),
-        throttle: clampN(0.35 + err * 0.02, 0, 1),
+        pitch: vsHold(0)(m.state),
+        throttle: clampN(0.4 + err * 0.04, 0, 1),
         flaps: 1,
       }), ground());
       if (m.state.flapsPos > best) best = m.state.flapsPos;
@@ -609,29 +610,49 @@ head('8b. the flap placard is a STAIRCASE, not one number');
     return best;
   };
 
-  const at250 = maxFlapAt(250);
-  const at195 = maxFlapAt(195);
-  const at150 = maxFlapAt(150);
-  say('flap available at 250 kt', `${(at250 * 40).toFixed(0)} deg`);
-  say('flap available at 195 kt', `${(at195 * 40).toFixed(0)} deg`);
-  say('flap available at 150 kt', `${(at150 * 40).toFixed(0)} deg`);
+  for (const kts of [250, 200, 150]) {
+    const got = maxFlapAt(kts);
+    say(`full flap selected at ${kts} kt`, `${(got * 40).toFixed(0)} deg`);
+    band(`  reaches full travel at ${kts} kt`, got * 40, 38, 40, 'deg');
+  }
 
-  assert('250 kt gets SOME flap, not none', at250 > 0.05,
-    `${(at250 * 40).toFixed(0)} deg — a single 200 kt Vfe gave zero here`);
-  band('  and not full flap either', at250 * 40, 1, 9, 'deg');
-  // 10..26: the loop holds ~195 kt but dips under the 190 kt flaps-25
-  // placard on the way, so either 15 or 25 is a correct answer here. The
-  // gate-by-gate table is the precise guard; this one only has to show that
-  // more flap is available than at 250 kt and less than at 150.
-  band('flap available at 195 kt', at195 * 40, 10, 26, 'deg');
-  band('flap available at 150 kt', at150 * 40, 22, 40, 'deg');
-  assert('more speed never means more flap', at250 <= at195 && at195 <= at150,
-    'the staircase must be monotonic');
+  assert(
+    'the jet declares no active placard schedule',
+    !B738.flaps.vfeSchedule,
+    'flaps are unrestricted by design — see vfeMs in b738.js',
+  );
+  assert(
+    'and the REAL table is kept, not deleted',
+    Array.isArray(B738.flaps.vfeScheduleRealistic)
+      && B738.flaps.vfeScheduleRealistic.length === 5,
+    'rename vfeScheduleRealistic -> vfeSchedule to restore the placards',
+  );
+  // The staircase code path must still WORK, so restoring it is genuinely one
+  // rename and not a re-debug. Exercise it on a throwaway airframe.
+  {
+    const placarded = {
+      ...B738,
+      flaps: { ...B738.flaps, vfeSchedule: B738.flaps.vfeScheduleRealistic },
+    };
+    const m = createFlightModel({ airframe: placarded, groundHeightFn: ground });
+    air(m, 2000, 260);
+    for (let i = 0; i < 60 * 25; i++) {
+      m.step(1 / 60, inputs({
+        pitch: vsHold(0)(m.state),
+        throttle: clampN(0.4 + (260 - m.state.indicatedAirspeedKts) * 0.04, 0, 1),
+        flaps: 1,
+      }), ground());
+    }
+    assert(
+      'the placard path still limits when enabled',
+      m.state.flapsPos < 0.2,
+      `${(m.state.flapsPos * 40).toFixed(1)} deg at 260 kt with the real table on`,
+    );
+  }
 
-  // And the Cessna must still be on the single-Vfe path, untouched.
-  const c = createFlightModel({ airframe: C172, groundHeightFn: ground });
-  assert('the C172 declares no schedule', !C172.flaps.vfeSchedule,
-    'it keeps the identical single-vfeMs code path');
+  // And the Cessna keeps its single Vfe, which DOES still blow back.
+  assert('the C172 still has a real Vfe', C172.flaps.vfeMs < 50,
+    `${(C172.flaps.vfeMs * MS_TO_KTS).toFixed(0)} kt — unchanged`);
 }
 
 // ---------------------------------------------------------------------------

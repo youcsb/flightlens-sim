@@ -419,30 +419,33 @@ export const B738 = {
      * full flap is available 90 kt too fast. Detents are the fix; until then
      * this errs toward being usable on approach.
      */
-    vfeMs: 83.3,
     /**
-     * THE REAL PLACARD TABLE. 737-800 flap limit speeds, as (axis position,
-     * m/s indicated) — the axis runs 0..1 over 0..40 degrees, so flaps 5 is
-     * 0.125, flaps 15 is 0.375, flaps 25 is 0.625.
+     * Vfe, m/s indicated. 180 m/s = 350 kt — ABOVE Vmo, so the flaps never
+     * blow back and every gate is available at any speed the aeroplane can
+     * legally reach.
      *
-     *     flaps 1 / 5     250 kt    128.6 m/s
-     *     flaps 15        200 kt    102.9
-     *     flaps 25        190 kt     97.7
-     *     flaps 30        175 kt     90.0
-     *     flaps 40        162 kt     83.3
+     * THIS IS A PLAYABILITY DECISION, TAKEN DELIBERATELY, AND IT IS NOT WHAT
+     * THE AEROPLANE DOES. A real 737 will not give you flaps 15 above 200 kt,
+     * and the staircase that models that is still implemented and still
+     * tested — see `vfeSchedule` below and flightModel's VFE_SCHEDULE. It was
+     * switched off because flying to a placard turned every arrival into a
+     * speed-management exercise before the aeroplane was fun to fly at all.
      *
-     * This replaces the compromise a single vfeMs forced. That comment used to
-     * read "pick the 162 kt full-flap figure and you cannot take any flap at a
-     * normal approach speed; pick 250 and full flap is available 90 kt too
-     * fast" — so it split the difference at 200 and the aeroplane then refused
-     * ALL flap at the 250 kt it spawns and descends at. A staircase is what the
-     * aeroplane actually has, and flightModel takes one now.
-     *
-     * `vfeMs` stays as the full-flap placard, both as the fallback for a model
-     * without schedule support and because it is the number a pilot means by
-     * "Vfe" on this type.
+     * To put the real limits back: delete `vfeMs` here and rename
+     * `vfeScheduleRealistic` to `vfeSchedule`. Nothing else has to change —
+     * the code path, the gauge gates and the lever gates are all still wired
+     * for it, and check:jet's staircase section is written against it.
      */
-    vfeSchedule: [
+    vfeMs: 180,
+    /**
+     * The REAL 737-800 placard table, kept and not deleted. Rename this to
+     * `vfeSchedule` to restore it. Positions are fractions of 40 degrees.
+     *
+     *     flaps 1 / 5     250 kt        flaps 30        175 kt
+     *     flaps 15        200 kt        flaps 40        162 kt
+     *     flaps 25        190 kt
+     */
+    vfeScheduleRealistic: [
       { pos: 0.125, ms: 128.6 },
       { pos: 0.375, ms: 102.9 },
       { pos: 0.625, ms: 97.7 },
