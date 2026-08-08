@@ -182,13 +182,41 @@ const VSI_HALF_SWEEP = 165;
 const vsiAngle = (fpm) =>
   -90 + (clamp(fpm, -VSI_MAX, VSI_MAX) / VSI_MAX) * VSI_HALF_SWEEP;
 
-// --- tachometer ------------------------------------------------------------
-const TACH_MAX = 3000;
+// --- engine gauge ----------------------------------------------------------
+/**
+ * The sixth dial is a TACHOMETER on a piston and an N1 GAUGE on a turbofan,
+ * and it is not the same instrument with a different needle position.
+ *
+ * A real 737 has no tachometer at all — its engine instruments read N1 as a
+ * PERCENTAGE of fan redline, and the standby instruments a jet carries for
+ * exactly this model's six-pack are an ASI, an attitude indicator and an
+ * altimeter, never an rpm gauge. Leaving a 0-3,000 RPM face on a jet and
+ * feeding it N1 would put 88% N1 at the bottom of the scale and read like a
+ * dead engine; leaving it fed from `state.rpm` — which a turbofan publishes as
+ * zero, deliberately — reads like a dead engine too, and the needle simply
+ * never moves.
+ *
+ * So the face is rebuilt. setEngineGauge() swaps these and redraws.
+ */
+const ENGINE_GAUGES = {
+  rpm: {
+    max: 3000, greenLo: 2100, redline: 2700,
+    tickStep: 100, labelStep: 500, labelDiv: 100,
+    label: 'RPM', sub: 'HUNDREDS', unit: '',
+  },
+  n1: {
+    // A CFM56-7B redlines at 104% N1 and idles near 21%. The green band starts
+    // at 85 because below that a big fan is producing very little thrust —
+    // which is the whole reason jets are flown on N1 rather than lever angle.
+    max: 110, greenLo: 85, redline: 104,
+    tickStep: 5, labelStep: 20, labelDiv: 1,
+    label: 'N1', sub: 'PERCENT', unit: '%',
+  },
+};
+let tachCfg = ENGINE_GAUGES.rpm;
 const TACH_SWEEP = 270; // from -135 (7:30) to +135 (4:30)
-const tachAngle = (rpm) =>
-  -TACH_SWEEP / 2 + (clamp(rpm, 0, TACH_MAX) / TACH_MAX) * TACH_SWEEP;
-const TACH_GREEN_LO = 2100;
-const TACH_REDLINE = 2700;
+const tachAngle = (v) =>
+  -TACH_SWEEP / 2 + (clamp(v, 0, tachCfg.max) / tachCfg.max) * TACH_SWEEP;
 
 // --- turn coordinator ------------------------------------------------------
 /** Degrees per second that counts as a standard-rate turn. */
@@ -744,20 +772,21 @@ function vsiFace(u) {
 function tachFace(u) {
   let s = '';
 
-  s += arc(84, tachAngle(TACH_GREEN_LO), tachAngle(TACH_REDLINE), GREEN, 7);
-  s += tick(78, 92, tachAngle(TACH_REDLINE), 5, RED);
+  const c = tachCfg;
+  s += arc(84, tachAngle(c.greenLo), tachAngle(c.redline), GREEN, 7);
+  s += tick(78, 92, tachAngle(c.redline), 5, RED);
 
-  for (let r = 0; r <= TACH_MAX; r += 100) {
+  for (let r = 0; r <= c.max; r += c.tickStep) {
     const a = tachAngle(r);
-    if (r % 500 === 0) s += tick(78, 62, a, 3.2);
+    if (r % c.labelStep === 0) s += tick(78, 62, a, 3.2);
     else s += tick(78, 68, a, 1.6, INK_DIM);
   }
-  for (let r = 0; r <= TACH_MAX; r += 500) {
-    s += radialText(50, tachAngle(r), String(r / 100), 15);
+  for (let r = 0; r <= c.max; r += c.labelStep) {
+    s += radialText(50, tachAngle(r), String(r / c.labelDiv), 15);
   }
 
-  s += `<text x="0" y="-24" class="t" font-size="10" fill="${INK_DIM}" letter-spacing="1.4">RPM</text>`;
-  s += `<text x="0" y="-12" class="t" font-size="7.5" fill="${INK_DIM}" letter-spacing="0.9">HUNDREDS</text>`;
+  s += `<text x="0" y="-24" class="t" font-size="10" fill="${INK_DIM}" letter-spacing="1.4">${c.label}</text>`;
+  s += `<text x="0" y="-12" class="t" font-size="7.5" fill="${INK_DIM}" letter-spacing="0.9">${c.sub}</text>`;
 
   // Hobbs meter, counting real elapsed run time. Cosmetic, but every tach has
   // one and its absence is conspicuous. It goes in the empty 90-degree sector
@@ -1060,12 +1089,12 @@ function cCluster(u) {
   const W = C_CLU_W - X - 4; // 86
 
   // Power. A bar with the same redline the tachometer carries.
-  s += `<text x="${X}" y="8" class="t ta-start" font-size="8.5" fill="${INK_DIM}" letter-spacing="0.9">RPM</text>`;
+  s += `<text x="${X}" y="8" class="t ta-start" font-size="8.5" fill="${INK_DIM}" letter-spacing="0.9">${tachCfg.label}</text>`;
   s += `<text id="${u}-c-rpm-v" x="${X + W}" y="8" class="t tn ta-end" font-size="11.5" fill="${INK}">0</text>`;
   s += `<rect x="${X}" y="14" width="${W}" height="7" rx="3.5" fill="${OFF}"/>`;
   s += `<rect id="${u}-c-rpm-bar" x="${X}" y="14" width="0" height="7" rx="3.5" fill="${GREEN}"/>`;
   s +=
-    `<rect x="${(X + (TACH_REDLINE / TACH_MAX) * W).toFixed(2)}" y="12"` +
+    `<rect x="${(X + (tachCfg.redline / tachCfg.max) * W).toFixed(2)}" y="12"` +
     ` width="1.8" height="11" fill="${RED}"/>`;
 
   // Flaps.
@@ -1822,7 +1851,10 @@ export function createInstruments(container, opts = {}) {
     const hdg = wrapDeg(num(state.headingDeg));
     const pitch = clamp(num(state.pitchDeg), -89, 89);
     const roll = clamp(num(state.rollDeg), -180, 180);
-    const rpm = num(state.rpm);
+    // WHICH NUMBER IS THE ENGINE. A piston publishes rpm and leaves n1Pct at
+    // zero; a turbofan does the reverse. Reading the wrong one gives a needle
+    // that never leaves the stop, with nothing to say why.
+    const rpm = tachCfg === ENGINE_GAUGES.n1 ? num(state.n1Pct) : num(state.rpm);
 
     // Flaps / brakes: state first, caller-supplied inputs second, absent third.
     // `flapsPos` is the flight model's own rate-limited, blow-back-limited flap
@@ -1891,6 +1923,13 @@ export function createInstruments(container, opts = {}) {
     }
 
     hobbsSec += dt;
+
+    // The value overlay.js puts in its status row. It lives HERE, in the
+    // shared update, and not in drawCompact() where it used to: the panel
+    // layout never calls drawCompact, so in panel view the row was frozen at
+    // whatever the last compact frame had left there — which after an aircraft
+    // change meant a Cessna showing the 737's last N1 reading, labelled RPM.
+    lastRpm = Math.round(d.rpm);
 
     if (layout === 'compact') drawCompact(state, brakeRaw, hasFlap);
     else drawPanel(state, brakeRaw, hasFlap);
@@ -2083,11 +2122,10 @@ export function createInstruments(container, opts = {}) {
     );
 
     // --- power -------------------------------------------------------------
-    const rpmFrac = clamp(d.rpm / TACH_MAX, 0, 1);
+    const rpmFrac = clamp(d.rpm / tachCfg.max, 0, 1);
     setAttr(el.rpmBar, 'width', (rpmFrac * (C_CLU_W - 122)).toFixed(2));
-    setAttr(el.rpmBar, 'fill', d.rpm > TACH_REDLINE ? RED : d.rpm >= TACH_GREEN_LO ? GREEN : CYAN);
+    setAttr(el.rpmBar, 'fill', d.rpm > tachCfg.redline ? RED : d.rpm >= tachCfg.greenLo ? GREEN : CYAN);
     setText(el.rpmV, group(d.rpm));
-    lastRpm = Math.round(d.rpm);
 
     // --- flaps -------------------------------------------------------------
     if (hasFlap) {
@@ -2159,7 +2197,32 @@ export function createInstruments(container, opts = {}) {
      * into the menu sheet on a phone — so cropping the cluster hides them from
      * the windscreen without losing them.
      */
-    info: () => ({ rpm: lastRpm, nearest: lastNearest, nearestSub: lastNearestSub }),
+    info: () => ({
+      rpm: lastRpm,
+      engineLabel: tachCfg.label,
+      engineUnit: tachCfg.unit,
+      nearest: lastNearest,
+      nearestSub: lastNearestSub,
+    }),
+    /**
+     * Swap the sixth dial between a tachometer and an N1 gauge.
+     *
+     * The FACE is rebuilt, not just the needle — see ENGINE_GAUGES. Passing a
+     * kind that is already active is a no-op, so main.js can call it freely.
+     *
+     * @param {'rpm'|'n1'} kind — flightModel publishes this as state.engineGauge.
+     */
+    setEngineGauge(kind) {
+      const next = ENGINE_GAUGES[kind] || ENGINE_GAUGES.rpm;
+      if (next === tachCfg) return;
+      tachCfg = next;
+      // Force a full rebuild: the current layout's SVG has the old face baked
+      // into its markup, and there is no partial update that can change a
+      // dial's tick spacing and its legend.
+      const want = layout;
+      layout = null;
+      applyLayout(want);
+    },
     root,
     /** 'panel' | 'compact'. For the acceptance check and the console. */
     getLayout: () => layout,

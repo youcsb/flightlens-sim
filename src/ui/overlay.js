@@ -354,6 +354,7 @@ export function createOverlay(container, o = {}) {
   // --- status -------------------------------------------------------------
   const status = document.createElement('div');
   status.className = 'ovl-panel ovl-status';
+  const stType = row(status, 'AIRCRAFT');
   const stCam = row(status, 'VIEW');
   const stTime = row(status, 'TIME');
   const stAudio = row(status, 'SOUND');
@@ -607,6 +608,11 @@ export function createOverlay(container, o = {}) {
     setCamera(name) {
       stCam.textContent = name;
     },
+    /** Which aeroplane is being flown. Named, not abbreviated: the whole point
+     *  of having two is knowing which one you are in. */
+    setAircraft(name) {
+      stType.textContent = name;
+    },
     setTime(label) {
       stTime.textContent = label;
     },
@@ -643,7 +649,15 @@ export function createOverlay(container, o = {}) {
       }
       const near = info.nearestSub ? `${info.nearest} ${info.nearestSub}` : info.nearest;
       if (stNear.textContent !== near) stNear.textContent = near;
-      const rpm = String(info.rpm ?? 0);
+      // The label follows the aeroplane: a piston reads RPM, a turbofan reads
+      // N1 as a percentage. A row headed RPM showing a fan speed is worse than
+      // no row, because it looks like a number someone checked.
+      // row() builds `LABEL <span class="v">`, so the label is the text node
+      // before the value span, and it carries the separating space.
+      const lbl = `${info.engineLabel || 'RPM'} `;
+      const labelNode = stRpm.previousSibling;
+      if (labelNode && labelNode.textContent !== lbl) labelNode.textContent = lbl;
+      const rpm = `${info.rpm ?? 0}${info.engineUnit || ''}`;
       if (stRpm.textContent !== rpm) stRpm.textContent = rpm;
     },
     setAutopilot(ap) {
@@ -865,6 +879,7 @@ const KEYMAP = [
   ['F · B', 'flaps · brakes'],
   ['C · V', 'view · panel view'],
   ['1 – 4', 'jump to a place'],
+  ['I', 'change aircraft'],
   ['R · P', 'reset · pause'],
   ['T · N', 'time of day · mute'],
   ['M', 'mouse yoke'],

@@ -337,6 +337,28 @@ const MODE_FOV = [CHASE_FOV, COCKPIT_FOV, ORBIT_FOV, FLYBY_FOV_MAX];
  * @param {THREE.WebGLRenderer} renderer Used to read the drawing-buffer size
  *        and to attach view-only pointer/wheel listeners to its canvas.
  */
+/**
+ * PER-AIRCRAFT CAMERA FRAME.
+ *
+ * Every CHASE_* and ORBIT_* constant above was measured against a Cessna 172:
+ * 8.3 m long, 11 m span. A 737-800 is 39.5 m long with a 34 m span, and the
+ * same 14.5 m boom puts the camera INSIDE the fuselage — which is exactly what
+ * it did the first time the jet was flown, and which reads as a broken camera
+ * rather than as a scaling assumption.
+ *
+ * `scale` multiplies the boom, the lateral swing, the look-ahead and the orbit
+ * radius; `eye` and `panelEye` are stated outright, because a flight deck is
+ * not at a scaled-up version of a Cessna's eye position — it is 17 m forward of
+ * the CG on one aeroplane and 0.9 m on the other.
+ *
+ * setAircraftFrame() exists so a type change does not have to rebuild the rig.
+ * Rebuilding it would throw away the springs' settled state and make every
+ * swap snap and re-converge. See main.js's `acMount`.
+ */
+let frameScale = 1;
+let frameEye = EYE_FORWARD;
+let framePanelEye = EYE_PANEL;
+
 export function createCameras(aircraftGroup, renderer) {
   const size = new THREE.Vector2();
   renderer.getSize(size);
@@ -410,6 +432,15 @@ export function createCameras(aircraftGroup, renderer) {
     mode: MODE_NAMES[0],
     cycle,
     setMode,
+    /**
+     * Re-frame the rig for a different aeroplane. See the frameScale block.
+     * @param {{scale?:number, eye?:THREE.Vector3, panelEye?:THREE.Vector3}} f
+     */
+    setAircraftFrame(f = {}) {
+      frameScale = f.scale > 0 ? f.scale : 1;
+      frameEye = f.eye || EYE_FORWARD;
+      framePanelEye = f.panelEye || EYE_PANEL;
+    },
     snap,
     update,
     onResize,
@@ -582,8 +613,8 @@ export function createCameras(aircraftGroup, renderer) {
    * mistake.
    */
   function buildChase(state, speedFrac, rollRad, pitchRad) {
-    const dist = (CHASE_DIST + CHASE_DIST_SPEED * speedFrac) * zoom[index];
-    const height = CHASE_HEIGHT + CHASE_HEIGHT_SPEED * speedFrac;
+    const dist = (CHASE_DIST + CHASE_DIST_SPEED * speedFrac) * frameScale * zoom[index];
+    const height = (CHASE_HEIGHT + CHASE_HEIGHT_SPEED * speedFrac) * frameScale;
 
     // Yaw frame from the flight model's own heading — no quaternion unpicking.
     const h = state.headingDeg * DEG_TO_RAD;
@@ -596,7 +627,7 @@ export function createCameras(aircraftGroup, renderer) {
     _target.applyAxisAngle(_right, pitchRad * CHASE_PITCH_BLEND);
 
     // Slide to the OUTSIDE of the turn to open up the view into it.
-    _target.addScaledVector(_right, -Math.sin(rollRad) * CHASE_LATERAL);
+    _target.addScaledVector(_right, -Math.sin(rollRad) * CHASE_LATERAL * frameScale);
 
     _target.add(_acPos);
 
@@ -611,9 +642,9 @@ export function createCameras(aircraftGroup, renderer) {
     // centre of frame — the GeoFS exterior composition.
     _lookTarget
       .copy(_fwd)
-      .multiplyScalar(CHASE_LOOKAHEAD)
+      .multiplyScalar(CHASE_LOOKAHEAD * frameScale)
       .applyAxisAngle(_right, pitchRad * CHASE_PITCH_BLEND)
-      .addScaledVector(_worldUp, CHASE_LOOKUP)
+      .addScaledVector(_worldUp, CHASE_LOOKUP * frameScale)
       .add(_acPos)
       .addScaledVector(_vel, CHASE_LEAD);
 
@@ -630,7 +661,7 @@ export function createCameras(aircraftGroup, renderer) {
 
   /** Cockpit. Rigid to the airframe — any lag here reads as a loose head. */
   function buildCockpit() {
-    const eye = panelView ? EYE_PANEL : EYE_FORWARD;
+    const eye = panelView ? framePanelEye : frameEye;
     _target.copy(eye).applyMatrix4(aircraftGroup.matrixWorld);
 
     // Gaze 200 m down the nose (well past the propeller), tipped down for the
@@ -646,7 +677,7 @@ export function createCameras(aircraftGroup, renderer) {
 
   /** Orbit. World-aligned spherical rig that translates with the aircraft. */
   function buildOrbit() {
-    const r = ORBIT_RADIUS * zoom[index];
+    const r = ORBIT_RADIUS * frameScale * zoom[index];
     const ce = Math.cos(orbitEl);
     _target.set(
       Math.sin(orbitAz) * ce * r,
