@@ -64,7 +64,6 @@
 import * as THREE from 'three';
 import { bakeStatic } from '../core/bakeStatic.js';
 import { clamp, DEG_TO_RAD } from '../core/units.js';
-import { texSize } from '../core/textureBudget.js';
 import {
   TAU,
   buildLiftingSurface,
@@ -135,15 +134,36 @@ const FUSELAGE = [
 ];
 
 /**
- * Cabin windows, as spans along z with texture coordinates. Two exit-row gaps,
- * because an unbroken 26 m ribbon of windows is the tell that a fuselage was
- * generated rather than drawn.
+ * Cabin windows, as spans along z. TEXTURE ONLY — see WINDOW_CUTS.
+ *
+ * Two exit-row gaps, because an unbroken 26 m ribbon of windows is the tell
+ * that a fuselage was generated rather than drawn.
  */
 const WINDOWS = [
   { z0: -13.6, z1: -6.2, u0: 0, u1: 1 },
   { z0: -5.0, z1: 2.6, u0: 0, u1: 1 },
   { z0: 3.8, z1: 11.2, u0: 0, u1: 1 },
 ];
+
+/**
+ * Window apertures cut from the SHELL GEOMETRY. Empty, on purpose.
+ *
+ * buildFuselage() cuts a hole wherever a ring station falls inside a window's
+ * (z, u) box, where `u` runs all the way around the ring — so `u0: 0, u1: 1`
+ * means the ENTIRE CIRCUMFERENCE. Handing it the WINDOWS table above removed
+ * 26 metres of cabin and replaced it with glazing: a 737 you could see
+ * straight through, which is exactly how it looked.
+ *
+ * The right fix is not a narrower box. A 737 window is 23 x 33 cm on a 3.76 m
+ * fuselage — about 2.8% of the circumference — and there are sixty of them.
+ * Cutting sixty apertures and glazing them buys nothing at any distance you
+ * ever see this aeroplane from, and costs geometry and a cabin lining to stop
+ * you seeing out the far side. The Cessna cuts real holes because you sit
+ * INSIDE it and its windows are most of the cockpit; you never sit inside this
+ * one. So the windows are painted on, in makeFuselageTexture, and the hull
+ * stays a solid hull.
+ */
+const WINDOW_CUTS = [];
 
 /** Supercritical-ish wing section, and a thin symmetric tail section. */
 const AF_WING = { m: 0.012, p: 0.5, t: 0.115 };
@@ -347,121 +367,272 @@ const ENGINE_Y = -1.47;
  * where the exhaust streaks land, and a uniformly white underside reads as
  * untextured plastic from the chase camera.
  */
+/**
+ * Fuselage skin — the livery, drawn not downloaded.
+ *
+ * TEXTURE SPACE, and getting this wrong is why the first version painted the
+ * window ribbon on the roof and the white paint on the belly.
+ *
+ * buildFuselage lays the rings out as `x = w*sin(th)`, `y = cy - h*cos(th)`
+ * with `th = u * 2pi`, and writes canvas X = position along z, canvas Y = u.
+ * So the vertical axis of this canvas is a trip AROUND the fuselage, starting
+ * and ending at the KEEL:
+ *
+ *   v = 0.00   keel (bottom)
+ *   v = 0.25   RIGHT side, at the centreline
+ *   v = 0.50   crown (top)
+ *   v = 0.75   LEFT side, at the centreline
+ *   v = 1.00   keel again
+ *
+ * Everything is therefore mirrored about v = 0.5, and "down the side of the
+ * aeroplane" means v DECREASING on the right and INCREASING on the left.
+ *
+ * The passenger window line sits 0.30 m above the centreline on a 1.88 m
+ * radius, which is 9.2 degrees up from horizontal — v 0.276 right, 0.724 left.
+ */
 function makeFuselageTexture(zMin, zMax, windows, reg) {
-  const W = texSize(2048);
-  const H = texSize(1024);
-  const { canvas, ctx } = makeSkinCanvas(W, H);
-  const { canvas: hCanvas, ctx: hx } = makeCanvas(W, H);
+  // The DESIGN size. What is allocated is texSize(W) x texSize(H); the drawing
+  // below is unchanged because makeSkinCanvas scales the pen to match.
+  const W = 2048;
+  const H = 1024;
+  const canvas = makeSkinCanvas(W, H);
+  const hCanvas = makeSkinCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  const hx = hCanvas.getContext('2d');
   hx.fillStyle = '#808080';
   hx.fillRect(0, 0, W, H);
 
-  const zToU = (z) => ((z - zMin) / (zMax - zMin)) * W;
+  const zToX = (z) => ((z - zMin) / (zMax - zMin)) * W;
+  /**
+   * Ring fraction to canvas Y, AND IT IS FLIPPED. buildFuselage writes the ring
+   * fraction straight into UV.y, and a texture's V runs bottom-up while a
+   * canvas's Y runs top-down. So v = 0 (the keel) is the BOTTOM of the ring but
+   * the BOTTOM of the canvas is y = H. Same convention as the Cessna's, which
+   * documents it as "right flank at 0.75 H".
+   */
+  const vToY = (v) => (1 - v) * H;
 
-  // v = 0 is the crown, v = 1 the keel (buildFuselage lays the rings out that
-  // way), so the paint scheme is a set of horizontal bands.
+  // Ring positions, as fractions of the circumference. See the header.
+  const WIN_R = 0.276;   // passenger window line, right
+  const WIN_L = 0.724;   // ... and left
+  const CHEAT_HI = 0.045; // cheatline top, below the window line
+  const CHEAT_LO = 0.098; // ... and its bottom
+  const BELLY = 0.155;   // where the grey underside starts, from the keel
+
+  // --- base paint ---------------------------------------------------------
+  // Symmetric about the crown: white over the top, grey under the belly.
   const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0.0, '#f4f6f8');
-  g.addColorStop(0.46, '#eef1f4');
-  g.addColorStop(0.62, '#e3e7ea');
-  g.addColorStop(0.74, '#9aa3ab');
-  g.addColorStop(1.0, '#6f777e');
+  g.addColorStop(0.00, '#8b949c');            // keel
+  g.addColorStop(BELLY, '#c9d0d6');
+  g.addColorStop(0.30, '#f2f5f8');
+  g.addColorStop(0.50, '#ffffff');            // crown
+  g.addColorStop(0.70, '#f2f5f8');
+  g.addColorStop(1 - BELLY, '#c9d0d6');
+  g.addColorStop(1.00, '#8b949c');            // keel
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, W, H);
 
-  // Cheatline: a dark blue band along the window line, sweeping up over the
-  // tail the way most narrowbody schemes do.
-  const winV = 0.545;
-  ctx.beginPath();
-  for (let i = 0; i <= 64; i++) {
-    const t = i / 64;
-    const z = zMin + (zMax - zMin) * t;
-    const rise = z > 11 ? ((z - 11) / (zMax - 11)) ** 1.6 * 0.34 : 0;
-    ctx.lineTo(zToU(z), (winV + 0.055 - rise) * H);
-  }
-  for (let i = 64; i >= 0; i--) {
-    const t = i / 64;
-    const z = zMin + (zMax - zMin) * t;
-    const rise = z > 11 ? ((z - 11) / (zMax - 11)) ** 1.6 * 0.34 : 0;
-    ctx.lineTo(zToU(z), (winV + 0.115 - rise) * H);
-  }
-  ctx.closePath();
-  ctx.fillStyle = '#1d3f75';
-  ctx.fill();
+  // --- the cheatline ------------------------------------------------------
+  // A navy band under the windows with a thin light-blue pinstripe above it,
+  // sweeping up over the tail the way most narrowbody schemes do. Drawn twice,
+  // mirrored, because the two sides of the fuselage are two bands in v.
+  const sweep = (z) => (z > 9 ? ((z - 9) / (zMax - 9)) ** 1.7 * 0.085 : 0);
+  const drawBand = (v0, v1, colour, side) => {
+    ctx.beginPath();
+    for (let i = 0; i <= 96; i++) {
+      const z = zMin + ((zMax - zMin) * i) / 96;
+      ctx.lineTo(zToX(z), vToY(v0 + side * sweep(z)));
+    }
+    for (let i = 96; i >= 0; i--) {
+      const z = zMin + ((zMax - zMin) * i) / 96;
+      ctx.lineTo(zToX(z), vToY(v1 + side * sweep(z)));
+    }
+    ctx.closePath();
+    ctx.fillStyle = colour;
+    ctx.fill();
+  };
+  // side = +1 on the left (v increasing is upward there), -1 on the right.
+  drawBand(WIN_R - CHEAT_LO, WIN_R - CHEAT_HI, '#14346b', -1);
+  drawBand(WIN_L + CHEAT_HI, WIN_L + CHEAT_LO, '#14346b', +1);
+  drawBand(WIN_R - CHEAT_HI - 0.012, WIN_R - CHEAT_HI - 0.004, '#4d9fd6', -1);
+  drawBand(WIN_L + CHEAT_HI + 0.004, WIN_L + CHEAT_HI + 0.012, '#4d9fd6', +1);
 
-  // Windows.
-  const wH = 0.030 * H;
+  // --- passenger windows --------------------------------------------------
+  // Individual windows on the real 0.53 m pitch, 23 x 33 cm, at the real
+  // height. Each gets a frame in the height map so it catches a highlight.
+  const winH = (0.33 / 11.81) * H;   // 33 cm of an 11.81 m circumference
+  const winW = (0.23 / (zMax - zMin)) * W;
+  const pitch = (0.53 / (zMax - zMin)) * W;
   for (const w of windows) {
-    const u0 = zToU(w.z0);
-    const u1 = zToU(w.z1);
-    const pitch = (0.53 / (zMax - zMin)) * W; // 53 cm window pitch, the real one
-    for (let u = u0; u < u1; u += pitch) {
-      ctx.fillStyle = '#10161d';
-      ctx.beginPath();
-      ctx.roundRect(u, winV * H - wH * 0.5, pitch * 0.42, wH, wH * 0.35);
-      ctx.fill();
-      hx.fillStyle = '#5a5a5a';
-      hx.beginPath();
-      hx.roundRect(u, winV * H - wH * 0.5, pitch * 0.42, wH, wH * 0.35);
-      hx.fill();
+    for (let x = zToX(w.z0); x < zToX(w.z1) - winW; x += pitch) {
+      for (const v of [WIN_R, WIN_L]) {
+        const y = vToY(v) - winH / 2;
+        ctx.fillStyle = '#0d1218';
+        ctx.beginPath();
+        ctx.roundRect(x, y, winW, winH, winW * 0.42);
+        ctx.fill();
+        // A sliver of reflected sky along the top edge, so they read as glass
+        // rather than as painted dots.
+        ctx.fillStyle = 'rgba(150,185,215,0.5)';
+        ctx.beginPath();
+        ctx.roundRect(x + winW * 0.18, y + winH * 0.10, winW * 0.64, winH * 0.22, winW * 0.2);
+        ctx.fill();
+        hx.fillStyle = '#4a4a4a';
+        hx.beginPath();
+        hx.roundRect(x - 1, y - 1, winW + 2, winH + 2, winW * 0.45);
+        hx.fill();
+      }
     }
   }
 
-  // Flight-deck glazing: a dark wrap over the nose, above the cheatline.
-  const fdU0 = zToU(-18.6);
-  const fdU1 = zToU(-16.2);
-  ctx.fillStyle = '#141a21';
+  // --- flight deck --------------------------------------------------------
+  // The 737's glazing is the most recognisable thing about its nose: two big
+  // forward windscreens either side of a centre post, then a sliding side
+  // window and a small third pane, all sloping down as they go aft.
+  //
+  // Both sides again, mirrored about the crown at v = 0.5. `d` is the distance
+  // BELOW the crown in v, so the right side is 0.5 - d and the left 0.5 + d.
+  const pane = (z0, z1, d0, d1, dh) => {
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(zToX(z0), vToY(0.5 + side * d0));
+      ctx.lineTo(zToX(z1), vToY(0.5 + side * d1));
+      ctx.lineTo(zToX(z1), vToY(0.5 + side * (d1 + dh)));
+      ctx.lineTo(zToX(z0), vToY(0.5 + side * (d0 + dh)));
+      ctx.closePath();
+      ctx.fillStyle = '#0b1017';
+      ctx.fill();
+      ctx.strokeStyle = '#9aa4ae';
+      ctx.lineWidth = Math.max(1.5, W / 900);
+      ctx.stroke();
+      // A cold reflection across the upper half of each pane.
+      ctx.save();
+      ctx.clip();
+      ctx.fillStyle = 'rgba(120,160,200,0.30)';
+      ctx.fillRect(zToX(z0), vToY(0.5 + side * d0) - (side < 0 ? 0 : 0), zToX(z1) - zToX(z0), side * vToY(dh) * 0.45);
+      ctx.restore();
+      // Frame in the height map so the posts stand proud.
+      hx.strokeStyle = '#5e5e5e';
+      hx.lineWidth = Math.max(2, W / 700);
+      hx.beginPath();
+      hx.moveTo(zToX(z0), vToY(0.5 + side * d0));
+      hx.lineTo(zToX(z1), vToY(0.5 + side * d1));
+      hx.lineTo(zToX(z1), vToY(0.5 + side * (d1 + dh)));
+      hx.lineTo(zToX(z0), vToY(0.5 + side * (d0 + dh)));
+      hx.closePath();
+      hx.stroke();
+    }
+  };
+  //     z from      z to     below crown at z0/z1     pane depth
+  pane(-18.95, -17.85, 0.030, 0.055, 0.098);  // No.1 windscreen
+  pane(-17.72, -16.95, 0.058, 0.072, 0.092);  // No.2 sliding window
+  pane(-16.85, -16.25, 0.075, 0.086, 0.076);  // No.3 quarter light
+
+  // Anti-glare shield: the flat black panel ahead of the windscreens that
+  // every airliner has, and without which the nose reads as a bare egg.
+  ctx.fillStyle = '#161b21';
   ctx.beginPath();
-  ctx.roundRect(fdU0, 0.40 * H, fdU1 - fdU0, 0.105 * H, 0.02 * H);
+  ctx.moveTo(zToX(-19.45), vToY(0.5));
+  ctx.lineTo(zToX(-18.9), vToY(0.5 - 0.028));
+  ctx.lineTo(zToX(-18.9), vToY(0.5 + 0.028));
+  ctx.closePath();
   ctx.fill();
 
-  // Doors — four of them, at the real stations.
-  for (const [z0, z1] of [[-15.0, -13.2], [-4.6, -3.0], [3.2, 4.8], [12.0, 13.6]]) {
-    const u0 = zToU(z0);
-    const u1 = zToU(z1);
-    ctx.strokeStyle = 'rgba(60,70,80,0.55)';
-    ctx.lineWidth = Math.max(1, W / 1400);
-    ctx.beginPath();
-    ctx.roundRect(u0, 0.40 * H, u1 - u0, 0.20 * H, 0.012 * H);
-    ctx.stroke();
-    hx.strokeStyle = '#6e6e6e';
-    hx.lineWidth = ctx.lineWidth * 2;
-    hx.beginPath();
-    hx.roundRect(u0, 0.40 * H, u1 - u0, 0.20 * H, 0.012 * H);
-    hx.stroke();
-  }
+  // --- doors --------------------------------------------------------------
+  // Four passenger doors and two overwing exits, at the real stations. Outline
+  // only in the paint; the height map carries the recess.
+  const door = (z0, z1, dTop, dBot) => {
+    for (const v of [WIN_R, WIN_L]) {
+      const s = v < 0.5 ? -1 : 1;
+      const y0 = vToY(v - s * dTop);
+      const y1 = vToY(v + s * dBot);
+      ctx.strokeStyle = 'rgba(70,82,95,0.5)';
+      ctx.lineWidth = Math.max(1, W / 1500);
+      ctx.beginPath();
+      ctx.roundRect(zToX(z0), Math.min(y0, y1), zToX(z1) - zToX(z0), Math.abs(y1 - y0), 6);
+      ctx.stroke();
+      hx.strokeStyle = '#6e6e6e';
+      hx.lineWidth = Math.max(2, W / 900);
+      hx.beginPath();
+      hx.roundRect(zToX(z0), Math.min(y0, y1), zToX(z1) - zToX(z0), Math.abs(y1 - y0), 6);
+      hx.stroke();
+    }
+  };
+  door(-15.0, -13.2, 0.052, 0.115);
+  door(-4.6, -3.0, 0.052, 0.115);   // overwing exits
+  door(3.2, 4.8, 0.052, 0.115);
+  door(12.0, 13.6, 0.052, 0.115);
 
-  // Frame stations and rivet rows.
-  hx.globalAlpha = 0.55;
+  // --- structure ----------------------------------------------------------
+  hx.globalAlpha = 0.5;
   for (let z = zMin + 2; z < zMax - 1.5; z += 1.02) {
-    const u = zToU(z);
+    const x = zToX(z);
     hx.strokeStyle = '#6a6a6a';
     hx.lineWidth = Math.max(1, W / 2048);
     hx.beginPath();
-    hx.moveTo(u, 0);
-    hx.lineTo(u, H);
+    hx.moveTo(x, 0);
+    hx.lineTo(x, H);
     hx.stroke();
   }
   hx.globalAlpha = 1;
-  for (const v of [0.30, 0.44, 0.68, 0.82]) {
-    drawRivets(hx, zToU(zMin + 1.5), v * H, zToU(zMax - 1.5), v * H, '#9a9a9a',
+  for (const v of [0.10, 0.19, 0.36, 0.64, 0.81, 0.90]) {
+    drawRivets(hx, zToX(zMin + 1.5), vToY(v), zToX(zMax - 1.5), vToY(v), '#9a9a9a',
       Math.max(3, W / 300), Math.max(1, W / 1600));
   }
 
-  // Registration, on the aft fuselage.
-  ctx.fillStyle = '#22303f';
-  ctx.font = `600 ${Math.round(0.055 * H)}px ui-sans-serif, system-ui, sans-serif`;
+  // --- registration and titles -------------------------------------------
+  /**
+   * WHICH FLANK GETS MIRRORED, derived rather than guessed, because guessing
+   * it wrong is invisible from one side and glaring from the other.
+   *
+   * Texture X runs nose (-Z) to tail (+Z). Take an observer outside the RIGHT
+   * flank, looking in -X with +Y up: their screen-right is cross(d, up) =
+   * (-1,0,0) x (0,1,0) = (0,0,-1), which is -Z — the NOSE. So on the right
+   * flank the nose is to the viewer's right, texture X increases toward screen
+   * LEFT, and text laid down normally comes out backwards.
+   *
+   * Repeat for the left flank: d = (+1,0,0) gives screen-right = +Z, the tail.
+   * Texture X increases toward screen right, and text reads correctly as laid.
+   *
+   *   RIGHT flank (v ~ 0.25)  ->  MIRROR
+   *   LEFT  flank (v ~ 0.75)  ->  as-is
+   *
+   * This file had it exactly the other way round, which is why the titles read
+   * backwards on the left side of the aeroplane.
+   */
+  const flankText = (text, z, v, mirror) => {
+    ctx.save();
+    if (mirror) {
+      ctx.translate(zToX(z) + ctx.measureText(text).width, vToY(v));
+      ctx.scale(-1, 1);
+      ctx.fillText(text, 0, 0);
+    } else {
+      ctx.fillText(text, zToX(z), vToY(v));
+    }
+    ctx.restore();
+  };
+
+  ctx.fillStyle = '#14346b';
+  ctx.font = `700 ${Math.round(0.052 * H)}px ui-sans-serif, system-ui, sans-serif`;
   ctx.textBaseline = 'middle';
-  ctx.fillText(reg, zToU(14.0), 0.72 * H);
+  flankText(reg, 14.6, WIN_R + 0.075, true);   // right flank
+  flankText(reg, 14.6, WIN_L - 0.075, false);  // left flank
+
+  ctx.font = `700 ${Math.round(0.075 * H)}px ui-sans-serif, system-ui, sans-serif`;
+  flankText('FLIGHTLENS', -11.5, 0.5 - 0.115, true);   // right
+  flankText('FLIGHTLENS', -11.5, 0.5 + 0.115, false);  // left
 
   return { map: canvas, height: hCanvas };
 }
 
 /** Wing and tail skin: spanwise panel lines, rivet rows, a leading-edge flash. */
 function makeWingTexture() {
-  const W = texSize(1024);
-  const H = texSize(512);
-  const { canvas, ctx } = makeSkinCanvas(W, H);
-  const { canvas: hCanvas, ctx: hx } = makeCanvas(W, H);
+  const W = 1024;
+  const H = 512;
+  const canvas = makeSkinCanvas(W, H);
+  const hCanvas = makeSkinCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+  const hx = hCanvas.getContext('2d');
   hx.fillStyle = '#808080';
   hx.fillRect(0, 0, W, H);
 
@@ -494,8 +665,9 @@ function makeWingTexture() {
 
 /** Fan-blur disc: dense at the tip, transparent at the spinner. */
 function makeFanDiscTexture() {
-  const S = texSize(256);
-  const { canvas, ctx } = makeCanvas(S, S);
+  const S = 256;
+  const canvas = makeCanvas(S, S);
+  const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, S, S);
   const c = S / 2;
   const g = ctx.createRadialGradient(c, c, S * 0.06, c, c, c);
@@ -665,50 +837,12 @@ export function createB738(scene, opts = {}) {
     for (let k = 0; k < n; k++) ringZ.push(a + ((b - a) * k) / n);
   }
   ringZ.push(FUSELAGE[FUSELAGE.length - 1][0]);
-  // buildFuselage returns { shell, glass, sampler } — the window apertures are
-  // cut from the shell and handed back as a separate glazing surface.
-  const fuse = buildFuselage(FUSELAGE, ringZ, 32, WINDOWS);
+  // buildFuselage returns { shell, glass, sampler }. WINDOW_CUTS is empty, so
+  // there are no apertures and no glazing — see the note on it. The hull is a
+  // solid hull and the windows are painted on.
+  const fuse = buildFuselage(FUSELAGE, ringZ, 32, WINDOW_CUTS);
   add(fuse.shell, paint).name = 'fuselage';
-
-  // Cabin lining, so the windows look into an interior rather than straight
-  // out through the far side of the aeroplane. Lofted slightly inside the hull
-  // at a coarser ring spacing, with the apertures grown so no sliver of lining
-  // pokes through a window edge — same trick, and same reason, as the Cessna's.
-  const LINING_MARGIN_Z = 0.14;
-  const LINING_MARGIN_U = 0.03;
-  const liningWindows = WINDOWS.map((w) => ({
-    z0: w.z0 - LINING_MARGIN_Z,
-    z1: w.z1 + LINING_MARGIN_Z,
-    u0: w.u0 - LINING_MARGIN_U,
-    u1: w.u1 + LINING_MARGIN_U,
-  }));
-  const liningTable = FUSELAGE.map(([z, hw, hh, cy, e]) => [z, hw * 0.965, hh * 0.965, cy, e]);
-  const liningZ = ringZ.filter((_, i) => i % 2 === 0);
-  const lining = buildFuselage(liningTable, liningZ, 24, liningWindows);
-  add(lining.shell, track(new THREE.MeshStandardMaterial({
-    color: 0x3c4046, roughness: 0.9, metalness: 0.0, side: THREE.BackSide,
-    envMap, envMapIntensity: 0.15,
-  })));
-  if (lining.glass) lining.glass.dispose();
-
-  if (fuse.glass) {
-    const glass = new THREE.Mesh(track(fuse.glass), track(new THREE.MeshPhysicalMaterial({
-      color: 0x8fa6b8,
-      metalness: 0.0,
-      roughness: 0.06,
-      transparent: true,
-      opacity: 0.16,
-      clearcoat: 1.0,
-      clearcoatRoughness: 0.03,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      envMap,
-      envMapIntensity: 0.5,
-    })));
-    glass.renderOrder = 2;
-    glass.name = 'glazing';
-    group.add(glass);
-  }
+  if (fuse.glass) fuse.glass.dispose();
 
   // ---- wing --------------------------------------------------------------
   const wingRoot = new THREE.Group();
@@ -755,7 +889,23 @@ export function createB738(scene, opts = {}) {
     const tip = wingPlanform(WING.semiSpan - 0.02);
     const wl = new THREE.Group();
     wl.position.set((side ? -1 : 1) * (WING.semiSpan - 0.05), tip.y, tip.zLE + tip.chord * 0.25);
-    wl.rotation.z = (side ? -1 : 1) * (Math.PI / 2 - WINGLET.cant);
+    /**
+     * BOTH WINGLETS POINT UP. The cant flips sign across the centreline, the
+     * quarter-turn does not.
+     *
+     * The surface is lofted along +X, so rotating by (pi/2 - cant) about Z
+     * sends it up and outboard on the RIGHT wing. Mirroring that whole angle
+     * for the left wing — negating it — sends the left one up and INBOARD in
+     * the mirror sense, which comes out as down and inboard in world terms: a
+     * winglet hanging below the wing. Only the cant is a mirrored quantity.
+     *
+     *   right  pi/2 - cant  ->  (sin cant,  cos cant)   up, outboard (+X)
+     *   left   pi/2 + cant  -> (-sin cant,  cos cant)   up, outboard (-X)
+     *
+     * Both have +cos(cant) as their vertical component, which is the property
+     * that matters and the one check-b738.mjs now asserts.
+     */
+    wl.rotation.z = Math.PI / 2 + (side ? 1 : -1) * WINGLET.cant;
     wingRoot.add(wl);
     add(buildLiftingSurface({
       planform: wingletPlanform,

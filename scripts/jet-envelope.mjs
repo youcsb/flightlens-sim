@@ -508,7 +508,23 @@ head('8. arrivals — the gear is the fuse, and it fails before the wing');
 
   const soft = arrive(300);
   const firm = arrive(700);
-  const hard = arrive(1100);
+  // THE FAILURE ORDER, not one particular sink rate. The gear gives way on
+  // closing speed at 5 m/s (984 fpm); the airframe needs 4 g held for 60 ms,
+  // which takes considerably more. So as arrivals get harder the GEAR must be
+  // what goes first, and only a genuinely violent one should reach the wing.
+  // Sweeping is what makes that checkable — a single command number slides
+  // either side of the threshold every time the trim moves, which is exactly
+  // what happened when cm0 changed.
+  const sweep = [1100, 1200, 1300, 1500, 1800].map((f) => ({ f, r: arrive(f) }));
+  const firstCrash = sweep.find((x) => x.r.crashed);
+  const hard = firstCrash ? firstCrash.r : sweep[sweep.length - 1].r;
+  for (const x of sweep) {
+    say(
+      '  ' + x.f + ' fpm commanded',
+      x.r.tdFpm.toFixed(0) + ' fpm, ' + x.r.peakG.toFixed(2) + ' g',
+      x.r.crashed ? x.r.why : 'survived',
+    );
+  }
   say('gentle arrival', `${soft.tdFpm.toFixed(0)} fpm, ${soft.peakG.toFixed(2)} g`, soft.crashed ? 'CRASH' : 'survived');
   say('firm arrival', `${firm.tdFpm.toFixed(0)} fpm, ${firm.peakG.toFixed(2)} g`, firm.crashed ? 'CRASH' : 'survived');
   say('hard arrival', `${hard.tdFpm.toFixed(0)} fpm, ${hard.peakG.toFixed(2)} g`, hard.crashed ? 'CRASH' : 'survived');

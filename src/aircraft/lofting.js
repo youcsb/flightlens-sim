@@ -24,6 +24,15 @@
 
 import * as THREE from 'three';
 import { clamp } from '../core/units.js';
+// makeSkinCanvas() sizes every skin through the device texture budget. This
+// import was MISSED when these functions were extracted out of model.js, and
+// nothing caught it: `texSize` is only reached inside the canvas path, which
+// HAS_CANVAS gates off under Node, so every headless harness skipped straight
+// past it. In a browser it threw ReferenceError on the first skin, both
+// aircraft caught it and fell back to untextured materials, and the aeroplanes
+// went plain white. See check-aircraft.mjs § textures for the guard that now
+// exists so this cannot happen silently again.
+import { texSize } from '../core/textureBudget.js';
 
 export const TAU = Math.PI * 2;
 

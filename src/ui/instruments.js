@@ -157,20 +157,33 @@ const cx = (i) => PAD_X + R_BEZEL + i * PITCH;
 // small gap at the bottom left. That is what puts the green arc up through the
 // top of the dial where a pilot expects it, and it parks the needle at 7
 // o'clock at rest instead of straight up.
-const ASI_MIN = 40;
-const ASI_MAX = 200;
-const ASI_START = 210; // degrees clockwise from straight up, at ASI_MIN
-const ASI_SWEEP = 330; // degrees from ASI_MIN to ASI_MAX
+const ASI_START = 210; // degrees clockwise from straight up, at the low end
+const ASI_SWEEP = 330; // degrees from the low end to the high end
+
+/**
+ * AIRSPEED SCALES, per aircraft. Like the engine gauge, this is not one
+ * instrument with a different needle position — it is a different instrument.
+ *
+ * A Cessna's ASI runs 40-200 kt. A 737 cruises at 250-340 KIAS, which is off
+ * the end of that face entirely: the needle sweeps past 200, past the 6
+ * o'clock gap, and comes to rest back near the bottom-left where the scale
+ * starts. It reads ZERO at 256 kt. That is not a needle pegged at the stop, it
+ * is a needle that has gone all the way round, and it is exactly what a real
+ * instrument would do if you flew it past its design range.
+ *
+ * The V-speed arcs are part of the scale, not decoration — the green arc IS
+ * the normal operating range and it means nothing if it is another aeroplane's.
+ */
+const ASI_SCALES = {
+  c172: { min: 40, max: 200, step: 5, mid: 10, num: 20, vS0: 40, vS1: 48, vFe: 85, vNo: 129, vNe: 163 },
+  // 737-800 at 70 t: Vs0 112 (flap 40), Vs1 143 clean, Vfe 200 (the flaps-15
+  // placard this model's single flap axis is set to), Vmo 340.
+  b738: { min: 60, max: 400, step: 10, mid: 20, num: 40, vS0: 112, vS1: 143, vFe: 200, vNo: 285, vNe: 340 },
+};
+let asiCfg = ASI_SCALES.c172;
 const asiAngle = (kt) =>
   ASI_START +
-  ((clamp(kt, ASI_MIN, ASI_MAX) - ASI_MIN) / (ASI_MAX - ASI_MIN)) * ASI_SWEEP;
-
-// Cessna 172S V-speeds, KIAS. See the header note.
-const V_S0 = 40;
-const V_S1 = 48;
-const V_FE = 85;
-const V_NO = 129;
-const V_NE = 163;
+  ((clamp(kt, asiCfg.min, asiCfg.max) - asiCfg.min) / (asiCfg.max - asiCfg.min)) * ASI_SWEEP;
 
 // --- attitude --------------------------------------------------------------
 /** SVG units of vertical travel per degree of pitch. +-30 deg fits the face. */
@@ -228,8 +241,21 @@ const TUBE_R = 218;
 const TUBE_CY = -150;
 const TUBE_HALF_SPAN = 9.5;
 
-// --- flap detents, degrees (C172) -----------------------------------------
-const FLAP_DETENTS = [0, 10, 20, 30];
+// --- flap detents, degrees, per aircraft ----------------------------------
+/**
+ * The gauge shows the aeroplane's OWN gate positions. A 737 flap selector has
+ * seven, not four, and reading 30 degrees when the lever is at 40 is a wrong
+ * number that looks like a right one.
+ *
+ * The flight model still has a single continuous 0..1 flap axis for both types
+ * — detents are not implemented in the physics — so this maps that axis onto
+ * the real gate labels rather than pretending the gates exist.
+ */
+const FLAP_SETS = {
+  c172: [0, 10, 20, 30],
+  b738: [0, 1, 5, 15, 25, 30, 40],
+};
+let FLAP_DETENTS = FLAP_SETS.c172;
 
 // ---------------------------------------------------------------------------
 // COMPACT HUD geometry. SVG user units; each compact widget is its OWN svg
@@ -512,22 +538,23 @@ function airspeedFace(u) {
 
   // Coloured arcs. The white flap-operating arc sits inboard of the green and
   // yellow, exactly as it does on the real instrument.
-  s += arc(85, asiAngle(V_S1), asiAngle(V_NO), GREEN, 8);
-  s += arc(85, asiAngle(V_NO), asiAngle(V_NE), AMBER, 8);
-  s += arc(74, asiAngle(V_S0), asiAngle(V_FE), '#f0f4f8', 5);
-  // Vne red line, standing proud of the arcs.
-  s += tick(78, 92, asiAngle(V_NE), 5, RED);
+  const A = asiCfg;
+  s += arc(85, asiAngle(A.vS1), asiAngle(A.vNo), GREEN, 8);
+  s += arc(85, asiAngle(A.vNo), asiAngle(A.vNe), AMBER, 8);
+  s += arc(74, asiAngle(A.vS0), asiAngle(A.vFe), '#f0f4f8', 5);
+  // Vne (Vmo on a jet) red line, standing proud of the arcs.
+  s += tick(78, 92, asiAngle(A.vNe), 5, RED);
 
   // Minor ticks every 5 kt, mid ticks every 10, numerals every 20. At
   // 2.06 deg/kt the 5 kt ticks land 10 degrees apart — dense enough to
   // interpolate against, open enough to count.
-  for (let kt = ASI_MIN; kt <= ASI_MAX; kt += 5) {
+  for (let kt = A.min; kt <= A.max; kt += A.step) {
     const a = asiAngle(kt);
-    if (kt % 20 === 0) s += tick(70, 56, a, 3.2);
-    else if (kt % 10 === 0) s += tick(70, 61, a, 2.2);
+    if (kt % A.num === 0) s += tick(70, 56, a, 3.2);
+    else if (kt % A.mid === 0) s += tick(70, 61, a, 2.2);
     else s += tick(70, 65, a, 1.3, INK_DIM);
   }
-  for (let kt = ASI_MIN; kt <= ASI_MAX; kt += 20) {
+  for (let kt = A.min; kt <= A.max; kt += A.num) {
     s += radialText(52, asiAngle(kt), String(kt), 15);
   }
 
@@ -905,13 +932,14 @@ function cAirspeed(u) {
     `<rect x="${x}" y="${y(hi)}" width="${w}" height="${((hi - lo) * C_ASI_UPK).toFixed(2)}"` +
     ` fill="${color}"/>`;
 
+  const A = asiCfg;
   let m = '';
-  m += band(V_S0, V_FE, 0, 2.6, '#f0f4f8'); // white flap-operating arc, inboard
-  m += band(V_S1, V_NO, 2.6, 3.4, GREEN);
-  m += band(V_NO, V_NE, 2.6, 3.4, AMBER);
-  m += band(V_NE, 240, 2.6, 3.4, RED);
-  for (let kt = 0; kt <= 240; kt += 5) {
-    const major = kt % 10 === 0;
+  m += band(A.vS0, A.vFe, 0, 2.6, '#f0f4f8'); // white flap arc, inboard
+  m += band(A.vS1, A.vNo, 2.6, 3.4, GREEN);
+  m += band(A.vNo, A.vNe, 2.6, 3.4, AMBER);
+  m += band(A.vNe, A.max, 2.6, 3.4, RED);
+  for (let kt = 0; kt <= A.max; kt += A.step) {
+    const major = kt % A.mid === 0;
     m +=
       `<line x1="9" y1="${y(kt)}" x2="${major ? 22 : 16}" y2="${y(kt)}"` +
       ` stroke="${major ? INK : INK_DIM}" stroke-width="${major ? 1.6 : 1.1}"/>`;
@@ -2210,12 +2238,20 @@ export function createInstruments(container, opts = {}) {
      * The FACE is rebuilt, not just the needle — see ENGINE_GAUGES. Passing a
      * kind that is already active is a no-op, so main.js can call it freely.
      *
+     * ...and the airspeed scale with it, because both faces live in the same
+     * SVG and there is only one rebuild to spend.
+     *
      * @param {'rpm'|'n1'} kind — flightModel publishes this as state.engineGauge.
+     * @param {'c172'|'b738'} [asiKey] — which ASI_SCALES entry to draw.
      */
-    setEngineGauge(kind) {
+    setEngineGauge(kind, asiKey) {
       const next = ENGINE_GAUGES[kind] || ENGINE_GAUGES.rpm;
-      if (next === tachCfg) return;
+      const nextAsi = ASI_SCALES[asiKey] || asiCfg;
+      const nextFlap = FLAP_SETS[asiKey] || FLAP_DETENTS;
+      if (next === tachCfg && nextAsi === asiCfg && nextFlap === FLAP_DETENTS) return;
       tachCfg = next;
+      asiCfg = nextAsi;
+      FLAP_DETENTS = nextFlap;
       // Force a full rebuild: the current layout's SVG has the old face baked
       // into its markup, and there is no partial update that can change a
       // dial's tick spacing and its legend.

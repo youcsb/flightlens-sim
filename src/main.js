@@ -448,11 +448,10 @@ async function boot() {
   const autopilot = createAutopilot();
 
   // Seed the aircraft transform so the first frame is already correct.
-  acMount.position.copy(flight.state.position);
-  acMount.quaternion.copy(flight.state.orientation);
+  flight.renderTransform(acMount.position, acMount.quaternion);
 
   overlay.setAircraft?.(type.name);
-  instruments.setEngineGauge?.(flight.state.engineGauge);
+  instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
   autopilot.setProfile?.(type.autopilot);
 
   const dem = getRegionStats();
@@ -552,13 +551,12 @@ async function boot() {
     input.setThrottle(spawnThrottleFor(type, p, rt));
     input.setFlaps(0);
 
-    acMount.position.copy(flight.state.position);
-    acMount.quaternion.copy(flight.state.orientation);
+    flight.renderTransform(acMount.position, acMount.quaternion);
     cameras.setAircraftFrame?.(type.camera);
     cameras.snap?.();
     cameras.update(0, flight.state);
 
-    instruments.setEngineGauge?.(flight.state.engineGauge);
+    instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
     // Gains for the aeroplane that now exists. Also re-zeros the integrators,
     // which were wound up for the one that does not.
     autopilot.setProfile?.(type.autopilot);
@@ -597,8 +595,7 @@ async function boot() {
 
     // Move the picture with the aeroplane, in this order: chunks first (so the
     // camera's ground-clearance floor reads real terrain), then the camera.
-    acMount.position.copy(flight.state.position);
-    acMount.quaternion.copy(flight.state.orientation);
+    flight.renderTransform(acMount.position, acMount.quaternion);
     terrain.converge?.(
       flight.state.position.x,
       flight.state.position.y,
@@ -838,8 +835,12 @@ async function boot() {
 
       // 4. visual aircraft follows the model. flightModel owns the transform;
       //    aircraft/model.js is purely cosmetic and never moves itself.
-      acMount.position.copy(state.position);
-      acMount.quaternion.copy(state.orientation);
+      // DRAW between the last two physics substeps, not at the latest one.
+      // step() leaves up to 4 ms of unsimulated time, so `state.position`
+      // advances in uneven jumps once frame times stop being exact multiples
+      // of 1/240 s — about a metre of noise at jet speeds, which reads as a
+      // ghosted aeroplane. See renderTransform() in flightModel.js.
+      flight.renderTransform(acMount.position, acMount.quaternion);
       aircraft.setControlSurfaces(inputs);
       // WHICH NUMBER DRIVES THE SPINNER IS THE AIRFRAME'S TO SAY. A piston
       // publishes rpm and leaves n1Pct at zero; a turbofan does the reverse,

@@ -207,5 +207,18 @@ export function spawnThrottleFor(type, place, r) {
     !!p && (Number.isFinite(p.altitudeAglM) || Number.isFinite(p.altitudeMslM));
   const base = place.throttle ?? 0;
   if (!airborne || type.id !== 'b738') return base;
-  return Math.max(base, 0.8);
+  /**
+   * 0.30, down from 0.80.
+   *
+   * 0.80 was picked to be sure a heavy jet would not sink on arrival, and it
+   * over-corrected badly: level flight at 250 kt and 2,000 ft needs about
+   * 39 kN against roughly 160 kN available, so a fifth of the thrust holds
+   * altitude and four fifths of it is climb. Spawning at 0.80 launched the
+   * aeroplane at 6,000 fpm through 18 degrees of pitch.
+   *
+   * Measured hands-off from the downtown spawn: 0.30 gives a 1,000 fpm climb
+   * at a steady 242 kt and 7 degrees of pitch, which is an aeroplane you
+   * arrive in rather than one you have to catch.
+   */
+  return Math.max(base, 0.3);
 }

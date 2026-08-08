@@ -218,13 +218,31 @@ export const B738 = {
     clDe: 0.32,
 
     /**
-     * Pitching moment at zero alpha — the hands-off trim bias, and the single
-     * most consequential number here for how the aeroplane feels. Unlike the
-     * Cessna, a jet is flown TRIMMED at every speed rather than hands-off at
-     * one, so this is set low and the stabiliser (controls.trimAuthority) does
-     * the work.
+     * Pitching moment at zero alpha — THE HANDS-OFF TRIM SPEED, and the single
+     * most consequential number in this file for how the aeroplane feels.
+     *
+     * 0.10, raised from a first guess of 0.045 after it was flown. The theory
+     * behind 0.045 was "a jet is flown trimmed at every speed, so keep the bias
+     * small and let the stabiliser do the work". The theory was wrong about
+     * what happens when the stabiliser is NOT doing the work: with cm0 0.045
+     * and cmAlpha -1.3 the untrimmed aeroplane balances at alpha 1.98 deg, and
+     * the speed at which that alpha carries 70 tonnes is
+     *
+     *     V = sqrt(W / (0.5 rho S CL))  with CL 0.357  ->  158 m/s = 308 kt
+     *
+     * So a hands-off 737 wanted 308 kt. Released at the 250 kt it spawns at, it
+     * pitched down to go and find that speed — losing 1,688 ft before the extra
+     * dynamic pressure pulled it out, then zooming back through the entry
+     * altitude. That is a correctly-modelled aeroplane trimmed for the wrong
+     * speed, and it read as "the plane dips a lot and crashes down quickly".
+     *
+     * Solving the same equation backwards for a hands-off 250 kt gives
+     * cm0 = cmAlpha * alpha = 1.3 * 0.0723 = 0.094. Measured across the range,
+     * 0.10 lands it: hands-off from the downtown spawn it now loses 29 ft
+     * rather than 1,688, holds 242 kt, and peaks at 7 deg of pitch instead of
+     * 23.
      */
-    cm0: 0.045,
+    cm0: 0.1,
     /** Longitudinal static stability. Stiffer than the Cessna in pitch. */
     cmAlpha: -1.3,
     /** Pitch damping. Large: long tail arm, short chord. */
