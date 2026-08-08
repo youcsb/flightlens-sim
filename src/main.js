@@ -457,6 +457,8 @@ async function boot() {
 
   /** Reused surface-command object — see the note at the call site. */
   const surf = { pitch: 0, roll: 0, yaw: 0, flaps: 0, flapsExact: true };
+  /** Last flap selection we warned about, so the toast fires once per press. */
+  let lastFlapWant = -1;
 
   const dem = getRegionStats();
   console.info(
@@ -886,6 +888,29 @@ async function boot() {
 
     // 6. hud + sound. The crash card is driven off the model's latched flag,
     //    not off an event, so it survives a paused frame and a camera change.
+    /**
+     * TELL THE PILOT WHY THE FLAPS ARE NOT MOVING.
+     *
+     * A placard-limited flap selection is silent: the lever moves through
+     * every gate and the wing does not budge. That is correct — and it is
+     * indistinguishable from a broken key. It cost a lot of confusion, because
+     * the honest answer ("you are 12 kt too fast") was nowhere on screen.
+     *
+     * Fires only on a real disagreement between the lever and the flaps, once
+     * per selection, and only when the flaps have had time to travel.
+     */
+    if (!paused) {
+      const want = inputs.flaps ?? 0;
+      const got = state.flapsPos ?? 0;
+      const blocked = want - got > 0.04;
+      if (blocked && want !== lastFlapWant) {
+        overlay.toast(`too fast for flaps — ${state.indicatedAirspeedKts.toFixed(0)} kt`);
+        lastFlapWant = want;
+      } else if (!blocked) {
+        lastFlapWant = -1;
+      }
+    }
+
     instruments.update(state, inputs);
     overlay.setAutopilot(autopilot);
     // The compact HUD crops RPM and the nearest field off the windscreen; the

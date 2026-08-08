@@ -73,18 +73,25 @@ export const AIRCRAFT_TYPES = [
     airframe: B738,
     createModel: (scene, opts) => createB738(scene, opts),
     /**
-     * 128 m/s = 250 kt, and this override is not a nicety.
+     * 108 m/s = 210 kt, and this override is not a nicety.
      *
      * The airborne places spawn at 100-105 kt because that is a sensible
      * Cessna cruise. A 737 stalls at 143 kt clean. Spawning one at 100 kt does
      * not produce a slow jet — it produces an aeroplane that is already below
      * its stalling speed at the instant it appears, drops a wing, and is in a
-     * spiral before the loading toast has faded. 250 kt is a normal
-     * below-10,000-ft speed and leaves a wide margin above the stall.
+     * spiral before the loading toast has faded.
+     *
+     * WHY 210 AND NOT 250. 250 kt is the realistic figure below 10,000 ft and
+     * it was the first choice — but it is also EXACTLY the flaps 1/5 placard,
+     * and the aeroplane accelerates off the spawn, so within seconds it sat at
+     * 262 kt and refused every flap setting. Correct, and completely opaque:
+     * the lever moved through all seven gates and the wing never budged. 210
+     * is under the flaps-15 placard, so flap is usable the moment you arrive,
+     * and it is still 67 kt clear of the clean stall.
      *
      * A type whose comfortable speed matches the table leaves this null.
      */
-    airborneSpeedMs: 128,
+    airborneSpeedMs: 108,
     /**
      * Both scenery airports clear this easily — KBFI 32L is 3,048 m and KSEA
      * 16C is 3,627 m, against a measured 1,772 m ground roll. It is stated so
