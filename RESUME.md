@@ -195,7 +195,51 @@ change the only option." Every step below preserves the C172 as the default.
 **Local only for now** — no deploying to flightlens.us until the kinks are out.
 game.flightlens.us keeps serving the Cessna-only build.
 
-### Step 1 (in progress) — parameterize the flight model
+### Step 1 — DONE (`791acbc`, merged to main, NOT deployed)
+
+`src/physics/airframes/c172.js` is now the Cessna as data — 20 config keys, six
+groups (`aero`, `controls`, `flaps`, `prop`, `gear`, `limits`). `flightModel.js`
+keeps 18 module-scope constants, all genuinely physics or integration.
+A second aircraft is one sibling file plus one line at the call site.
+
+**Gate passed and independently re-verified:** envelope, trim and autopilot
+output byte-identical to the pre-refactor baselines. build green, check:all
+green at **1,208 assertions across 16 harnesses**.
+
+#### THE IMPORTANT PART — what a 737 still needs in CODE, not data
+
+The refactor clears its own bar (an invented 60 t jet flies as pure data), but
+it is NOT enough for a *good* 737. Fix 1–3 before anyone models the jet; 4 is a
+quiet trap:
+
+1. **Propulsion is a piston with a propeller on it.** `shaftW = P_MAX · lapse ·
+   spool` then `T = shaftW·η / ∛(V³ + knee³)` — naturally-aspirated power lapse
+   and fixed-pitch prop roll-off. A turbofan is roughly flat thrust and *rises*
+   in relative terms where a prop sags. Magnitude can be faked with a huge
+   `maxPowerW`; the SHAPE is wrong through the whole climb. Wants a
+   `propulsion: 'piston' | 'turbofan'` branch.
+2. **`state.rpm` is an rpm gauge.** A jet shows N1 %. `idleRpm: 20, maxRpm: 100`
+   produces a plausible-looking number, which is worse than an obviously wrong
+   one.
+3. **No compressibility at all** — no Prandtl–Glauert on CL_ALPHA, no Mach drag
+   rise, no Mmo. Vne is pure IAS. A 737 cruises at M0.78 where those dominate.
+   **The biggest physics gap.**
+4. **`CL_MAX` is clamped to 0.9..2.4.** A high-wing-loading airframe with slats
+   hits the ceiling and its stall speed comes out silently wrong. One line.
+5. No gear-retraction axis or gear drag increment (a 172's gear is welded down).
+6. Flaps are one continuous 0..1 axis — no detents, no slats as a separate
+   surface, no speedbrake, spoilers or reversers. A 737's schedule is a table
+   with a placard speed per notch.
+7. One thrust vector on the centreline — no engine-out asymmetry.
+8. Some feel literals still inline in `integrate()`: flap blow-back band, stall
+   hysteresis and warning threshold, tailplane/aileron blanking.
+9. `aircraft/model.js` needs a 737 mesh and hardcodes a −1.2 m contact patch
+   that must match `gearHeightM`.
+
+**So the earlier 3–5 hour estimate for the jet was optimistic.** Items 1–3 are
+real model work, not config, and item 3 is a new subsystem.
+
+### Superseded — original step 1 description
 
 flightModel.js had 67 module-scope constants describing exactly one aeroplane.
 `DEFAULTS` already carried mass, wing area, span, power, cd0 and the inertias;
