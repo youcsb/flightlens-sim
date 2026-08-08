@@ -744,9 +744,28 @@ export function createCameras(aircraftGroup, renderer) {
     const h = Number.isFinite(dt) ? clamp(dt, 0, 0.1) : 0;
     aircraftGroup.updateMatrixWorld();
 
-    // Prefer the flight model's state, but stay correct if it is not passed.
-    if (state && state.position) _acPos.copy(state.position);
-    else _acPos.setFromMatrixPosition(aircraftGroup.matrixWorld);
+    /**
+     * FRAME WHAT IS DRAWN, NOT WHAT IS SIMULATED.
+     *
+     * This used to prefer `state.position` and fall back to the group. That is
+     * backwards now that main.js draws the aeroplane at flightModel's
+     * INTERPOLATED pose: `state.position` is the latest completed 1/240 s
+     * substep, the group is where the aeroplane actually is on screen, and the
+     * two differ by up to one substep — about a metre at jet speeds.
+     *
+     * On chase, cockpit and orbit the mismatch is invisible, because the camera
+     * rides with the aircraft and both ends jitter together. On FLYBY it is
+     * fully exposed: that camera is a tripod planted in the world, so a jittery
+     * aim point shakes the whole frame while the aeroplane slides about inside
+     * it. That is why the ghosting survived in exactly one view after the
+     * render interpolation went in.
+     *
+     * The group is authoritative because it is what the renderer will use.
+     * `state.position` remains the fallback for a caller that passes no group
+     * transform of its own.
+     */
+    _acPos.setFromMatrixPosition(aircraftGroup.matrixWorld);
+    if (!Number.isFinite(_acPos.x) && state && state.position) _acPos.copy(state.position);
 
     if (state && state.velocity) _vel.copy(state.velocity);
     else _vel.set(0, 0, 0);
