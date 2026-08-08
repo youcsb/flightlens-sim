@@ -1059,14 +1059,27 @@ createFlightModel(opts?) -> {
 
 ```ts
 opts = {
+  airframe = C172,                       // src/physics/airframes/*.js
   startLat, startLon, startHeadingDeg,   // default KBFI 32L, ~330.13
   startAltitudeAglM = 0,                 // 0 = on the wheels
   startAirspeedMs = 0,
   groundHeightFn = () => 0,              // MUST be terrain.getHeightAt — §1.4
+  windEastMs = 0, windNorthMs = 0, crashEnabled = true,
+  // any airframe key may also be passed here and wins over the airframe file:
   gearHeightM = 1.2, massKg = 1100, wingAreaM2 = 16.2,
-  maxSpeedMs = 85, stallSpeedMs = 25, idleRpm = 700, maxRpm = 2700,
+  maxSpeedMs = 85, stallSpeedMs = 25, idleRpm = 700, maxRpm = 2700, ...
 }
 ```
+
+**Which aeroplane is data, not code.** `flightModel.js` owns the physics — the
+lift curve's shape, Euler's equations, the gear solver, the crash logic — and
+holds no opinion about what is flying. Every number that describes an airframe
+(mass, geometry, stability derivatives, control travel, flaps, propulsion, the
+gear contact table, the structural limits) lives in `src/physics/airframes/`,
+alongside the comment explaining why it is that value. The default is
+`airframes/c172.js`, which is also the worked example; a second aircraft is a
+sibling of that file and nothing else. `createFlightModel()` with no arguments
+is exactly the C172, and `npm run envelope` is what proves it.
 
 `state` — metric primaries for physics, display fields for the HUD:
 

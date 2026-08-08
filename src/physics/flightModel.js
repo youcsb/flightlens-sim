@@ -1,12 +1,25 @@
 /**
  * flightModel.js — the flight dynamics model. The single owner of aircraft state.
  *
- * A six-degree-of-freedom rigid-body model of a Cessna/Cub-class light single.
- * Forces and moments come from real aerodynamics — dynamic pressure, a lift
- * curve with a genuine stall break, induced + parasite drag, ISA air density,
- * a propeller power/thrust curve — and from four sprung landing-gear contact
- * points that carry weight, roll, brake and steer. Nothing here is a rate
- * table: the aircraft flies because the sum of forces says so.
+ * A six-degree-of-freedom rigid-body model of a fixed-wing aeroplane. Forces
+ * and moments come from real aerodynamics — dynamic pressure, a lift curve with
+ * a genuine stall break, induced + parasite drag, ISA air density, a
+ * power/thrust curve — and from sprung landing-gear contact points that carry
+ * weight, roll, brake and steer. Nothing here is a rate table: the aircraft
+ * flies because the sum of forces says so.
+ *
+ * WHICH AEROPLANE IS DATA, NOT CODE. Every number that describes an airframe —
+ * mass, geometry, stability derivatives, control travel, flaps, propulsion,
+ * the gear table, the structural limits — lives in src/physics/airframes/.
+ * This file owns the physics and the integration; it holds no opinion about
+ * what is flying. The default airframe is airframes/c172.js, which is also the
+ * worked example: a second aircraft is a sibling of that file and nothing else.
+ * See `airframe` in FlightModelOpts.
+ *
+ * What is left at module scope here is deliberately NOT per-airframe: the
+ * timestep, the numerical guards, the shape of the flat-plate post-stall
+ * regime, the terrain-sampling filters. If you find yourself wanting to vary
+ * one of them per aircraft, it belongs in the airframe file instead.
  *
  * Contract: see MODULES.md § 2.10
  *
@@ -116,8 +129,18 @@ import {
   airDensity,
 } from '../core/units.js';
 import { llToLocal, localToLl } from '../geo/coords.js';
+import { C172 } from './airframes/c172.js';
 
 /** @typedef {Object} FlightModelOpts
+ *  @property {Object} [airframe]         THE AEROPLANE. An airframes/*.js export.
+ *           Default C172. Merged group by group over the C172, so anything it
+ *           omits falls back — convenient for an experiment, a trap for a
+ *           finished aircraft. Any airframe key may ALSO be passed at the top
+ *           level of opts, where it wins over the airframe file; that is how
+ *           `createFlightModel({ massKg: 1200 })` has always worked and still
+ *           does. Nested groups (aero, controls, flaps, prop, gear, limits)
+ *           are merged key by key wherever they appear, so overriding one
+ *           derivative does not silently delete the other twenty.
  *  @property {number} [startLat]         Spawn latitude, degrees. Default KBFI 32L threshold.
  *  @property {number} [startLon]         Spawn longitude, degrees.
  *  @property {number} [startHeadingDeg]  Initial TRUE heading, 0..360. Default ~330.13.
@@ -126,24 +149,28 @@ import { llToLocal, localToLl } from '../geo/coords.js';
  *  @property {number} [startAirspeedMs]  Initial airspeed, m/s. Default 0 (parked).
  *  @property {(x:number, z:number) => number} [groundHeightFn] Terrain sampler used
  *           by reset(). MUST be the same function step() is fed. Default () => 0.
- *  @property {number} [gearHeightM]      Ground clearance of the datum, metres. Default 1.2.
- *  @property {number} [massKg]           All-up mass. Default 1100.
- *  @property {number} [wingAreaM2]       Reference wing area. Default 16.2.
- *  @property {number} [maxSpeedMs]       Advisory Vne, m/s. Default 85 (~165 kt).
- *  @property {number} [stallSpeedMs]     CLEAN 1-g stall speed. Sets CLmax. Default 25 (~48.6 kt).
- *  @property {number} [idleRpm]          Default 700.
- *  @property {number} [maxRpm]           Default 2700.
- *  --- additive, all optional, sensible C172-class defaults ---
- *  @property {number} [wingSpanM]        Default 11.0 -> aspect ratio 7.47.
- *  @property {number} [fuselageLengthM]  Default 8.28, used only for inertia scaling.
- *  @property {number} [maxPowerW]        Shaft power at sea level. Default 132000 (177 hp).
- *  @property {number} [propEfficiency]   Default 0.85.
- *  @property {number} [staticThrustN]    Sea-level full-power static thrust. Default 2650.
- *  @property {number} [cd0]              Zero-lift drag coefficient. Default 0.034.
- *  @property {number} [oswald]           Span efficiency. Default 0.80.
- *  @property {number} [inertiaRollKgM2]  Default 1285 * mass/1100.
- *  @property {number} [inertiaPitchKgM2] Default 1825 * mass/1100.
- *  @property {number} [inertiaYawKgM2]   Default 2667 * mass/1100.
+ *  --- airframe scalars, all optional; see airframes/c172.js for what each one
+ *      means and why it is the value it is. Listed here only because callers
+ *      have always been allowed to pass them one at a time. ---
+ *  @property {number} [gearHeightM]      Ground clearance of the datum, metres.
+ *  @property {number} [massKg]           All-up mass.
+ *  @property {number} [wingAreaM2]       Reference wing area.
+ *  @property {number} [maxSpeedMs]       Advisory Vne, m/s.
+ *  @property {number} [stallSpeedMs]     CLEAN 1-g stall speed. Sets CLmax.
+ *  @property {number} [idleRpm]
+ *  @property {number} [maxRpm]
+ *  @property {number} [wingSpanM]
+ *  @property {number} [wingHeightM]      Wing height above the datum, metres.
+ *  @property {number} [fuselageLengthM]  Used only for inertia scaling.
+ *  @property {number} [maxPowerW]        Shaft power at sea level.
+ *  @property {number} [propEfficiency]
+ *  @property {number} [staticThrustN]    Sea-level full-power static thrust.
+ *  @property {number} [cd0]              Zero-lift drag coefficient.
+ *  @property {number} [oswald]           Span efficiency.
+ *  @property {number} [inertiaRollKgM2]  0 = scale the C172's by mass and span^2.
+ *  @property {number} [inertiaPitchKgM2] 0 = scale the C172's by mass and length^2.
+ *  @property {number} [inertiaYawKgM2]   0 = scale the C172's by mass and length^2.
+ *  --- environment / harness ---
  *  @property {number} [windEastMs]       Steady wind, m/s toward east. Default 0.
  *  @property {number} [windNorthMs]      Steady wind, m/s toward north. Default 0.
  *  @property {boolean} [crashEnabled]    Terrain is SOLID and the airframe can be
@@ -151,6 +178,11 @@ import { llToLocal, localToLl } from '../geo/coords.js';
  *           measure something past the point where the aeroplane would break.
  */
 
+/**
+ * Everything that is NOT the aeroplane: where it starts, what the air is
+ * doing, and whether the harness wants it breakable. The airframe's own
+ * defaults come from airframes/c172.js and are merged in by resolveConfig().
+ */
 const DEFAULTS = {
   // KBFI runway 32L threshold, facing north-west up the runway. See
   // geo/airports.js SPAWN for why this spawn and not another.
@@ -165,28 +197,44 @@ const DEFAULTS = {
   startAltitudeAglM: 0,
   startAirspeedMs: 0,
   groundHeightFn: null,
-  gearHeightM: 1.2,
-  massKg: 1100,
-  wingAreaM2: 16.2,
-  maxSpeedMs: 85,
-  stallSpeedMs: 25,
-  idleRpm: 700,
-  maxRpm: 2700,
-
-  wingSpanM: 11.0,
-  fuselageLengthM: 8.28,
-  maxPowerW: 132000,
-  propEfficiency: 0.85,
-  staticThrustN: 2650,
-  cd0: 0.034,
-  oswald: 0.8,
-  inertiaRollKgM2: 0,
-  inertiaPitchKgM2: 0,
-  inertiaYawKgM2: 0,
   windEastMs: 0,
   windNorthMs: 0,
   crashEnabled: true,
 };
+
+/**
+ * The nested groups of an airframe description. Everything else in an airframe
+ * file is a plain scalar and merges by assignment.
+ *
+ * These are merged KEY BY KEY rather than replaced wholesale, so an airframe —
+ * or a one-off opts override — that names three derivatives keeps the other
+ * twenty instead of silently deleting them. Replacing a whole group is still
+ * possible where it is the sensible thing: `gear.contacts` is one value (an
+ * array), so stating it replaces the entire table, which is what you want.
+ */
+const AIRFRAME_GROUPS = ['aero', 'controls', 'flaps', 'prop', 'gear', 'limits'];
+
+/** Merge `over` onto `base`, one level deep through AIRFRAME_GROUPS. */
+function mergeAirframe(base, over) {
+  const out = { ...base, ...over };
+  for (const g of AIRFRAME_GROUPS) {
+    out[g] = { ...base[g], ...(over ? over[g] : null) };
+  }
+  return out;
+}
+
+/**
+ * DEFAULTS, then the chosen airframe, then whatever the caller said directly.
+ *
+ * Three layers because they answer three different questions: what does this
+ * module do on its own, what aeroplane is this, and what does this particular
+ * call want different. `createFlightModel()` with no arguments therefore
+ * produces exactly the C172 — that is the property the whole arrangement is
+ * for, and scripts/flight-envelope.mjs is what proves it.
+ */
+function resolveConfig(opts) {
+  return mergeAirframe(mergeAirframe({ ...DEFAULTS, ...C172 }, opts.airframe), opts);
+}
 
 // ---------------------------------------------------------------------------
 // Fixed integration
@@ -197,159 +245,18 @@ const FIXED_DT = 1 / 240;
 const MAX_SUBSTEPS = 32;
 
 // ---------------------------------------------------------------------------
-// Airframe aerodynamics — C172-class stability derivatives, per RADIAN.
-// Sourced from the standard Roskam/JSBSim Cessna 172 dataset and then trimmed
-// against the target envelope (see the ENVELOPE block at the bottom of this
-// file for the arithmetic these were checked against).
+// Post-stall aerodynamics — not per-airframe.
+//
+// Every stability derivative, every control travel, the flap numbers, the
+// propeller asymmetries, the gear table and the structural limits have moved
+// to airframes/*.js. What is left here is the behaviour of a wing that has
+// stopped being a wing: past full separation any planform is a slab held at an
+// angle to the wind, and these two numbers say what a slab does. They are the
+// same for a Cub and a widebody.
 // ---------------------------------------------------------------------------
-const CL0 = 0.25; // lift coefficient at zero geometric alpha (cambered wing + incidence)
-const ALPHA_SOFT = 3 * DEG_TO_RAD; // width of the rounded-over top of the lift curve
-const STALL_BREAK = 0.06; // rad; e-folding width of the post-stall collapse
 const CL_FLATPLATE = 1.05; // fully separated wing behaves like a flat plate
 const CD_SEPARATED = 1.6; // drag multiplier for a fully separated wing
-const CD_BETA = 0.55; // parasite drag per radian^2 of sideslip — slipping costs energy
-const NEG_STALL_SCALE = 0.88; // a cambered wing stalls sooner inverted
 
-const CL_Q = 3.9; // lift from pitch rate
-const CL_DE = 0.43; // lift from elevator
-
-const CM0 = 0.05; // sets the hands-off trim speed (~91 kt at gross)
-const CM_ALPHA = -1.1; // longitudinal static stability
-const CM_Q = -12.4; // pitch damping
-const CM_DE = -1.28; // elevator power
-const CM_FLAP = -0.12; // flaps pitch the nose down
-const CM_STALL = -0.28; // centre of pressure marches aft when the wing lets go
-
-const CY_BETA = -0.31;
-const CY_DR = 0.187;
-
-const CROLL_BETA = -0.089; // dihedral effect: sideslip rolls you out of it
-const CROLL_P = -0.47; // roll damping
-const CROLL_R = 0.096; // yaw rate rolls the aircraft (roll-yaw coupling)
-const CROLL_DA = 0.229; // aileron power
-const CROLL_DR = -0.0147; // right rudder rolls right (direct term)
-const CROLL_STALL = 0.02; // asymmetric separation -> wing drop
-
-const CN_BETA = 0.065; // weathercock stability
-const CN_P = -0.03; // roll rate yaws adversely
-const CN_R = -0.099; // yaw damping
-const CN_DA = -0.014; // ADVERSE YAW — right aileron yaws left
-const CN_DR = -0.072; // rudder power
-
-/** Maximum control-surface travel, radians. */
-const DE_MAX = 0.42; // elevator, 24 deg
-const DA_MAX = 0.35; // aileron, 20 deg
-const DR_MAX = 0.4; // rudder, 23 deg
-
-/** Control surfaces have mass; the stick is not the surface. rad/s at full travel. */
-const SURFACE_RATE = 4.0;
-
-/**
- * ELEVATOR TRIM.
- *
- * Without a trim axis this aeroplane is permanently rigged for one speed. CM0 =
- * 0.05 puts that at about 91 kt hands-off, so anywhere else the stick has to be
- * held — which is why level flight drifts, and why the autopilot needed an
- * integrator "standing in for the trim the airframe does not have". This is
- * that trim.
- *
- * MODELLED AS A BIAS ON THE ELEVATOR, which is what a trim tab physically does:
- * it moves the deflection the surface sits at with no stick force, so the
- * aeroplane holds a different speed hands-off.
- *
- * AUTHORITY is 35% of full elevator travel, not 100%. A real trim tab cannot
- * fly the aeroplane on its own, and full-travel trim would let a player hold
- * the stick against a trim that can out-pull them — which is a way to make a
- * simulator feel broken. 35% covers roughly 55 kt to 130 kt hands-off, the
- * whole speed range this aircraft actually flies.
- *
- * RATE is deliberately slow. A trim wheel is a wheel: 8 seconds end to end
- * means a tap is a fine adjustment rather than a lurch, which is the entire
- * point of trimming instead of just holding the stick.
- */
-const TRIM_AUTHORITY = 0.35;
-const TRIM_RATE = 1 / 8;
-
-/** Flap system. */
-const FLAP_TRAVEL_RATE = 0.2; // full travel in 5 s
-const FLAP_DCL0 = 0.72; // lift-curve shift at full flap
-const FLAP_DCLMAX = 0.62; // CLmax increase at full flap
-const FLAP_DCD = 0.065; // parasite drag at full flap
-const VFE_MS = 43.7; // 85 kt: flaps blow back above this
-
-/**
- * Propeller / engine.
- *
- * Thrust is  T(V) = P * eta / (V^3 + knee^3)^(1/3),  with `knee` solved so that
- * T(0) is the configured static thrust. The cube, not a square root, and not
- * the naive P/V: P/V is singular at rest, and a sqrt blend sags so hard through
- * 40 m/s that the climb rate came out at 407 fpm against a book 730 — measured.
- * The cube holds thrust near-flat through the takeoff roll (which is what a
- * real fixed-pitch prop does) and still rolls it off by cruise. cd0 is then
- * what sets the top end: 0.034 rather than the 0.029 a clean C172 shows, which
- * lands Vmax at a measured 126.6 kt. This airframe is drag-limited on top end
- * and thrust-rich down low, exactly like the real one.
- */
-const THRUST_KNEE_MS = 37.5; // legacy reference; the real knee is derived below
-const WINDMILL_RPM_PER_MS = 22; // a stopped throttle still turns the prop
-const WINDMILL_CD0 = 0.006; // a windmilling prop is a disc of drag
-const SLIPSTREAM_ARM_M = 0.26; // propwash over the fin -> left yaw under power
-const TORQUE_ARM_M = 0.12; // engine torque -> left roll under power
-
-/** Ground effect: induced drag falls within a wingspan of the surface. */
-const GROUND_EFFECT_K = 16; // McCormick's (16 h/b)^2 / (1 + (16 h/b)^2)
-
-/**
- * Landing gear. Body-frame offsets in metres with `y` measured UP from the
- * wheel plane (so the actual body offset is y - gearHeightM), +X right,
- * -Z forward.
- *
- * Four points, not one: a single contact point cannot know the difference
- * between sitting on the mains and sitting on the nosewheel, which is exactly
- * the difference between a takeoff roll that needs speed and one that does not.
- * The mains sit 0.30 m AFT of the CG and the nosewheel 1.10 m forward, so the
- * static nose load is W * 0.3/1.4 and the elevator has to beat it before the
- * nose will come up. It cannot do that below about 33 kt.
- */
-const CONTACTS = [
-  {
-    name: 'nose',
-    x: 0, y: 0, z: -1.1,
-    k: 26000, c: 3000,
-    steer: true, brake: false,
-    muRoll: 0.025, muSide: 0.75,
-    vRefLong: 0.35, vRefSide: 0.25,
-  },
-  {
-    name: 'left',
-    x: -1.3, y: 0.02, z: 0.3,
-    k: 42000, c: 4700,
-    steer: false, brake: true,
-    muRoll: 0.022, muSide: 0.95,
-    vRefLong: 0.3, vRefSide: 0.25,
-  },
-  {
-    name: 'right',
-    x: 1.3, y: 0.02, z: 0.3,
-    k: 42000, c: 4700,
-    steer: false, brake: true,
-    muRoll: 0.022, muSide: 0.95,
-    vRefLong: 0.3, vRefSide: 0.25,
-  },
-  {
-    // Tail tie-down. Not a wheel — it is the over-rotation limit. Contacts at
-    // roughly 12 deg nose-up, which is what stops "full aft stick at walking
-    // pace" from levitating the aeroplane.
-    name: 'tail',
-    x: 0, y: 0.6, z: 3.0,
-    k: 45000, c: 5000,
-    steer: false, brake: false,
-    muRoll: 0.55, muSide: 0.55,
-    vRefLong: 0.4, vRefSide: 0.4,
-  },
-];
-
-const MU_BRAKE = 0.55;
 /**
  * Rebound damping, as a fraction of compression damping. A one-sided damper
  * (compression only) pogos: nothing bleeds the energy the spring gives back.
@@ -364,83 +271,31 @@ const REBOUND_DAMP = 0.7;
  * so that the surface the terrain module draws is the surface the aeroplane
  * cannot pass through.
  *
- * The three numbers that decide whether a contact is a landing or a crash:
+ * The three numbers that decide whether a contact is a landing or a crash. Two
+ * of them describe the aeroplane and live in its airframe file; only the third
+ * is a property of the world and lives here:
  *
- *   GEAR_STROKE_M      how far a leg can travel before it bottoms out. Measured
- *                      against the model's own hard-landing test: a 700 fpm
- *                      arrival — already 4.8 g and the worst case the envelope
- *                      script calls survivable — peaks at 25 cm on a main. 40 cm
- *                      leaves margin over that and is still far less than the
- *                      1.2 m of datum clearance, so "bottomed" always means the
- *                      leg is fully compressed and never means "firm".
+ *   gear.strokeM       (airframe) how far a leg travels before it bottoms out.
+ *
+ *   gear.crashLoadG    (airframe, in `limits`) ultimate load factor, with the
+ *                      timed/instant split explained where the numbers are.
  *
  *   CRASH_CLOSING_MS   closing speed ALONG THE LOCAL SURFACE NORMAL at the
  *                      moment the leg bottoms. 5 m/s is 984 fpm straight down —
- *                      well past the 600 fpm (10 fps) ultimate design sink of a
- *                      light single's gear, and the reason it is measured along
- *                      the NORMAL rather than along world-down is that this is
- *                      what makes a cliff face solid: fly level at 60 m/s into
- *                      ground whose normal is horizontal and the closing speed
- *                      is 60 m/s, not 0.
- *
- *   CRASH_LOAD_G       airframe ultimate load factor. A C172 is +3.8 g limit,
- *                      x1.5 = 5.7 g ultimate. 6 g, magnitude, either sign.
+ *                      well past the 600 fpm (10 fps) ultimate design sink that
+ *                      both FAR 23 and FAR 25 gear are certified to, which is
+ *                      why this one number is NOT per-airframe: a Cub and a
+ *                      737 are held to the same 10 fps. The reason it is
+ *                      measured along the NORMAL rather than along world-down
+ *                      is that this is what makes a cliff face solid: fly level
+ *                      at 60 m/s into ground whose normal is horizontal and the
+ *                      closing speed is 60 m/s, not 0.
  *
  * The normal is real, not assumed: sampleGroundNormal() probes the SAME height
  * field the wheels roll on, four samples in a cross, once per frame.
  */
-const GEAR_STROKE_M = 0.4;
 const CRASH_CLOSING_MS = 5.0;
 
-/**
- * Airframe limits.
- *
- * WHY THERE ARE TWO, AND WHY ONE OF THEM IS TIMED.
- *
- * `state.loadFactor` is an INSTANTANEOUS specific-force reading taken once per
- * 1/240 s substep. Testing it directly against a single threshold writes the
- * aeroplane off for a 4-millisecond numerical transient — and this simulation
- * manufactures those routinely: a gear leg releasing its spring, a DEM tile
- * paging in, an LOD refinement moving the ground under the wheels. Players hit
- * "airframe overload — -6.0 g" repeatedly in ordinary flight, which is the
- * threshold value itself showing through, not an aerodynamic event.
- *
- * The gear test immediately below already guards against exactly this class of
- * artefact — its comment explains that an LOD refinement raising the ground
- * under a PARKED aeroplane must not be a crash. The airframe test needed the
- * same treatment and did not have it.
- *
- * A real airframe fails from load SUSTAINED over a meaningful interval, so:
- *
- *   SUSTAINED  — beyond CRASH_LOAD_G continuously for CRASH_LOAD_SUSTAIN_S.
- *                This is overstress: a hard pull held long enough to matter.
- *   INSTANT    — beyond CRASH_LOAD_INSTANT_G in a single sample. The impact
- *                path: hitting a cliff produces loads far past the manoeuvring
- *                limit and waiting to admit it would be absurd.
- *
- * THE 60 ms WINDOW IS MEASURED, NOT PICKED. Arrival sink rates, run through the
- * envelope harness's own landing setup:
- *
- *     700 fpm   peak 4.77 g   held   0 ms   must survive — it is a hard landing
- *   1,200 fpm   peak 7.33 g   held  54 ms
- *   1,400 fpm   peak 8.38 g   held  71 ms   must crash
- *   1,800 fpm   peak 10.1 g   held 104 ms   must crash
- *
- * 60 ms sits in the gap: a 700 fpm arrival never reaches the limit at all, and
- * a 1,400 fpm arrival holds it comfortably past the window. 60 ms is also 14
- * substeps at 1/240 s, an order of magnitude longer than the one- and two-sample
- * spikes that were causing the spurious crashes.
- */
-const CRASH_LOAD_G = 6.0;
-const CRASH_LOAD_SUSTAIN_S = 0.06;
-const CRASH_LOAD_INSTANT_G = 12.0;
-/**
- * Structural failure speed, as a multiple of Vne (indicated). 1.3 x 165 kt =
- * 214 kt IAS. Below it the airframe merely complains (`state.overspeed`);
- * at it the wing comes off. Chosen so the model's own display-field check,
- * which deliberately parks the aeroplane at 180 KIAS, still runs.
- */
-const OVERSPEED_BREAK = 1.3;
 /**
  * Half-width of the cross used to estimate the surface normal, metres. Wider
  * than a gear track (2.6 m) would smooth a runway edge into a ramp; narrower
@@ -492,65 +347,108 @@ const MAX_DAMP_PER_W = 2;
 /** Per-contact normal-force ceiling, in units of aircraft weight. Stops a bad
  *  terrain sample from firing the aeroplane into orbit. */
 const MAX_N_PER_W = 8;
-/**
- * Nosewheel steering. 10 deg is the real pedal-linked travel on a C172 (tighter
- * turns come from differential braking, which this model does not have), and it
- * is not a comfort choice: the tyre model is geometrically honest, so a 1.7 m
- * wheelbase at 30 deg of nosewheel gives a 2.9 m turn radius and the aeroplane
- * pirouettes. Measured with 30 deg: a mere 0.15 of pedal held through the
- * takeoff roll swung the heading 250 deg. Real pilots use about a degree; a
- * keyboard gives you all of it or none.
- *
- * ---------------------------------------------------------------------------
- * WHY THE FADE IS 1/V^1.5 AND NOT LINEAR
- * ---------------------------------------------------------------------------
- * Reducing STEER_MAX to 10 deg was necessary but not sufficient, because the
- * problem is the SHAPE of the fade, not its endpoint. A steering angle delta
- * held at ground speed V yields a yaw rate of roughly V*tan(delta)/wheelbase —
- * so a fade that decays SLOWER than 1/V hands the pilot MORE yaw authority the
- * faster they go, which is precisely backwards and is what made the takeoff
- * roll uncontrollable.
- *
- * Measured on the old linear fade (gain = 1 - (V-3)/25, floor 0.15):
- *
- *   no rudder at all        KBFI 32L, heading 330 -> 305 by 39 kt, off the
- *                           runway every time (slipstream, ~2.5 deg/s left)
- *   full right rudder held  heading 330 -> 149 in six seconds, still only
- *                           26 kt: a pirouette on the nosewheel
- *
- * There was no keyboard input in between that held the centreline, because at
- * 20 m/s the old curve still gave 0.32 of 10 deg = 3.3 deg of nosewheel, i.e.
- * a 29 m turn radius at 40 kt.
- *
- * A 1/V law gives constant yaw-rate authority at every speed; V_REF/V raised to
- * 1.5 lets it fall off a little faster still, which leaves full deflection for
- * taxiing and almost none for the roll. Resulting full-pedal authority:
- *
- *   3 m/s  (taxi)   10 deg    ~30 deg/s   tight enough to turn onto a runway
- *   10 m/s (20 kt)  1.6 deg   ~10 deg/s
- *   20 m/s (39 kt)  0.6 deg   ~7 deg/s    against 2.5 deg/s of slipstream
- *
- * That ratio — roughly 3x the disturbance — is what makes the centreline
- * holdable with partial pedal instead of being a choice between two failures.
- * The AERODYNAMIC rudder is untouched by any of this; it is a separate moment
- * (cN) and keeps full authority for slips and crosswind landings.
- */
-const STEER_MAX = 0.18; // 10 deg
-/** Ground speed below which full pedal means full nosewheel, m/s. */
-const STEER_REF_MS = 3;
-/** Exponent on the V_REF/V fade. 1.0 = constant yaw-rate authority. */
-const STEER_FADE_EXP = 1.5;
-/** Never quite zero, so there is still a nudge available at speed. */
-const STEER_FLOOR = 0.02;
 
 /**
  * @param {FlightModelOpts} [opts]
  * @returns {{ state: Object, config: Object, step: (dt: number, inputs: Object, groundHeight: number) => Object, reset: (lat?: number, lon?: number, headingDeg?: number) => void }}
  */
 export function createFlightModel(opts = {}) {
-  const cfg = { ...DEFAULTS, ...opts };
+  const cfg = resolveConfig(opts);
   const hasGroundFn = typeof cfg.groundHeightFn === 'function';
   const groundHeightFn = hasGroundFn ? cfg.groundHeightFn : () => 0;
+
+  // -------------------------------------------------------------------------
+  // THE AIRFRAME, unpacked.
+  //
+  // Every name below used to be a module-scope `const` with a literal beside
+  // it; each one is now whatever the chosen airframe says. They are bound ONCE,
+  // here, for two reasons: the physics below reads plain identifiers instead of
+  // chasing `cfg.aero.cmAlpha` through a property lookup 240 times a second,
+  // and the code that uses them is untouched by the move, which is what makes
+  // "same numbers in, same aeroplane out" checkable rather than hopeful.
+  //
+  // The comments explaining WHY each number is what it is now live beside the
+  // numbers, in airframes/c172.js. Go there before changing one.
+  // -------------------------------------------------------------------------
+  const AERO = cfg.aero;
+  const CTRL = cfg.controls;
+  const FLAP = cfg.flaps;
+  const PROP = cfg.prop;
+  const GEAR = cfg.gear;
+  const LIMITS = cfg.limits;
+
+  // Lift curve and its post-stall shape.
+  const CL0 = AERO.cl0;
+  const ALPHA_SOFT = AERO.alphaSoftRad;
+  const STALL_BREAK = AERO.stallBreakRad;
+  const NEG_STALL_SCALE = AERO.negStallScale;
+  const CD_BETA = AERO.cdBeta;
+
+  const CL_Q = AERO.clQ;
+  const CL_DE = AERO.clDe;
+
+  const CM0 = AERO.cm0;
+  const CM_ALPHA = AERO.cmAlpha;
+  const CM_Q = AERO.cmQ;
+  const CM_DE = AERO.cmDe;
+  const CM_FLAP = AERO.cmFlap;
+  const CM_STALL = AERO.cmStall;
+
+  const CY_BETA = AERO.cyBeta;
+  const CY_DR = AERO.cyDr;
+
+  const CROLL_BETA = AERO.crollBeta;
+  const CROLL_P = AERO.crollP;
+  const CROLL_R = AERO.crollR;
+  const CROLL_DA = AERO.crollDa;
+  const CROLL_DR = AERO.crollDr;
+  const CROLL_STALL = AERO.crollStall;
+
+  const CN_BETA = AERO.cnBeta;
+  const CN_P = AERO.cnP;
+  const CN_R = AERO.cnR;
+  const CN_DA = AERO.cnDa;
+  const CN_DR = AERO.cnDr;
+
+  const GROUND_EFFECT_K = AERO.groundEffectK;
+
+  // Control surfaces and trim.
+  const DE_MAX = CTRL.deMaxRad;
+  const DA_MAX = CTRL.daMaxRad;
+  const DR_MAX = CTRL.drMaxRad;
+  const SURFACE_RATE = CTRL.surfaceRate;
+  const TRIM_AUTHORITY = CTRL.trimAuthority;
+  const TRIM_RATE = CTRL.trimRate;
+
+  // Flaps.
+  const FLAP_TRAVEL_RATE = FLAP.travelRate;
+  const FLAP_DCL0 = FLAP.dCl0;
+  const FLAP_DCLMAX = FLAP.dClMax;
+  const FLAP_DCD = FLAP.dCd;
+  const VFE_MS = FLAP.vfeMs;
+
+  // Propulsion response and single-engine asymmetry.
+  const SPOOL_RATE = PROP.spoolRate;
+  const WINDMILL_RPM_PER_MS = PROP.windmillRpmPerMs;
+  const WINDMILL_CD0 = PROP.windmillCd0;
+  const SLIPSTREAM_ARM_M = PROP.slipstreamArmM;
+  const TORQUE_ARM_M = PROP.torqueArmM;
+  const PROP_EFFECT_FADE_MS = PROP.effectFadeMs;
+
+  // Gear and ground handling.
+  const CONTACTS = GEAR.contacts;
+  const GEAR_STROKE_M = GEAR.strokeM;
+  const MU_BRAKE = GEAR.muBrake;
+  const STEER_MAX = GEAR.steerMaxRad;
+  const STEER_REF_MS = GEAR.steerRefMs;
+  const STEER_FADE_EXP = GEAR.steerFadeExp;
+  const STEER_FLOOR = GEAR.steerFloor;
+
+  // Structural limits.
+  const CRASH_LOAD_G = LIMITS.crashLoadG;
+  const CRASH_LOAD_SUSTAIN_S = LIMITS.crashLoadSustainS;
+  const CRASH_LOAD_INSTANT_G = LIMITS.crashLoadInstantG;
+  const OVERSPEED_BREAK = LIMITS.overspeedBreak;
 
   // -------------------------------------------------------------------------
   // Derived airframe constants — computed once, never per frame.
@@ -567,9 +465,11 @@ export function createFlightModel(opts = {}) {
 
   /**
    * CLmax is DERIVED from the configured clean stall speed, so `stallSpeedMs`
-   * is a real knob rather than decoration. 25 m/s at gross gives CLmax 1.74,
-   * i.e. Vs1 = 48.6 kt — the C172's book number. Full flap adds FLAP_DCLMAX,
-   * which brings Vs0 to about 41.7 kt: "stall ~40 kt", honestly arrived at.
+   * is a real knob rather than decoration — and, more to the point, so an
+   * airframe file states a number you can look up in a POH instead of a
+   * coefficient you cannot. On the C172, 25 m/s at gross gives CLmax 1.74,
+   * i.e. Vs1 = 48.6 kt, the book number. Full flap adds FLAP_DCLMAX, which
+   * brings Vs0 to about 41.7 kt: "stall ~40 kt", honestly arrived at.
    */
   const CL_MAX = clamp(
     WEIGHT /
@@ -607,20 +507,30 @@ export function createFlightModel(opts = {}) {
    * This is display-only. Every force in this file still acts on the datum.
    */
   const ALT_DATUM_M = GEAR_H;
-  /**
-   * Height of the wing above the datum, metres. Ground effect is a function of
-   * how far the WING is from the surface, not how far the CG is: measuring at
-   * the datum puts the wing a metre lower than it is and overstates the
-   * induced-drag reduction on the roll-out by roughly a factor of three.
-   */
-  const WING_HEIGHT_M = 0.96;
+  /** Height of the wing above the datum — see `wingHeightM` in the airframe. */
+  const WING_HEIGHT_M = cfg.wingHeightM;
   const MAX_N = MAX_N_PER_W * WEIGHT;
   const maxDamp = MAX_DAMP_PER_W * WEIGHT;
-  /** Static spring deflection, so reset() can park the aircraft already
-   *  settled instead of dropping it 10 cm onto the runway. */
+  /**
+   * Static spring deflection, so reset() can park the aircraft already settled
+   * instead of dropping it 10 cm onto the runway.
+   *
+   * Only the legs the aeroplane STANDS on share the weight, which is why the
+   * contact table flags them: a tail tie-down or a wingtip bumper is in the
+   * table as a limit stop, is not touching the ground when parked, and must
+   * not be counted here or the squat comes out too small.
+   */
   let kTotal = 0;
-  for (let i = 0; i < 3; i++) kTotal += CONTACTS[i].k;
-  const STATIC_SQUAT = WEIGHT / kTotal;
+  for (let i = 0; i < CONTACTS.length; i++) {
+    if (CONTACTS[i].bearing) kTotal += CONTACTS[i].k;
+  }
+  // An airframe that flagged nothing gets every leg rather than a divide by
+  // zero: too small a squat is a cosmetic first frame, an infinite one puts
+  // the aeroplane at minus infinity.
+  if (kTotal <= 0) {
+    for (let i = 0; i < CONTACTS.length; i++) kTotal += CONTACTS[i].k;
+  }
+  const STATIC_SQUAT = WEIGHT / Math.max(1, kTotal);
 
   /**
    * Aircraft state. Mutated in place every step — hold the reference, don't
@@ -753,6 +663,8 @@ export function createFlightModel(opts = {}) {
 
   /** Read-only derived numbers — useful for a HUD or a test, never written to. */
   const config = Object.freeze({
+    /** Which aeroplane this is, from the airframe file. */
+    name: cfg.name,
     massKg: MASS,
     weightN: WEIGHT,
     wingAreaM2: S_WING,
@@ -1168,7 +1080,7 @@ export function createFlightModel(opts = {}) {
     // One lagged engine state drives BOTH the rpm gauge and the thrust, so
     // what you hear and what you feel are the same number. Naturally aspirated
     // power lapse with density: P/P0 = (sigma - 0.117) / 0.883.
-    engineSpool = damp(engineSpool, inThrottle, 2.5, h);
+    engineSpool = damp(engineSpool, inThrottle, SPOOL_RATE, h);
     const powerLapse = clamp((sigma - 0.117) / 0.883, 0, 1);
     const shaftW = P_MAX * powerLapse * (0.03 + 0.97 * engineSpool);
     const thrust = (shaftW * ETA) / Math.cbrt(V * V * V + THRUST_KNEE3);
@@ -1270,14 +1182,10 @@ export function createFlightModel(opts = {}) {
     const qSb = qS * SPAN;
     const qSc = qS * CHORD;
     // Torque and slipstream are LOW-SPEED, HIGH-POWER effects here, faded out
-    // by 45 m/s. Not a simplification for its own sake: a real aeroplane's
-    // wing rigging and aileron/rudder trim tabs are set to cancel these at
-    // cruise, and this model has no trim axis to cancel them with. Applied
-    // flat, a constant 170 N.m of torque roll walks the aircraft into a
-    // 45-degree left bank over two minutes of hands-off cruise — measured,
-    // not hypothetical. Faded, you get what you should: right rudder on the
-    // takeoff roll and in the climb, hands off at cruise.
-    const propEffect = clamp(1 - V / 45, 0, 1);
+    // by prop.effectFadeMs — see the airframe file for why they are faded at
+    // all, and set both arms to zero for anything that is not a single with a
+    // propeller on the front.
+    const propEffect = clamp(1 - V / PROP_EFFECT_FADE_MS, 0, 1);
     let momL = qSb * cRoll - TORQUE_ARM_M * thrust * propEffect;
     let momM = qSc * cM;
     // Propwash spirals onto the fin: left yaw. This is why a real single
@@ -1832,42 +1740,14 @@ export function createFlightModel(opts = {}) {
 /* ---------------------------------------------------------------------------
  * ENVELOPE
  *
- * DERIVED — the arithmetic the constants were chosen against, at gross weight
- * (1100 kg / 10,787 N), sea level, ISA. Re-derive before changing a constant.
+ * An envelope belongs to an AEROPLANE, not to an integrator, so the derived
+ * arithmetic and the measured flight-test numbers now sit at the bottom of the
+ * airframe file they describe — see the ENVELOPE block in
+ * src/physics/airframes/c172.js for the C172's, which is what this module
+ * produces when called with no arguments.
  *
- *   CL_ALPHA      4.96 /rad     Helmbold, AR 7.47
- *   CL_MAX        1.74          from stallSpeedMs = 25 m/s
- *   alpha_crit    ~18.7 deg clean (geometric), ~1.1 deg lower at full flap
- *   Vs1 (clean)   25.0 m/s = 48.6 kt
- *   Vs0 (flap)    21.5 m/s = 41.7 kt
- *   Vfe           43.7 m/s = 85 kt (flaps blow back above this)
- *   Vne           85 m/s   = 165 kt (advisory; nothing enforces it)
- *   trim speed    ~47 m/s  = ~91 kt hands off, from CM0 = 0.05
- *
- * MEASURED — none of the above proves the aeroplane flies. These come from
- * `node scripts/flight-envelope.mjs`, which takes off, climbs, cruises, stalls
- * and lands the model and prints what happened. Re-run it after any change
- * here; do not update these numbers by hand.
- *
- *   ground roll        228 m (748 ft), rotates at 55 kt, flies at 57.5 kt
- *   Vy                 80 kt -> 743 fpm  (curve is flat: 75 kt gives 738)
- *   climb at 100 kt    605 fpm           (at 60 kt, 623 fpm)
- *   cruise 75% power   109.6 kt level at 2,000 ft
- *   Vmax level         126.6 kt, full throttle
- *   stall, clean       47.4 KIAS at 18.7 deg alpha, power off, wings level
- *   stall, full flap   41.5 KIAS
- *   accelerated stall  89.0 KIAS at 3.06 g in a 55 deg bank — the break
- *                      follows ANGLE OF ATTACK, not speed
- *   height lost        ~157 ft, break to recovered, unloading promptly
- *   glide ratio        9.0 : 1 power off
- *   hands-off trim     101.9 kt at 65% power, phugoid stays inside 88-112 kt
- *   touchdown loads    1.97 g at 200 fpm, 2.95 g at 400, 4.77 g at 700
- *   frame independence 1.0 m of divergence over 30 s between 20 Hz and 200 Hz
- *
- *   power lapse        59% of rated at Mount Rainier's summit (4,392 m,
- *                      sigma 0.641), and measured climb falls 764 fpm at 300 m
- *                      to 297 fpm at 3,600 m. The service ceiling lands just
- *                      under the summit, which is where a real 172's does. You
- *                      can go and look at the mountain; you cannot fly over the
- *                      top of it. That is the point.
+ * The way to prove any airframe is `node scripts/flight-envelope.mjs`, which
+ * takes off, climbs, cruises, stalls and lands the model and prints what
+ * happened. Re-run it after any change to this file — a change here changes
+ * every aeroplane at once, which is precisely why the numbers do not live here.
  * ------------------------------------------------------------------------- */
