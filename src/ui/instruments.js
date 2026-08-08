@@ -157,20 +157,33 @@ const cx = (i) => PAD_X + R_BEZEL + i * PITCH;
 // small gap at the bottom left. That is what puts the green arc up through the
 // top of the dial where a pilot expects it, and it parks the needle at 7
 // o'clock at rest instead of straight up.
-const ASI_MIN = 40;
-const ASI_MAX = 200;
-const ASI_START = 210; // degrees clockwise from straight up, at ASI_MIN
-const ASI_SWEEP = 330; // degrees from ASI_MIN to ASI_MAX
+const ASI_START = 210; // degrees clockwise from straight up, at the low end
+const ASI_SWEEP = 330; // degrees from the low end to the high end
+
+/**
+ * AIRSPEED SCALES, per aircraft. Like the engine gauge, this is not one
+ * instrument with a different needle position — it is a different instrument.
+ *
+ * A Cessna's ASI runs 40-200 kt. A 737 cruises at 250-340 KIAS, which is off
+ * the end of that face entirely: the needle sweeps past 200, past the 6
+ * o'clock gap, and comes to rest back near the bottom-left where the scale
+ * starts. It reads ZERO at 256 kt. That is not a needle pegged at the stop, it
+ * is a needle that has gone all the way round, and it is exactly what a real
+ * instrument would do if you flew it past its design range.
+ *
+ * The V-speed arcs are part of the scale, not decoration — the green arc IS
+ * the normal operating range and it means nothing if it is another aeroplane's.
+ */
+const ASI_SCALES = {
+  c172: { min: 40, max: 200, step: 5, mid: 10, num: 20, vS0: 40, vS1: 48, vFe: 85, vNo: 129, vNe: 163 },
+  // 737-800 at 70 t: Vs0 112 (flap 40), Vs1 143 clean, Vfe 200 (the flaps-15
+  // placard this model's single flap axis is set to), Vmo 340.
+  b738: { min: 60, max: 400, step: 10, mid: 20, num: 40, vS0: 112, vS1: 143, vFe: 200, vNo: 285, vNe: 340 },
+};
+let asiCfg = ASI_SCALES.c172;
 const asiAngle = (kt) =>
   ASI_START +
-  ((clamp(kt, ASI_MIN, ASI_MAX) - ASI_MIN) / (ASI_MAX - ASI_MIN)) * ASI_SWEEP;
-
-// Cessna 172S V-speeds, KIAS. See the header note.
-const V_S0 = 40;
-const V_S1 = 48;
-const V_FE = 85;
-const V_NO = 129;
-const V_NE = 163;
+  ((clamp(kt, asiCfg.min, asiCfg.max) - asiCfg.min) / (asiCfg.max - asiCfg.min)) * ASI_SWEEP;
 
 // --- attitude --------------------------------------------------------------
 /** SVG units of vertical travel per degree of pitch. +-30 deg fits the face. */
@@ -182,13 +195,41 @@ const VSI_HALF_SWEEP = 165;
 const vsiAngle = (fpm) =>
   -90 + (clamp(fpm, -VSI_MAX, VSI_MAX) / VSI_MAX) * VSI_HALF_SWEEP;
 
-// --- tachometer ------------------------------------------------------------
-const TACH_MAX = 3000;
+// --- engine gauge ----------------------------------------------------------
+/**
+ * The sixth dial is a TACHOMETER on a piston and an N1 GAUGE on a turbofan,
+ * and it is not the same instrument with a different needle position.
+ *
+ * A real 737 has no tachometer at all — its engine instruments read N1 as a
+ * PERCENTAGE of fan redline, and the standby instruments a jet carries for
+ * exactly this model's six-pack are an ASI, an attitude indicator and an
+ * altimeter, never an rpm gauge. Leaving a 0-3,000 RPM face on a jet and
+ * feeding it N1 would put 88% N1 at the bottom of the scale and read like a
+ * dead engine; leaving it fed from `state.rpm` — which a turbofan publishes as
+ * zero, deliberately — reads like a dead engine too, and the needle simply
+ * never moves.
+ *
+ * So the face is rebuilt. setEngineGauge() swaps these and redraws.
+ */
+const ENGINE_GAUGES = {
+  rpm: {
+    max: 3000, greenLo: 2100, redline: 2700,
+    tickStep: 100, labelStep: 500, labelDiv: 100,
+    label: 'RPM', sub: 'HUNDREDS', unit: '',
+  },
+  n1: {
+    // A CFM56-7B redlines at 104% N1 and idles near 21%. The green band starts
+    // at 85 because below that a big fan is producing very little thrust —
+    // which is the whole reason jets are flown on N1 rather than lever angle.
+    max: 110, greenLo: 85, redline: 104,
+    tickStep: 5, labelStep: 20, labelDiv: 1,
+    label: 'N1', sub: 'PERCENT', unit: '%',
+  },
+};
+let tachCfg = ENGINE_GAUGES.rpm;
 const TACH_SWEEP = 270; // from -135 (7:30) to +135 (4:30)
-const tachAngle = (rpm) =>
-  -TACH_SWEEP / 2 + (clamp(rpm, 0, TACH_MAX) / TACH_MAX) * TACH_SWEEP;
-const TACH_GREEN_LO = 2100;
-const TACH_REDLINE = 2700;
+const tachAngle = (v) =>
+  -TACH_SWEEP / 2 + (clamp(v, 0, tachCfg.max) / tachCfg.max) * TACH_SWEEP;
 
 // --- turn coordinator ------------------------------------------------------
 /** Degrees per second that counts as a standard-rate turn. */
@@ -200,8 +241,21 @@ const TUBE_R = 218;
 const TUBE_CY = -150;
 const TUBE_HALF_SPAN = 9.5;
 
-// --- flap detents, degrees (C172) -----------------------------------------
-const FLAP_DETENTS = [0, 10, 20, 30];
+// --- flap detents, degrees, per aircraft ----------------------------------
+/**
+ * The gauge shows the aeroplane's OWN gate positions. A 737 flap selector has
+ * seven, not four, and reading 30 degrees when the lever is at 40 is a wrong
+ * number that looks like a right one.
+ *
+ * The flight model still has a single continuous 0..1 flap axis for both types
+ * — detents are not implemented in the physics — so this maps that axis onto
+ * the real gate labels rather than pretending the gates exist.
+ */
+const FLAP_SETS = {
+  c172: [0, 10, 20, 30],
+  b738: [0, 1, 5, 15, 25, 30, 40],
+};
+let FLAP_DETENTS = FLAP_SETS.c172;
 
 // ---------------------------------------------------------------------------
 // COMPACT HUD geometry. SVG user units; each compact widget is its OWN svg
@@ -484,22 +538,23 @@ function airspeedFace(u) {
 
   // Coloured arcs. The white flap-operating arc sits inboard of the green and
   // yellow, exactly as it does on the real instrument.
-  s += arc(85, asiAngle(V_S1), asiAngle(V_NO), GREEN, 8);
-  s += arc(85, asiAngle(V_NO), asiAngle(V_NE), AMBER, 8);
-  s += arc(74, asiAngle(V_S0), asiAngle(V_FE), '#f0f4f8', 5);
-  // Vne red line, standing proud of the arcs.
-  s += tick(78, 92, asiAngle(V_NE), 5, RED);
+  const A = asiCfg;
+  s += arc(85, asiAngle(A.vS1), asiAngle(A.vNo), GREEN, 8);
+  s += arc(85, asiAngle(A.vNo), asiAngle(A.vNe), AMBER, 8);
+  s += arc(74, asiAngle(A.vS0), asiAngle(A.vFe), '#f0f4f8', 5);
+  // Vne (Vmo on a jet) red line, standing proud of the arcs.
+  s += tick(78, 92, asiAngle(A.vNe), 5, RED);
 
   // Minor ticks every 5 kt, mid ticks every 10, numerals every 20. At
   // 2.06 deg/kt the 5 kt ticks land 10 degrees apart — dense enough to
   // interpolate against, open enough to count.
-  for (let kt = ASI_MIN; kt <= ASI_MAX; kt += 5) {
+  for (let kt = A.min; kt <= A.max; kt += A.step) {
     const a = asiAngle(kt);
-    if (kt % 20 === 0) s += tick(70, 56, a, 3.2);
-    else if (kt % 10 === 0) s += tick(70, 61, a, 2.2);
+    if (kt % A.num === 0) s += tick(70, 56, a, 3.2);
+    else if (kt % A.mid === 0) s += tick(70, 61, a, 2.2);
     else s += tick(70, 65, a, 1.3, INK_DIM);
   }
-  for (let kt = ASI_MIN; kt <= ASI_MAX; kt += 20) {
+  for (let kt = A.min; kt <= A.max; kt += A.num) {
     s += radialText(52, asiAngle(kt), String(kt), 15);
   }
 
@@ -744,20 +799,21 @@ function vsiFace(u) {
 function tachFace(u) {
   let s = '';
 
-  s += arc(84, tachAngle(TACH_GREEN_LO), tachAngle(TACH_REDLINE), GREEN, 7);
-  s += tick(78, 92, tachAngle(TACH_REDLINE), 5, RED);
+  const c = tachCfg;
+  s += arc(84, tachAngle(c.greenLo), tachAngle(c.redline), GREEN, 7);
+  s += tick(78, 92, tachAngle(c.redline), 5, RED);
 
-  for (let r = 0; r <= TACH_MAX; r += 100) {
+  for (let r = 0; r <= c.max; r += c.tickStep) {
     const a = tachAngle(r);
-    if (r % 500 === 0) s += tick(78, 62, a, 3.2);
+    if (r % c.labelStep === 0) s += tick(78, 62, a, 3.2);
     else s += tick(78, 68, a, 1.6, INK_DIM);
   }
-  for (let r = 0; r <= TACH_MAX; r += 500) {
-    s += radialText(50, tachAngle(r), String(r / 100), 15);
+  for (let r = 0; r <= c.max; r += c.labelStep) {
+    s += radialText(50, tachAngle(r), String(r / c.labelDiv), 15);
   }
 
-  s += `<text x="0" y="-24" class="t" font-size="10" fill="${INK_DIM}" letter-spacing="1.4">RPM</text>`;
-  s += `<text x="0" y="-12" class="t" font-size="7.5" fill="${INK_DIM}" letter-spacing="0.9">HUNDREDS</text>`;
+  s += `<text x="0" y="-24" class="t" font-size="10" fill="${INK_DIM}" letter-spacing="1.4">${c.label}</text>`;
+  s += `<text x="0" y="-12" class="t" font-size="7.5" fill="${INK_DIM}" letter-spacing="0.9">${c.sub}</text>`;
 
   // Hobbs meter, counting real elapsed run time. Cosmetic, but every tach has
   // one and its absence is conspicuous. It goes in the empty 90-degree sector
@@ -876,13 +932,14 @@ function cAirspeed(u) {
     `<rect x="${x}" y="${y(hi)}" width="${w}" height="${((hi - lo) * C_ASI_UPK).toFixed(2)}"` +
     ` fill="${color}"/>`;
 
+  const A = asiCfg;
   let m = '';
-  m += band(V_S0, V_FE, 0, 2.6, '#f0f4f8'); // white flap-operating arc, inboard
-  m += band(V_S1, V_NO, 2.6, 3.4, GREEN);
-  m += band(V_NO, V_NE, 2.6, 3.4, AMBER);
-  m += band(V_NE, 240, 2.6, 3.4, RED);
-  for (let kt = 0; kt <= 240; kt += 5) {
-    const major = kt % 10 === 0;
+  m += band(A.vS0, A.vFe, 0, 2.6, '#f0f4f8'); // white flap arc, inboard
+  m += band(A.vS1, A.vNo, 2.6, 3.4, GREEN);
+  m += band(A.vNo, A.vNe, 2.6, 3.4, AMBER);
+  m += band(A.vNe, A.max, 2.6, 3.4, RED);
+  for (let kt = 0; kt <= A.max; kt += A.step) {
+    const major = kt % A.mid === 0;
     m +=
       `<line x1="9" y1="${y(kt)}" x2="${major ? 22 : 16}" y2="${y(kt)}"` +
       ` stroke="${major ? INK : INK_DIM}" stroke-width="${major ? 1.6 : 1.1}"/>`;
@@ -1060,12 +1117,12 @@ function cCluster(u) {
   const W = C_CLU_W - X - 4; // 86
 
   // Power. A bar with the same redline the tachometer carries.
-  s += `<text x="${X}" y="8" class="t ta-start" font-size="8.5" fill="${INK_DIM}" letter-spacing="0.9">RPM</text>`;
+  s += `<text x="${X}" y="8" class="t ta-start" font-size="8.5" fill="${INK_DIM}" letter-spacing="0.9">${tachCfg.label}</text>`;
   s += `<text id="${u}-c-rpm-v" x="${X + W}" y="8" class="t tn ta-end" font-size="11.5" fill="${INK}">0</text>`;
   s += `<rect x="${X}" y="14" width="${W}" height="7" rx="3.5" fill="${OFF}"/>`;
   s += `<rect id="${u}-c-rpm-bar" x="${X}" y="14" width="0" height="7" rx="3.5" fill="${GREEN}"/>`;
   s +=
-    `<rect x="${(X + (TACH_REDLINE / TACH_MAX) * W).toFixed(2)}" y="12"` +
+    `<rect x="${(X + (tachCfg.redline / tachCfg.max) * W).toFixed(2)}" y="12"` +
     ` width="1.8" height="11" fill="${RED}"/>`;
 
   // Flaps.
@@ -1822,7 +1879,10 @@ export function createInstruments(container, opts = {}) {
     const hdg = wrapDeg(num(state.headingDeg));
     const pitch = clamp(num(state.pitchDeg), -89, 89);
     const roll = clamp(num(state.rollDeg), -180, 180);
-    const rpm = num(state.rpm);
+    // WHICH NUMBER IS THE ENGINE. A piston publishes rpm and leaves n1Pct at
+    // zero; a turbofan does the reverse. Reading the wrong one gives a needle
+    // that never leaves the stop, with nothing to say why.
+    const rpm = tachCfg === ENGINE_GAUGES.n1 ? num(state.n1Pct) : num(state.rpm);
 
     // Flaps / brakes: state first, caller-supplied inputs second, absent third.
     // `flapsPos` is the flight model's own rate-limited, blow-back-limited flap
@@ -1891,6 +1951,13 @@ export function createInstruments(container, opts = {}) {
     }
 
     hobbsSec += dt;
+
+    // The value overlay.js puts in its status row. It lives HERE, in the
+    // shared update, and not in drawCompact() where it used to: the panel
+    // layout never calls drawCompact, so in panel view the row was frozen at
+    // whatever the last compact frame had left there — which after an aircraft
+    // change meant a Cessna showing the 737's last N1 reading, labelled RPM.
+    lastRpm = Math.round(d.rpm);
 
     if (layout === 'compact') drawCompact(state, brakeRaw, hasFlap);
     else drawPanel(state, brakeRaw, hasFlap);
@@ -2083,11 +2150,10 @@ export function createInstruments(container, opts = {}) {
     );
 
     // --- power -------------------------------------------------------------
-    const rpmFrac = clamp(d.rpm / TACH_MAX, 0, 1);
+    const rpmFrac = clamp(d.rpm / tachCfg.max, 0, 1);
     setAttr(el.rpmBar, 'width', (rpmFrac * (C_CLU_W - 122)).toFixed(2));
-    setAttr(el.rpmBar, 'fill', d.rpm > TACH_REDLINE ? RED : d.rpm >= TACH_GREEN_LO ? GREEN : CYAN);
+    setAttr(el.rpmBar, 'fill', d.rpm > tachCfg.redline ? RED : d.rpm >= tachCfg.greenLo ? GREEN : CYAN);
     setText(el.rpmV, group(d.rpm));
-    lastRpm = Math.round(d.rpm);
 
     // --- flaps -------------------------------------------------------------
     if (hasFlap) {
@@ -2159,7 +2225,40 @@ export function createInstruments(container, opts = {}) {
      * into the menu sheet on a phone — so cropping the cluster hides them from
      * the windscreen without losing them.
      */
-    info: () => ({ rpm: lastRpm, nearest: lastNearest, nearestSub: lastNearestSub }),
+    info: () => ({
+      rpm: lastRpm,
+      engineLabel: tachCfg.label,
+      engineUnit: tachCfg.unit,
+      nearest: lastNearest,
+      nearestSub: lastNearestSub,
+    }),
+    /**
+     * Swap the sixth dial between a tachometer and an N1 gauge.
+     *
+     * The FACE is rebuilt, not just the needle — see ENGINE_GAUGES. Passing a
+     * kind that is already active is a no-op, so main.js can call it freely.
+     *
+     * ...and the airspeed scale with it, because both faces live in the same
+     * SVG and there is only one rebuild to spend.
+     *
+     * @param {'rpm'|'n1'} kind — flightModel publishes this as state.engineGauge.
+     * @param {'c172'|'b738'} [asiKey] — which ASI_SCALES entry to draw.
+     */
+    setEngineGauge(kind, asiKey) {
+      const next = ENGINE_GAUGES[kind] || ENGINE_GAUGES.rpm;
+      const nextAsi = ASI_SCALES[asiKey] || asiCfg;
+      const nextFlap = FLAP_SETS[asiKey] || FLAP_DETENTS;
+      if (next === tachCfg && nextAsi === asiCfg && nextFlap === FLAP_DETENTS) return;
+      tachCfg = next;
+      asiCfg = nextAsi;
+      FLAP_DETENTS = nextFlap;
+      // Force a full rebuild: the current layout's SVG has the old face baked
+      // into its markup, and there is no partial update that can change a
+      // dial's tick spacing and its legend.
+      const want = layout;
+      layout = null;
+      applyLayout(want);
+    },
     root,
     /** 'panel' | 'compact'. For the acceptance check and the console. */
     getLayout: () => layout,

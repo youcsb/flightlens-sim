@@ -284,7 +284,46 @@ function wrap180(deg) {
  *   status: () => Object,
  * }}
  */
+/**
+ * PER-AIRCRAFT GAINS.
+ *
+ * Every constant above was tuned against the Cessna and every one of them is
+ * an aeroplane-specific number: MAX_VS_FPM 600 is a 172's climb rate, the
+ * airspeed floor of 58 kt is a 172's stall plus margin, and K_HDG_TO_BANK is
+ * calibrated to a light single's roll response. Flown on the 737 unchanged the
+ * loop HOLDS — it does not diverge — but it hunts: 47 vertical-speed reversals
+ * a minute and +/-1,200 fpm about a level flight path, measured.
+ *
+ * The airspeed protection is the dangerous one rather than the untidy one. A
+ * 58 kt floor on an aeroplane that stalls at 143 kt is not protection at all;
+ * it is a number that can never fire, on the one loop whose whole job is to
+ * stop the autopilot mushing an aeroplane into a stall while commanding a
+ * climb it has no energy for.
+ *
+ * `setProfile()` rather than a constructor argument because main.js keeps ONE
+ * autopilot across an aircraft change — see setAircraft() there.
+ */
+const DEFAULT_PROFILE = {
+  maxVsFpm: MAX_VS_FPM,
+  kAltToVs: K_ALT_TO_VS,
+  kVsToPitch: K_VS_TO_PITCH,
+  maxPitchCmdDeg: MAX_PITCH_CMD_DEG,
+  kPitchP: K_PITCH_P,
+  kPitchD: K_PITCH_D,
+  kPitchI: K_PITCH_I,
+  maxBankDeg: MAX_BANK_DEG,
+  kHdgToBank: K_HDG_TO_BANK,
+  kBankP: K_BANK_P,
+  kBankD: K_BANK_D,
+  kBankI: K_BANK_I,
+  vsProtectKts: VS_PROTECT_KTS,
+  vsFloorKts: VS_FLOOR_KTS,
+};
+
 export function createAutopilot() {
+  /** Active gains. Replaced wholesale by setProfile(). */
+  let G = { ...DEFAULT_PROFILE };
+
   let engaged = false;
   let headingBug = 0;
   let altitudeBug = 1000;
@@ -378,6 +417,17 @@ export function createAutopilot() {
      * pressing the key never produces a surprise manoeuvre — the aeroplane
      * holds what it already had, and you then dial it somewhere else.
      */
+    /**
+     * Install a gain set. Unspecified keys keep the Cessna's value, so a
+     * profile states only what genuinely differs — and an aeroplane with no
+     * profile at all still gets a working autopilot rather than zeroes.
+     * @param {Partial<typeof DEFAULT_PROFILE>} [profile]
+     */
+    setProfile(profile) {
+      G = { ...DEFAULT_PROFILE, ...(profile || {}) };
+      resetIntegrators();
+    },
+
     toggle(state) {
       if (engaged) {
         disengage('off');
@@ -512,15 +562,15 @@ export function createAutopilot() {
 
       // --- lateral: heading -> bank -> aileron ------------------------------
       const hdgErr = wrap180(headingBug - (state.headingDeg ?? 0));
-      const bankTarget = clamp(hdgErr * K_HDG_TO_BANK, -MAX_BANK_DEG, MAX_BANK_DEG);
+      const bankTarget = clamp(hdgErr * G.kHdgToBank, -G.maxBankDeg, G.maxBankDeg);
       const bankErr = bankTarget - rollDeg;
 
-      bankI = clamp(bankI + bankErr * d * K_BANK_I, -BANK_I_CLAMP, BANK_I_CLAMP);
-      cmdRoll = clamp((bankErr * K_BANK_P - rollRate * K_BANK_D) * tuneScale + bankI, -1, 1);
+      bankI = clamp(bankI + bankErr * d * G.kBankI, -BANK_I_CLAMP, BANK_I_CLAMP);
+      cmdRoll = clamp((bankErr * G.kBankP - rollRate * G.kBankD) * tuneScale + bankI, -1, 1);
 
       // --- vertical: altitude -> vertical speed -> elevator ------------------
       const altErr = altitudeBug - (state.altitudeFt ?? 0);
-      let vsTarget = clamp(altErr * K_ALT_TO_VS, -MAX_VS_FPM, MAX_VS_FPM);
+      let vsTarget = clamp(altErr * G.kAltToVs, -G.maxVsFpm, G.maxVsFpm);
 
       // Airspeed protection, in two stages.
       //
@@ -535,9 +585,9 @@ export function createAutopilot() {
       // The integrator is also dumped downward, or its accumulated nose-up
       // command survives the recovery and flies straight back into the stall.
       const kts = state.airspeedKts ?? 0;
-      const room = (kts - VS_FLOOR_KTS) / (VS_PROTECT_KTS - VS_FLOOR_KTS);
+      const room = (kts - G.vsFloorKts) / (G.vsProtectKts - G.vsFloorKts);
       if (room < 0) {
-        vsTarget = Math.min(vsTarget, clamp(room, -1, 0) * MAX_VS_FPM);
+        vsTarget = Math.min(vsTarget, clamp(room, -1, 0) * G.maxVsFpm);
         if (pitchI > 0) pitchI = 0;
       } else if (vsTarget > 0) {
         vsTarget *= clamp(room, 0, 1);
@@ -548,9 +598,9 @@ export function createAutopilot() {
       // whose absence caused the porpoising.
       const vsErr = vsTarget - (state.verticalSpeedFpm ?? 0);
       let pitchTarget = clamp(
-        vsErr * K_VS_TO_PITCH,
-        -MAX_PITCH_CMD_DEG,
-        MAX_PITCH_CMD_DEG,
+        vsErr * G.kVsToPitch,
+        -G.maxPitchCmdDeg,
+        G.maxPitchCmdDeg,
       );
 
       // In a bank some lift goes sideways, so level flight needs a little more
@@ -563,10 +613,10 @@ export function createAutopilot() {
       // pitch rate, with an integrator standing in for the trim the airframe
       // does not have.
       const pitchErr = pitchTarget - pitchDeg;
-      pitchI = clamp(pitchI + pitchErr * d * K_PITCH_I, -PITCH_I_CLAMP, PITCH_I_CLAMP);
+      pitchI = clamp(pitchI + pitchErr * d * G.kPitchI, -PITCH_I_CLAMP, PITCH_I_CLAMP);
 
       cmdPitch = clamp(
-        (pitchErr * K_PITCH_P - pitchRate * K_PITCH_D) * tuneScale + pitchI,
+        (pitchErr * G.kPitchP - pitchRate * G.kPitchD) * tuneScale + pitchI,
         -1,
         1,
       );

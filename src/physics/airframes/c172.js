@@ -132,6 +132,20 @@ export const C172 = {
   // AERODYNAMIC DERIVATIVES — per RADIAN, aero axes (x fwd, y right, z down)
   // -------------------------------------------------------------------------
   aero: {
+    /**
+     * COMPRESSIBILITY. False, and false here means the whole thing is skipped
+     * rather than multiplied by one.
+     *
+     * A 172's never-exceed speed is 165 KIAS. At sea level that is M0.25, and
+     * Prandtl-Glauert at M0.25 is a 3% change in lift-curve slope — smaller
+     * than the uncertainty in cl0 and utterly swamped by the fact that nobody
+     * flies a Skyhawk at Vne. Turning it on would move every number in every
+     * harness by a rounding error in exchange for nothing.
+     *
+     * An airframe that sets this true must also set mCrit, machDragK and
+     * limits.mmo. See flightModel's MACH_EFFECTS block for what each does.
+     */
+    machEffects: false,
     /** Lift coefficient at zero geometric alpha (cambered wing + incidence). */
     cl0: 0.25,
     /** Lift from pitch rate. */
@@ -280,9 +294,22 @@ export const C172 = {
   // -------------------------------------------------------------------------
   prop: {
     /**
+     * WHAT KIND OF ENGINE: 'piston' | 'turbofan'.
+     *
+     * 'piston' means a naturally aspirated engine turning a fixed-pitch prop:
+     * constant SHAFT POWER, so thrust falls as roughly 1/V and the aeroplane
+     * runs out of push long before it runs out of placard. Every number below
+     * in this group describes that arrangement, and most of them are
+     * meaningless for a fan.
+     */
+    propulsion: 'piston',
+    /**
      * Engine spool lag, per second, as an exponential rate constant. 2.5 is a
      * naturally aspirated piston: throttle to power in a fraction of a second.
      * A turbofan is FAR slower and a jet airframe must say so.
+     *
+     * A piston is symmetric — it loses power as fast as it makes it — so
+     * `spoolRateDown` is deliberately absent and defaults to this same number.
      */
     spoolRate: 2.5,
     /** A stopped throttle still turns the prop: rpm per m/s of airspeed. A
@@ -524,6 +551,22 @@ export const C172 = {
      * still runs.
      */
     overspeedBreak: 1.3,
+    /**
+     * Sanity rails on the CLmax that flightModel DERIVES from stallSpeedMs and
+     * mass. The 172 lands at 1.74, comfortably inside, so these are inert here
+     * — they are stated anyway because getting them wrong is SILENT.
+     *
+     * A wing with leading-edge slats reaches 2.8-3.0 and would be quietly
+     * pinned at 2.4, giving it a stall speed several knots optimistic with
+     * nothing anywhere saying so. An airframe with slats must raise clMaxMax.
+     */
+    clMaxMin: 0.9,
+    clMaxMax: 2.4,
+    /**
+     * No Mmo. A 172 cannot approach a Mach limit — see aero.machEffects — and
+     * an omitted Mmo means the structural check is pure IAS, exactly as it
+     * always was.
+     */
   },
 };
 

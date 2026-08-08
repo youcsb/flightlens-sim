@@ -329,14 +329,56 @@ class Spring3 {
 // Mode table
 // ---------------------------------------------------------------------------
 
-const MODE_NAMES = ['chase', 'cockpit', 'orbit', 'flyby'];
-const MODE_FOV = [CHASE_FOV, COCKPIT_FOV, ORBIT_FOV, FLYBY_FOV_MAX];
+/**
+ * The modes the C key cycles.
+ *
+ * 'flyby' — the planted tripod the aircraft passes, the "belly view" — is
+ * REMOVED, not deleted. It ghosted: the aeroplane rendered as two overlapping
+ * images, visible in motion and impossible to catch in a still frame. The
+ * render interpolation added to flightModel (see renderTransform) and the
+ * camera's switch to framing the DRAWN pose both helped and neither fixed it,
+ * and the residual measured shake — 0.4 px — is far too small to explain what
+ * was on screen. The cause is still unknown.
+ *
+ * Everything that implements it is left in place below, so putting it back is
+ * adding the name to these two arrays. See RESUME.md for the diagnosis that
+ * was never run: capture consecutive frames via WebGLRenderTarget readback and
+ * diff them, which separates "drawn twice in one frame" from "alternating
+ * across frames". Those have different causes.
+ *
+ * Worth being honest in here: whatever it is may well affect the other three
+ * views too, below the threshold where anyone notices. This is a workaround.
+ */
+const MODE_NAMES = ['chase', 'cockpit', 'orbit'];
+const MODE_FOV = [CHASE_FOV, COCKPIT_FOV, ORBIT_FOV];
 
 /**
  * @param {THREE.Object3D} aircraftGroup The aircraft root from createAircraft().
  * @param {THREE.WebGLRenderer} renderer Used to read the drawing-buffer size
  *        and to attach view-only pointer/wheel listeners to its canvas.
  */
+/**
+ * PER-AIRCRAFT CAMERA FRAME.
+ *
+ * Every CHASE_* and ORBIT_* constant above was measured against a Cessna 172:
+ * 8.3 m long, 11 m span. A 737-800 is 39.5 m long with a 34 m span, and the
+ * same 14.5 m boom puts the camera INSIDE the fuselage — which is exactly what
+ * it did the first time the jet was flown, and which reads as a broken camera
+ * rather than as a scaling assumption.
+ *
+ * `scale` multiplies the boom, the lateral swing, the look-ahead and the orbit
+ * radius; `eye` and `panelEye` are stated outright, because a flight deck is
+ * not at a scaled-up version of a Cessna's eye position — it is 17 m forward of
+ * the CG on one aeroplane and 0.9 m on the other.
+ *
+ * setAircraftFrame() exists so a type change does not have to rebuild the rig.
+ * Rebuilding it would throw away the springs' settled state and make every
+ * swap snap and re-converge. See main.js's `acMount`.
+ */
+let frameScale = 1;
+let frameEye = EYE_FORWARD;
+let framePanelEye = EYE_PANEL;
+
 export function createCameras(aircraftGroup, renderer) {
   const size = new THREE.Vector2();
   renderer.getSize(size);
@@ -410,6 +452,15 @@ export function createCameras(aircraftGroup, renderer) {
     mode: MODE_NAMES[0],
     cycle,
     setMode,
+    /**
+     * Re-frame the rig for a different aeroplane. See the frameScale block.
+     * @param {{scale?:number, eye?:THREE.Vector3, panelEye?:THREE.Vector3}} f
+     */
+    setAircraftFrame(f = {}) {
+      frameScale = f.scale > 0 ? f.scale : 1;
+      frameEye = f.eye || EYE_FORWARD;
+      framePanelEye = f.panelEye || EYE_PANEL;
+    },
     snap,
     update,
     onResize,
@@ -582,8 +633,8 @@ export function createCameras(aircraftGroup, renderer) {
    * mistake.
    */
   function buildChase(state, speedFrac, rollRad, pitchRad) {
-    const dist = (CHASE_DIST + CHASE_DIST_SPEED * speedFrac) * zoom[index];
-    const height = CHASE_HEIGHT + CHASE_HEIGHT_SPEED * speedFrac;
+    const dist = (CHASE_DIST + CHASE_DIST_SPEED * speedFrac) * frameScale * zoom[index];
+    const height = (CHASE_HEIGHT + CHASE_HEIGHT_SPEED * speedFrac) * frameScale;
 
     // Yaw frame from the flight model's own heading — no quaternion unpicking.
     const h = state.headingDeg * DEG_TO_RAD;
@@ -596,7 +647,7 @@ export function createCameras(aircraftGroup, renderer) {
     _target.applyAxisAngle(_right, pitchRad * CHASE_PITCH_BLEND);
 
     // Slide to the OUTSIDE of the turn to open up the view into it.
-    _target.addScaledVector(_right, -Math.sin(rollRad) * CHASE_LATERAL);
+    _target.addScaledVector(_right, -Math.sin(rollRad) * CHASE_LATERAL * frameScale);
 
     _target.add(_acPos);
 
@@ -611,9 +662,9 @@ export function createCameras(aircraftGroup, renderer) {
     // centre of frame — the GeoFS exterior composition.
     _lookTarget
       .copy(_fwd)
-      .multiplyScalar(CHASE_LOOKAHEAD)
+      .multiplyScalar(CHASE_LOOKAHEAD * frameScale)
       .applyAxisAngle(_right, pitchRad * CHASE_PITCH_BLEND)
-      .addScaledVector(_worldUp, CHASE_LOOKUP)
+      .addScaledVector(_worldUp, CHASE_LOOKUP * frameScale)
       .add(_acPos)
       .addScaledVector(_vel, CHASE_LEAD);
 
@@ -630,7 +681,7 @@ export function createCameras(aircraftGroup, renderer) {
 
   /** Cockpit. Rigid to the airframe — any lag here reads as a loose head. */
   function buildCockpit() {
-    const eye = panelView ? EYE_PANEL : EYE_FORWARD;
+    const eye = panelView ? framePanelEye : frameEye;
     _target.copy(eye).applyMatrix4(aircraftGroup.matrixWorld);
 
     // Gaze 200 m down the nose (well past the propeller), tipped down for the
@@ -646,7 +697,7 @@ export function createCameras(aircraftGroup, renderer) {
 
   /** Orbit. World-aligned spherical rig that translates with the aircraft. */
   function buildOrbit() {
-    const r = ORBIT_RADIUS * zoom[index];
+    const r = ORBIT_RADIUS * frameScale * zoom[index];
     const ce = Math.cos(orbitEl);
     _target.set(
       Math.sin(orbitAz) * ce * r,
@@ -713,9 +764,28 @@ export function createCameras(aircraftGroup, renderer) {
     const h = Number.isFinite(dt) ? clamp(dt, 0, 0.1) : 0;
     aircraftGroup.updateMatrixWorld();
 
-    // Prefer the flight model's state, but stay correct if it is not passed.
-    if (state && state.position) _acPos.copy(state.position);
-    else _acPos.setFromMatrixPosition(aircraftGroup.matrixWorld);
+    /**
+     * FRAME WHAT IS DRAWN, NOT WHAT IS SIMULATED.
+     *
+     * This used to prefer `state.position` and fall back to the group. That is
+     * backwards now that main.js draws the aeroplane at flightModel's
+     * INTERPOLATED pose: `state.position` is the latest completed 1/240 s
+     * substep, the group is where the aeroplane actually is on screen, and the
+     * two differ by up to one substep — about a metre at jet speeds.
+     *
+     * On chase, cockpit and orbit the mismatch is invisible, because the camera
+     * rides with the aircraft and both ends jitter together. On FLYBY it is
+     * fully exposed: that camera is a tripod planted in the world, so a jittery
+     * aim point shakes the whole frame while the aeroplane slides about inside
+     * it. That is why the ghosting survived in exactly one view after the
+     * render interpolation went in.
+     *
+     * The group is authoritative because it is what the renderer will use.
+     * `state.position` remains the fallback for a caller that passes no group
+     * transform of its own.
+     */
+    _acPos.setFromMatrixPosition(aircraftGroup.matrixWorld);
+    if (!Number.isFinite(_acPos.x) && state && state.position) _acPos.copy(state.position);
 
     if (state && state.velocity) _vel.copy(state.velocity);
     else _vel.set(0, 0, 0);

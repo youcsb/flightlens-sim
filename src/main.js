@@ -51,7 +51,14 @@ import { placeLandmarks } from './geo/landmarks.js';
 import { setBuildingBudget } from './geo/buildings.js';
 import { createTerrain } from './world/terrain.js';
 import { createSky } from './world/sky.js';
-import { createAircraft } from './aircraft/model.js';
+import {
+  AIRCRAFT_TYPES,
+  DEFAULT_TYPE_ID,
+  getAircraftType,
+  nextAircraftId,
+  applySpawnFor,
+  spawnThrottleFor,
+} from './aircraft/types.js';
 import { createFlightModel } from './physics/flightModel.js';
 import { createInstruments } from './ui/instruments.js';
 import { createOverlay } from './ui/overlay.js';
@@ -372,13 +379,41 @@ async function boot() {
   await nextFrame();
   // Passing the renderer buys a properly PMREM-prefiltered environment map
   // instead of a raw equirect that three has to convert on the first render.
-  const aircraft = createAircraft(scene, { renderer });
+  // WHICH AEROPLANE. The URL wins (so a link can name one), then the last
+  // choice, then the Cessna. Every fallback lands on the Cessna: being unable
+  // to start is far worse than starting in the wrong aeroplane.
+  let typeId = DEFAULT_TYPE_ID;
+  try {
+    const q = new URLSearchParams(location.search).get('aircraft');
+    typeId = (q || localStorage.getItem('sim.aircraft') || DEFAULT_TYPE_ID);
+  } catch { /* no URL, no storage: the default stands */ }
+  let type = getAircraftType(typeId);
+  typeId = type.id;
+
+  // THE CAMERA HOLDS THE MOUNT, NOT THE AEROPLANE.
+  //
+  // createCameras() binds its target group once, and swapping aircraft means
+  // building a new visual model with a new group. Handing the cameras a
+  // permanent empty group and parenting the model INTO it means the camera
+  // rig, its springs and its settled state all survive a type change — which
+  // is the difference between switching aeroplanes and having the view snap
+  // and re-converge every time.
+  const acMount = new THREE.Group();
+  acMount.name = 'aircraftMount';
+  scene.add(acMount);
+
+  let aircraft = type.createModel(scene, { renderer, registration: type.registration });
+  acMount.add(aircraft.group);
+  aircraft.group.position.set(0, 0, 0);
+  aircraft.group.quaternion.identity();
 
   // 6. Spawn on a real runway threshold. getSpawn() falls back to hardcoded
   //    KBFI coordinates if the airport bake has not been run, so this never
   //    throws and never drops the aircraft into the void.
   const spawn = getSpawn();
-  const flight = createFlightModel({
+  /** Rebuilt whenever the type changes; everything downstream reads it fresh. */
+  let flight = createFlightModel({
+    airframe: type.airframe,
     startLat: spawn.lat,
     startLon: spawn.lon,
     startHeadingDeg: spawn.headingDeg,
@@ -407,13 +442,23 @@ async function boot() {
   // itself (touch.js#surface), so the fingers still land and the canvas still
   // gets everything they miss.
   const input = createInput(renderer.domElement, { touchParent: hudEl });
-  const cameras = createCameras(aircraft.group, renderer);
+  const cameras = createCameras(acMount, renderer);
+  cameras.setAircraftFrame?.(type.camera);
   const sound = createSoundscape();
   const autopilot = createAutopilot();
 
   // Seed the aircraft transform so the first frame is already correct.
-  aircraft.group.position.copy(flight.state.position);
-  aircraft.group.quaternion.copy(flight.state.orientation);
+  flight.renderTransform(acMount.position, acMount.quaternion);
+
+  overlay.setAircraft?.(type.name);
+  instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
+  input.setFlapGates?.(typeId);
+  autopilot.setProfile?.(type.autopilot);
+
+  /** Reused surface-command object — see the note at the call site. */
+  const surf = { pitch: 0, roll: 0, yaw: 0, flaps: 0, flapsExact: true };
+  /** Last flap selection we warned about, so the toast fires once per press. */
+  let lastFlapWant = -1;
 
   const dem = getRegionStats();
   console.info(
@@ -461,6 +506,73 @@ async function boot() {
     };
   }
 
+  /**
+   * Change aeroplane.
+   *
+   * Both halves are rebuilt — the physics airframe and the visual model — and
+   * then the aircraft is RESET onto the current place. The reset is not
+   * tidiness: a 737's contact patch is 2.9 m below its datum and a Cessna's is
+   * 1.2 m, so keeping the old position across a swap either buries the new
+   * aeroplane 1.7 m into the runway or hangs it in the air above one.
+   *
+   * What survives: the camera rig (it holds `acMount`, not the model — see
+   * there), the terrain, the sky, the time of day and the chosen place. What
+   * does not: the autopilot, whose integrators are wound up for an aeroplane
+   * that no longer exists, and which is explicitly disengaged rather than left
+   * to unwind into the new one.
+   */
+  function setAircraft(id) {
+    const next = getAircraftType(id);
+    if (next.id === typeId) return;
+
+    autopilot.disengage?.('aircraft changed');
+
+    const old = aircraft;
+    type = next;
+    typeId = next.id;
+    try {
+      localStorage.setItem('sim.aircraft', typeId);
+    } catch { /* private browsing: the choice just does not persist */ }
+
+    aircraft = type.createModel(scene, { renderer, registration: type.registration });
+    // createModel adds to the scene itself; reparent into the camera's mount.
+    acMount.add(aircraft.group);
+    aircraft.group.position.set(0, 0, 0);
+    aircraft.group.quaternion.identity();
+    old.dispose();
+
+    flight = createFlightModel({
+      airframe: type.airframe,
+      startLat: spawn.lat,
+      startLon: spawn.lon,
+      startHeadingDeg: spawn.headingDeg,
+      startAltitudeAglM: 0,
+      startAirspeedMs: 0,
+      groundHeightFn: terrain.getHeightAt,
+    });
+
+    const p = PLACES[placeIndex];
+    const rt = applySpawnFor(type, resolvePlace(p));
+    flight.reset(rt.lat, rt.lon, rt.headingDeg, rt.placement);
+    input.setThrottle(spawnThrottleFor(type, p, rt));
+    input.setFlaps(0);
+
+    flight.renderTransform(acMount.position, acMount.quaternion);
+    cameras.setAircraftFrame?.(type.camera);
+    cameras.snap?.();
+    cameras.update(0, flight.state);
+
+    instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
+    // The lever's gates belong to the aeroplane too — see FLAP_GATE_SETS.
+    input.setFlapGates?.(typeId);
+    // Gains for the aeroplane that now exists. Also re-zeros the integrators,
+    // which were wound up for the one that does not.
+    autopilot.setProfile?.(type.autopilot);
+    overlay.setAircraft?.(type.name);
+    overlay.toast(`${type.name} · ${p.label}`);
+    console.info(`[sim] aircraft -> ${type.name} (${typeId})`);
+  }
+
   gotoPlace = async function gotoPlaceImpl(i) {
     const p = PLACES[i];
     if (!p) return;
@@ -477,17 +589,21 @@ async function boot() {
     // §1.6: a paging failure degrades the view, it does not cancel a teleport.
     await warmAt(r.lat, r.lon).catch(() => {});
 
-    flight.reset(r.lat, r.lon, r.headingDeg, r.placement);
+    // The PLACES table describes a situation for a light single. The AIRCRAFT
+    // decides what that situation means for it — see applySpawnFor. A 737
+    // dropped into "2,000 ft over downtown at 100 kt" is below its stalling
+    // speed at the instant it appears.
+    const rt = applySpawnFor(type, r);
+    flight.reset(rt.lat, rt.lon, rt.headingDeg, rt.placement);
 
     // The lever is part of the situation. Arriving at 3,000 ft with the
     // throttle closed is a glider start, not a cruise.
-    input.setThrottle(p.throttle ?? 0);
+    input.setThrottle(spawnThrottleFor(type, p, rt));
     input.setFlaps(0);
 
     // Move the picture with the aeroplane, in this order: chunks first (so the
     // camera's ground-clearance floor reads real terrain), then the camera.
-    aircraft.group.position.copy(flight.state.position);
-    aircraft.group.quaternion.copy(flight.state.orientation);
+    flight.renderTransform(acMount.position, acMount.quaternion);
     terrain.converge?.(
       flight.state.position.x,
       flight.state.position.y,
@@ -566,14 +682,21 @@ async function boot() {
         break;
       case 'KeyR': {
         const p = PLACES[placeIndex];
-        const r = resolvePlace(p);
-        flight.reset(r.lat, r.lon, r.headingDeg, r.placement);
-        input.setThrottle(p.throttle ?? 0);
+        const rt = applySpawnFor(type, resolvePlace(p));
+        flight.reset(rt.lat, rt.lon, rt.headingDeg, rt.placement);
+        input.setThrottle(spawnThrottleFor(type, p, rt));
         input.setFlaps(0);
         cameras.snap?.();
         overlay.toast(`reset · ${p.label}`);
         break;
       }
+      // Cycle the aeroplane. THE RESET IS THE POINT, not a side effect: a
+      // 737's contact patch is 2.9 m below its datum and a Cessna's is 1.2 m,
+      // so a swap without a reset drops the new aeroplane 1.7 m through the
+      // runway or hangs it above it.
+      case 'KeyI':
+        setAircraft(nextAircraftId(typeId));
+        break;
       case 'KeyP':
       case 'Escape':
         paused = !paused;
@@ -720,10 +843,40 @@ async function boot() {
 
       // 4. visual aircraft follows the model. flightModel owns the transform;
       //    aircraft/model.js is purely cosmetic and never moves itself.
-      aircraft.group.position.copy(state.position);
-      aircraft.group.quaternion.copy(state.orientation);
-      aircraft.setControlSurfaces(inputs);
-      aircraft.spinProp(state.rpm, dt);
+      // DRAW between the last two physics substeps, not at the latest one.
+      // step() leaves up to 4 ms of unsimulated time, so `state.position`
+      // advances in uneven jumps once frame times stop being exact multiples
+      // of 1/240 s — about a metre of noise at jet speeds, which reads as a
+      // ghosted aeroplane. See renderTransform() in flightModel.js.
+      flight.renderTransform(acMount.position, acMount.quaternion);
+      /**
+       * THE FLAPS THE AEROPLANE SEES, NOT THE ONES THE LEVER ASKED FOR.
+       *
+       * `inputs.flaps` is the raw lever. `state.flapsPos` is where the flaps
+       * actually ARE after the flight model has applied its travel rate and,
+       * crucially, BLOW-BACK: above Vfe the airflow pushes them back up and
+       * they refuse to extend. The 737's Vfe is 200 kt, so on a 250 kt cruise
+       * the lever moves, the physics correctly keeps the flaps stowed — and
+       * the visual model, driven from the lever, deflected them anyway.
+       *
+       * That is the exact failure b738model.js's header warns about: the
+       * aeroplane you see stops being the one you fly. It also made the panel
+       * look broken, because the gauge reads `flapsPos` and was telling the
+       * truth while the wing was lying.
+       */
+      surf.pitch = inputs.pitch;
+      surf.roll = inputs.roll;
+      surf.yaw = inputs.yaw;
+      surf.flaps = state.flapsPos;
+      // Already rate- and blow-back-limited by the model; do not ramp it twice.
+      surf.flapsExact = true;
+      aircraft.setControlSurfaces(surf);
+      // WHICH NUMBER DRIVES THE SPINNER IS THE AIRFRAME'S TO SAY. A piston
+      // publishes rpm and leaves n1Pct at zero; a turbofan does the reverse,
+      // deliberately, because a plausible-looking rpm on a jet is worse than
+      // an absent one. Passing state.rpm unconditionally leaves a 737's fans
+      // frozen solid while it flies — no error, just a still picture.
+      aircraft.spinProp(state.engineGauge === 'n1' ? state.n1Pct : state.rpm, dt);
     }
 
     // 5. world + view. Cameras first: terrain streams around wherever the
@@ -735,6 +888,29 @@ async function boot() {
 
     // 6. hud + sound. The crash card is driven off the model's latched flag,
     //    not off an event, so it survives a paused frame and a camera change.
+    /**
+     * TELL THE PILOT WHY THE FLAPS ARE NOT MOVING.
+     *
+     * A placard-limited flap selection is silent: the lever moves through
+     * every gate and the wing does not budge. That is correct — and it is
+     * indistinguishable from a broken key. It cost a lot of confusion, because
+     * the honest answer ("you are 12 kt too fast") was nowhere on screen.
+     *
+     * Fires only on a real disagreement between the lever and the flaps, once
+     * per selection, and only when the flaps have had time to travel.
+     */
+    if (!paused) {
+      const want = inputs.flaps ?? 0;
+      const got = state.flapsPos ?? 0;
+      const blocked = want - got > 0.04;
+      if (blocked && want !== lastFlapWant) {
+        overlay.toast(`too fast for flaps — ${state.indicatedAirspeedKts.toFixed(0)} kt`);
+        lastFlapWant = want;
+      } else if (!blocked) {
+        lastFlapWant = -1;
+      }
+    }
+
     instruments.update(state, inputs);
     overlay.setAutopilot(autopilot);
     // The compact HUD crops RPM and the nearest field off the windscreen; the
@@ -795,9 +971,17 @@ async function boot() {
     renderer,
     terrain,
     sky,
-    flight,
+    /**
+     * GETTERS, not values. `flight` and `aircraft` are BOTH reassigned when
+     * the aircraft type changes, so capturing them by value froze window.sim
+     * on whichever aeroplane booted first. Everything still worked — the app
+     * uses the live bindings — but every probe through window.sim was reading
+     * a disposed model, which cost real time chasing a flap bug that was not
+     * there. A debug surface that lies is worse than no debug surface.
+     */
+    get flight() { return flight; },
     cameras,
-    aircraft,
+    get aircraft() { return aircraft; },
     input,
     sound,
     autopilot,

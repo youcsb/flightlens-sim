@@ -111,8 +111,27 @@ const THROTTLE_RATE = 0.42;
 /** Brake application/release rate (fraction/second). Brakes are not a switch. */
 const BRAKE_RATE = 6.0;
 
-/** Flap notches, as fractions of full extension. */
-const FLAP_NOTCHES = [0, 0.34, 0.67, 1];
+/**
+ * FLAP GATES, as fractions of full extension. THE LEVER IS PER-AIRCRAFT.
+ *
+ * A Cessna's selector has four positions (0/10/20/30 deg) and a 737's has
+ * seven (0/1/5/15/25/30/40). Flying the jet on the Cessna's gates meant the
+ * smallest selection available was 0.34 — flaps 13.6 — which is ABOVE the
+ * 250 kt placard for anything past flaps 5, so it blew back to 2.4 deg and
+ * looked, correctly, like nothing had happened. The two settings a 737 pilot
+ * actually uses at that speed, flaps 1 and flaps 5, were not on the lever at
+ * all.
+ *
+ * Stated as fractions of the type's FULL travel, so they line up with
+ * `flaps.vfeSchedule` in the airframe and with FLAP_SETS in instruments.js.
+ * All three describe the same gates and must agree.
+ */
+const FLAP_GATE_SETS = {
+  c172: [0, 0.34, 0.67, 1],
+  //    UP    1      5     15     25    30    40   (of 40 degrees)
+  b738: [0, 0.025, 0.125, 0.375, 0.625, 0.75, 1],
+};
+let FLAP_NOTCHES = FLAP_GATE_SETS.c172;
 
 /**
  * Trim step per keypress, and the accelerated step once a key auto-repeats.
@@ -854,6 +873,23 @@ export function createInput(domElement, opts = {}) {
   }
 
   return {
+    /**
+     * Swap the flap lever's gates when the aircraft changes. Re-quantises the
+     * current selection onto the new gates rather than keeping an index, which
+     * would mean "notch 3" silently becoming a different deflection.
+     */
+    setFlapGates(key) {
+      const next = FLAP_GATE_SETS[key];
+      if (!next || next === FLAP_NOTCHES) return;
+      const cur = controls.flaps;
+      FLAP_NOTCHES = next;
+      let best = 0;
+      for (let i = 1; i < next.length; i += 1) {
+        if (Math.abs(next[i] - cur) < Math.abs(next[best] - cur)) best = i;
+      }
+      flapIndex = best;
+      controls.flaps = next[best];
+    },
     get,
     dispose,
     setThrottle,

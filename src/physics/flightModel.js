@@ -127,6 +127,7 @@ import {
   GRAVITY,
   RHO_SEA_LEVEL,
   airDensity,
+  speedOfSound,
 } from '../core/units.js';
 import { llToLocal, localToLl } from '../geo/coords.js';
 import { C172 } from './airframes/c172.js';
@@ -412,6 +413,43 @@ export function createFlightModel(opts = {}) {
 
   const GROUND_EFFECT_K = AERO.groundEffectK;
 
+  // ---------------------------------------------------------------------------
+  // COMPRESSIBILITY — off by default, and off means BYPASSED, not zeroed.
+  //
+  // Below about M0.3 none of this is measurable, and a C172 cannot reach M0.3
+  // in level flight, so switching it on for the Cessna would buy nothing and
+  // cost a rounding difference in every number the harnesses assert. An
+  // airframe that lives near the speed of sound sets `machEffects: true` and
+  // gets three things a subsonic model does not have:
+  //
+  //   1. Prandtl-Glauert. The lift-curve slope grows as 1/sqrt(1 - M^2). At
+  //      M0.78 that is a 60% steeper wing: the same gust produces 60% more g,
+  //      and the aeroplane is correspondingly twitchier in pitch at cruise
+  //      than it is on approach. This also LOWERS the alpha at which it stalls.
+  //   2. Wave drag. Above the critical Mach number a shock forms on the upper
+  //      surface and drag climbs steeply. This is what stops a jet from simply
+  //      accelerating to Vne in the cruise — it is a drag wall, not a placard.
+  //   3. Mmo. A speed limit expressed in Mach rather than IAS, which at
+  //      altitude bites long before Vne does.
+  // ---------------------------------------------------------------------------
+  const MACH_EFFECTS = AERO.machEffects === true;
+  /** Drag-divergence onset. 0.72 is a mid-1980s supercritical section. */
+  const M_CRIT = AERO.mCrit > 0 ? AERO.mCrit : 0.72;
+  /**
+   * Wave-drag scale. Cd_wave = k * ((M - Mcrit) / (1 - Mcrit))^3, so the rise
+   * is cubic in how far past the divergence you are: negligible at Mcrit,
+   * comparable to the whole parasite drag by M0.86. A cubic is the standard
+   * cheap fit to the knee and it has the property that matters — you can feel
+   * where the wall is before you hit it.
+   */
+  const MACH_DRAG_K = AERO.machDragK >= 0 ? AERO.machDragK : 0.1;
+  /**
+   * Prandtl-Glauert is singular at M1 and this is not a transonic model. The
+   * correction is frozen at M0.92, past which the airframe is already deep
+   * into wave drag and well past its Mmo break.
+   */
+  const PG_MACH_MAX = 0.92;
+
   // Control surfaces and trim.
   const DE_MAX = CTRL.deMaxRad;
   const DA_MAX = CTRL.daMaxRad;
@@ -426,9 +464,67 @@ export function createFlightModel(opts = {}) {
   const FLAP_DCLMAX = FLAP.dClMax;
   const FLAP_DCD = FLAP.dCd;
   const VFE_MS = FLAP.vfeMs;
+  /**
+   * FLAP PLACARD SCHEDULE — a max position per speed, optional.
+   *
+   * `vfeMs` alone says "above this speed no flap at all", which is true of a
+   * Cessna and false of every airliner. A 737 may select flaps 1 and 5 at
+   * 250 kt, 15 at 200, 25 at 190 and 40 at 162: the limit is a STAIRCASE, and
+   * collapsing it to its lowest step means the aeroplane refuses all flap at a
+   * perfectly normal 250 kt descent speed. Which is exactly what it did.
+   *
+   * Each entry is { pos, ms }: at or below `ms`, flap may extend to `pos`.
+   * Absent, the single-vfeMs behaviour below is used unchanged — so a Cessna
+   * takes the identical code path it always has.
+   */
+  const VFE_SCHEDULE =
+    Array.isArray(FLAP.vfeSchedule) && FLAP.vfeSchedule.length
+      ? FLAP.vfeSchedule
+      : null;
 
   // Propulsion response and single-engine asymmetry.
+  /**
+   * WHICH KIND OF ENGINE. 'piston' is a naturally aspirated piston turning a
+   * fixed-pitch propeller; 'turbofan' is a high-bypass fan.
+   *
+   * This is a branch and not a set of coefficients because the two have
+   * opposite SHAPES, not different magnitudes. A propeller converts a roughly
+   * constant shaft power into thrust, so its thrust falls as 1/V and is nearly
+   * gone by 200 kt. A turbofan produces roughly constant THRUST, sagging only
+   * gently with Mach. Faking a jet with a huge `maxPowerW` gets the sea-level
+   * static number right and then decays through the whole climb — the aircraft
+   * would run out of thrust at exactly the speeds a 737 lives at.
+   */
+  const PROPULSION = PROP.propulsion === 'turbofan' ? 'turbofan' : 'piston';
   const SPOOL_RATE = PROP.spoolRate;
+  /**
+   * Spool-DOWN rate, per second. Defaults to spoolRate, which is what a piston
+   * does and is what keeps the C172 bit-identical. A big fan is asymmetric:
+   * accelerating the core is slow (it has to burn its way up against inertia),
+   * decelerating is quicker. That asymmetry is most of why jets are flown with
+   * the thrust levers ahead of the aeroplane on approach.
+   */
+  const SPOOL_RATE_DOWN =
+    PROP.spoolRateDown > 0 ? PROP.spoolRateDown : PROP.spoolRate;
+  /** Residual thrust at flight idle, as a fraction of static. */
+  const IDLE_THRUST_FRAC =
+    PROP.idleThrustFrac >= 0 ? PROP.idleThrustFrac : 0.055;
+  /**
+   * Density exponent for turbofan thrust: T ~ sigma^n. n = 1 would be pure
+   * mass-flow scaling; the real number is a little under that because the
+   * colder air aloft raises the pressure ratio and claws some back. 0.85 puts
+   * a CFM56 at ~37% of its static thrust at FL350, which is the book figure.
+   */
+  const THRUST_LAPSE_EXP = PROP.thrustLapseExp > 0 ? PROP.thrustLapseExp : 0.85;
+  /**
+   * Mach thrust sag for a high-bypass fan: T/T0 = 1 - k*sqrt(M) (Mattingly).
+   * The fan is doing less work on air that is already moving fast relative to
+   * it. 0.49 costs ~43% of static thrust at M0.78 — which is why a 737 needs
+   * most of its thrust at cruise and has plenty on the runway.
+   */
+  const THRUST_MACH_K = PROP.thrustMachK >= 0 ? PROP.thrustMachK : 0.49;
+  const N1_IDLE = PROP.n1Idle > 0 ? PROP.n1Idle : 21;
+  const N1_MAX = PROP.n1Max > 0 ? PROP.n1Max : 100;
   const WINDMILL_RPM_PER_MS = PROP.windmillRpmPerMs;
   const WINDMILL_CD0 = PROP.windmillCd0;
   const SLIPSTREAM_ARM_M = PROP.slipstreamArmM;
@@ -449,6 +545,18 @@ export function createFlightModel(opts = {}) {
   const CRASH_LOAD_SUSTAIN_S = LIMITS.crashLoadSustainS;
   const CRASH_LOAD_INSTANT_G = LIMITS.crashLoadInstantG;
   const OVERSPEED_BREAK = LIMITS.overspeedBreak;
+  /**
+   * Bounds on the DERIVED CLmax (see below). These are a sanity rail on a
+   * number computed from stall speed and mass, not a physical law, so they
+   * belong to the airframe: 2.4 is generous for a plain flapped wing and much
+   * too low for anything with leading-edge devices. Getting this wrong is
+   * SILENT — the aeroplane simply stalls at the wrong speed and nothing says
+   * so, which is why the two ends are named and not literals.
+   */
+  const CL_MAX_MIN = LIMITS.clMaxMin > 0 ? LIMITS.clMaxMin : 0.9;
+  const CL_MAX_MAX = LIMITS.clMaxMax > 0 ? LIMITS.clMaxMax : 2.4;
+  /** Mmo. Only consulted when machEffects is on; Infinity means "IAS only". */
+  const MMO = MACH_EFFECTS && LIMITS.mmo > 0 ? LIMITS.mmo : Infinity;
 
   // -------------------------------------------------------------------------
   // Derived airframe constants — computed once, never per frame.
@@ -460,8 +568,28 @@ export function createFlightModel(opts = {}) {
   const AR = (SPAN * SPAN) / S_WING;
   const CHORD = S_WING / SPAN;
   const K_INDUCED = 1 / (Math.PI * AR * cfg.oswald);
-  /** Finite-wing lift-curve slope, Helmbold. ~4.96 /rad for AR 7.47. */
-  const CL_ALPHA = (2 * Math.PI) / (1 + 2 / AR);
+  /**
+   * Finite-wing lift-curve slope, Helmbold. ~4.96 /rad for AR 7.47.
+   *
+   * Sweep, when the airframe declares any, multiplies it by cos(sweep) — simple
+   * sweep theory: only the component of the flow normal to the quarter-chord
+   * does aerodynamic work. Aspect ratio alone cannot tell you this, and the
+   * difference is not small: a 737's 25 deg of sweep costs 9% of its slope, and
+   * a model that ignored it would give the jet a Cessna's pitch response.
+   *
+   * Sweep is also WHY the jet has a high critical Mach number, but the two are
+   * separate knobs here — `aero.mCrit` is stated directly rather than derived,
+   * because real Mcrit depends on the section as much as on the sweep, and a
+   * supercritical aerofoil is most of a 737's.
+   *
+   * Zero sweep skips the multiply outright, so a straight wing keeps the exact
+   * float it always had.
+   */
+  const SWEEP_RAD = (AERO.sweepDeg > 0 ? AERO.sweepDeg : 0) * DEG_TO_RAD;
+  const CL_ALPHA =
+    SWEEP_RAD > 0
+      ? ((2 * Math.PI) / (1 + 2 / AR)) * Math.cos(SWEEP_RAD)
+      : (2 * Math.PI) / (1 + 2 / AR);
 
   /**
    * CLmax is DERIVED from the configured clean stall speed, so `stallSpeedMs`
@@ -474,8 +602,8 @@ export function createFlightModel(opts = {}) {
   const CL_MAX = clamp(
     WEIGHT /
       (0.5 * RHO_SEA_LEVEL * cfg.stallSpeedMs * cfg.stallSpeedMs * S_WING),
-    0.9,
-    2.4,
+    CL_MAX_MIN,
+    CL_MAX_MAX,
   );
 
   const massScale = MASS / 1100;
@@ -571,8 +699,23 @@ export function createFlightModel(opts = {}) {
     rollDeg: 0,
     /** Climb rate, FEET PER MINUTE, + = climbing. */
     verticalSpeedFpm: 0,
-    /** Propeller/engine speed, REVOLUTIONS PER MINUTE. */
+    /** Propeller/engine speed, REVOLUTIONS PER MINUTE. Zero on a turbofan,
+     *  which has no propeller and reads `n1Pct` instead — see `engineGauge`. */
     rpm: 0,
+    /** Fan speed, PERCENT of redline. Zero on a piston. */
+    n1Pct: 0,
+    /**
+     * Which of the two above the panel should believe: 'rpm' | 'n1'. A gauge
+     * cannot work this out from the numbers — an idling fan and a stopped
+     * propeller both read low — so the airframe declares it.
+     */
+    engineGauge: PROPULSION === 'turbofan' ? 'n1' : 'rpm',
+    /**
+     * Mach number. Always published, even for airframes that ignore
+     * compressibility, because it is a real quantity and a HUD may want it;
+     * whether it FEEDS BACK into the aerodynamics is `aero.machEffects`.
+     */
+    mach: 0,
     /** True while the wing is stalled. AoA-based, with hysteresis — NOT a
      *  speed threshold. You can stall this aircraft at any speed. */
     stalled: false,
@@ -744,6 +887,36 @@ export function createFlightModel(opts = {}) {
   let inBrakes = 0;
   // Integration accumulator and a clock used only for stall-buffet phase.
   let accumulator = 0;
+  /**
+   * RENDER INTERPOLATION.
+   *
+   * step() advances the world in whole 1/240 s substeps and carries whatever
+   * time is left over. That is what makes the physics frame-rate independent,
+   * and it is also, on its own, VISIBLY JITTERY: a real display never delivers
+   * exactly 16.667 ms, so a frame consumes three substeps or four depending on
+   * the residue, and `state.position` therefore advances in uneven jumps.
+   *
+   * Measured, with ordinary vsync jitter of +/-0.4 ms, as the worst per-frame
+   * departure from smooth motion:
+   *
+   *     C172 at 100 kt    24 cm      3% of the aeroplane's length — invisible
+   *     B738 at 250 kt    70 cm
+   *     B738 at 450 kt    96 cm
+   *
+   * It scales with speed, which is why nobody saw it until there was a jet:
+   * a metre of positional noise at frame rate, against a camera whose springs
+   * move smoothly, reads as a doubled or ghosted aeroplane.
+   *
+   * The fix is the standard one and it is PURELY VISUAL — no harness output
+   * moves, because `state` is untouched. Keep the pose from one substep back
+   * and let the renderer draw between it and the current one, `renderAlpha` of
+   * the way along. That renders up to one substep (4 ms) in the past, which is
+   * the price of smoothness and is well under a frame.
+   */
+  const _prevPos = new THREE.Vector3();
+  const _prevQuat = new THREE.Quaternion();
+  let havePrev = false;
+  let renderAlpha = 0;
   let clock = 0;
   // Running ground-height for refreshDisplay between substeps.
   let lastGround = 0;
@@ -958,16 +1131,20 @@ export function createFlightModel(opts = {}) {
    *
    * @param {number} aEff  alpha relative to the zero-lift line, radians
    * @param {number} aMaxPos positive-side critical alphaEff, radians
+   * @param {number} clAlpha lift-curve slope, /rad. This is a PARAMETER rather
+   *        than the module's CL_ALPHA because compressibility steepens it —
+   *        see MACH_EFFECTS. Subsonic airframes pass CL_ALPHA itself, so the
+   *        curve is the identical function it always was.
    * @param {{cl:number, sep:number}} out
    */
-  function liftCurve(aEff, aMaxPos, out) {
+  function liftCurve(aEff, aMaxPos, clAlpha, out) {
     const sign = aEff >= 0 ? 1 : -1;
     const a = aEff >= 0 ? aEff : -aEff;
     const aMax = sign > 0 ? aMaxPos : aMaxPos * NEG_STALL_SCALE;
     const knee = aMax - ALPHA_SOFT;
 
     if (a <= knee) {
-      out.cl = sign * CL_ALPHA * a;
+      out.cl = sign * clAlpha * a;
       out.sep = 0;
       return out;
     }
@@ -975,11 +1152,11 @@ export function createFlightModel(opts = {}) {
       // Quadratic that matches value and slope at `knee` and flattens at aMax.
       const t = (a - knee) / ALPHA_SOFT;
       out.cl =
-        sign * CL_ALPHA * (knee + ALPHA_SOFT * (t - 0.5 * t * t));
+        sign * clAlpha * (knee + ALPHA_SOFT * (t - 0.5 * t * t));
       out.sep = 0;
       return out;
     }
-    const clPeak = CL_ALPHA * (aMax - 0.5 * ALPHA_SOFT);
+    const clPeak = clAlpha * (aMax - 0.5 * ALPHA_SOFT);
     const w = 1 - Math.exp(-(a - aMax) / STALL_BREAK);
     const flat =
       CL_FLATPLATE * Math.sin(2 * (a < Math.PI * 0.5 ? a : Math.PI * 0.5));
@@ -1005,6 +1182,8 @@ export function createFlightModel(opts = {}) {
     if (state.crashed) {
       engineSpool = moveToward(engineSpool, 0, 1.2 * h);
       state.rpm = Math.max(0, state.rpm - 900 * h);
+      state.n1Pct = Math.max(0, state.n1Pct - 30 * h);
+      state.mach = 0;
       state.thrustN = 0;
       state.velocity.set(0, 0, 0);
       state.angularVelocity.set(0, 0, 0);
@@ -1050,6 +1229,23 @@ export function createFlightModel(opts = {}) {
     const qbar = 0.5 * rho * V * V;
     const qS = qbar * S_WING;
 
+    // --- Mach ---------------------------------------------------------------
+    // Computed only when the airframe asks for it: a sqrt per substep is cheap
+    // but not free, and a subsonic aeroplane would be paying it to multiply by
+    // one. `state.mach` is still published either way — a Cessna's Mach number
+    // is a real quantity, it is just never large enough to change anything.
+    const mach = V / speedOfSound(state.position.y);
+    let clAlphaEff = CL_ALPHA;
+    let cdWave = 0;
+    if (MACH_EFFECTS) {
+      const mPG = mach < PG_MACH_MAX ? mach : PG_MACH_MAX;
+      clAlphaEff = CL_ALPHA / Math.sqrt(1 - mPG * mPG);
+      if (mach > M_CRIT) {
+        const over = (mach - M_CRIT) / (1 - M_CRIT);
+        cdWave = MACH_DRAG_K * over * over * over;
+      }
+    }
+
     // --- body rates -> aero rates ------------------------------------------
     const p = -state.angularVelocity.z;
     const q = state.angularVelocity.x;
@@ -1062,40 +1258,127 @@ export function createFlightModel(opts = {}) {
     const rHat = (r * SPAN) / (2 * vRef);
 
     // --- flaps: travel rate, then blow-back above Vfe ----------------------
-    const blowBack = clamp(1 - (V - VFE_MS) / 12, 0, 1);
+    // Blow-back. Each placard contributes the position it permits, and the
+    // flaps may go to whichever permits the most.
+    //
+    // THE FADE BAND IS NARROW HERE — 3 m/s, not the single-Vfe path's 12.
+    // A placard is a limit, not a suggestion: below it you get the whole gate.
+    // Reusing the 12 m/s (23 kt) softening meant you had to be 23 kt UNDER a
+    // placard before the gate fully deployed, so flaps 5 gave 2.3 degrees at
+    // 238 kt instead of 5. The wide band exists on the single-Vfe path to keep
+    // a Cessna's one limit from being a hard switch; with a staircase there is
+    // always another step below, so the softening is not needed and actively
+    // lies about what the lever is worth.
+    let blowBack;
+    if (VFE_SCHEDULE) {
+      /**
+       * INDICATED airspeed, not true. A placard is an IAS number — it is a
+       * dynamic-pressure limit and that is what the airflow actually applies
+       * to the flap. The single-Vfe path below compares TRUE airspeed, which
+       * is wrong in the same way but invisible on a Cessna: at 500 ft the two
+       * differ by 1%. This aeroplane cruises at 2,500 m where TAS runs ~10%
+       * over IAS, so every gate was judged against a speed the aeroplane was
+       * not doing and sat one notch behind the lever the whole way down.
+       *
+       * The old path is deliberately left on V. Changing it would move the
+       * Cessna's numbers, and its baseline is the thing that proves none of
+       * this work touched it.
+       */
+      const iasMsFlap = V * Math.sqrt(sigma);
+      blowBack = 0;
+      for (let i = 0; i < VFE_SCHEDULE.length; i++) {
+        const e = VFE_SCHEDULE[i];
+        const allowed = e.pos * clamp(1 - (iasMsFlap - e.ms) / 3, 0, 1);
+        if (allowed > blowBack) blowBack = allowed;
+      }
+    } else {
+      blowBack = clamp(1 - (V - VFE_MS) / 12, 0, 1);
+    }
     const flapCmd = Math.min(clamp(inFlaps, 0, 1), blowBack);
     flapPos = moveToward(flapPos, flapCmd, FLAP_TRAVEL_RATE * h);
 
     // --- lift curve, shifted and stretched by flap ------------------------
+    // CLmax itself is set by SEPARATION and barely moves with Mach, so a
+    // steeper slope means the wing reaches that same CLmax at a SMALLER alpha.
+    // That is the right behaviour and it is the reason high-altitude jet upsets
+    // are so unforgiving: the margin between cruise alpha and stall alpha
+    // shrinks as you climb, from both ends at once.
     const cl0Eff = CL0 + FLAP_DCL0 * flapPos;
-    const alphaZeroLift = -cl0Eff / CL_ALPHA;
+    const alphaZeroLift = -cl0Eff / clAlphaEff;
     const alphaEffMax =
-      (CL_MAX + FLAP_DCLMAX * flapPos) / CL_ALPHA + 0.5 * ALPHA_SOFT;
+      (CL_MAX + FLAP_DCLMAX * flapPos) / clAlphaEff + 0.5 * ALPHA_SOFT;
     const alphaEff = alpha - alphaZeroLift;
-    liftCurve(alphaEff, alphaEffMax, _cl);
+    liftCurve(alphaEff, alphaEffMax, clAlphaEff, _cl);
     const clWing = _cl.cl;
     const sep = _cl.sep;
 
     // --- engine ------------------------------------------------------------
-    // One lagged engine state drives BOTH the rpm gauge and the thrust, so
-    // what you hear and what you feel are the same number. Naturally aspirated
-    // power lapse with density: P/P0 = (sigma - 0.117) / 0.883.
-    engineSpool = damp(engineSpool, inThrottle, SPOOL_RATE, h);
-    const powerLapse = clamp((sigma - 0.117) / 0.883, 0, 1);
-    const shaftW = P_MAX * powerLapse * (0.03 + 0.97 * engineSpool);
-    const thrust = (shaftW * ETA) / Math.cbrt(V * V * V + THRUST_KNEE3);
+    // One lagged engine state drives BOTH the gauge and the thrust, so what you
+    // hear and what you feel are the same number.
+    //
+    // The spool rate is directional. For a piston the two rates are equal and
+    // this is exactly the single damp() it always was; a fan accelerates more
+    // slowly than it decelerates, which is a thing you have to fly around.
+    engineSpool = damp(
+      engineSpool,
+      inThrottle,
+      inThrottle >= engineSpool ? SPOOL_RATE : SPOOL_RATE_DOWN,
+      h,
+    );
+
+    let thrust;
+    if (PROPULSION === 'turbofan') {
+      // Flat-rated thrust, not shaft power. It sags with density and with
+      // Mach, and it does NOT have a 1/V term — that term is the propeller,
+      // and there isn't one.
+      const machT = mach > 0 ? mach : 0;
+      const machFactor = clamp(1 - THRUST_MACH_K * Math.sqrt(machT), 0.25, 1);
+      thrust =
+        cfg.staticThrustN *
+        (IDLE_THRUST_FRAC + (1 - IDLE_THRUST_FRAC) * engineSpool) *
+        Math.pow(sigma, THRUST_LAPSE_EXP) *
+        machFactor;
+    } else {
+      // Naturally aspirated power lapse with density: P/P0 = (sigma-0.117)/0.883.
+      // Then a fixed-pitch propeller converts shaft power to thrust, which is
+      // where the 1/V roll-off comes from.
+      const powerLapse = clamp((sigma - 0.117) / 0.883, 0, 1);
+      const shaftW = P_MAX * powerLapse * (0.03 + 0.97 * engineSpool);
+      thrust = (shaftW * ETA) / Math.cbrt(V * V * V + THRUST_KNEE3);
+    }
     state.thrustN = thrust;
 
-    // rpm: commanded by the same spool state, but the airstream will drive the
-    // prop faster than idle on the way down — a glide is not a silent glide.
-    const cmdRpm =
-      cfg.idleRpm +
-      engineSpool * (cfg.maxRpm - cfg.idleRpm) * (0.55 + 0.45 * sigma);
-    const windmillRpm = V * WINDMILL_RPM_PER_MS;
-    state.rpm = Math.min(
-      cfg.maxRpm,
-      cmdRpm > windmillRpm ? cmdRpm : windmillRpm,
-    );
+    if (PROPULSION === 'turbofan') {
+      // N1 is a FAN SPEED, and thrust goes up far faster than it does — so the
+      // gauge rises quickly off idle and then crawls, and the last 10% of the
+      // needle is a third of the thrust. This is why jets are flown on N1 and
+      // not on "throttle %": 65% N1 is nearly nothing and 90% is nearly
+      // everything, and the difference between them is the whole approach.
+      //
+      // The exponent maps SPOOL (the commanded thrust fraction), not the thrust
+      // fraction including its idle floor — mapping the latter put a parked
+      // aeroplane at 51% N1, because idle thrust is 5.5% and the curve is very
+      // steep down there. Idle is idle: spool 0 reads exactly n1Idle.
+      state.n1Pct =
+        N1_IDLE + (N1_MAX - N1_IDLE) * Math.pow(clamp(engineSpool, 0, 1), 0.35);
+      // There is no propeller and nothing for the airstream to windmill into a
+      // gauge reading. Leaving `rpm` at zero is deliberate: a plausible-looking
+      // rpm on a turbofan is worse than an obviously absent one, because a
+      // wrong number that reads right is a number nobody checks.
+      state.rpm = 0;
+    } else {
+      // rpm: commanded by the same spool state, but the airstream will drive
+      // the prop faster than idle on the way down — a glide is not silent.
+      const cmdRpm =
+        cfg.idleRpm +
+        engineSpool * (cfg.maxRpm - cfg.idleRpm) * (0.55 + 0.45 * sigma);
+      const windmillRpm = V * WINDMILL_RPM_PER_MS;
+      state.rpm = Math.min(
+        cfg.maxRpm,
+        cmdRpm > windmillRpm ? cmdRpm : windmillRpm,
+      );
+      state.n1Pct = 0;
+    }
 
     // --- drag --------------------------------------------------------------
     // Ground effect: induced drag collapses inside a wingspan of the surface.
@@ -1108,7 +1391,13 @@ export function createFlightModel(opts = {}) {
     const sinA = Math.sin(alphaEff);
     const cdSep = sep * CD_SEPARATED * sinA * sinA;
     const cd =
-      cfg.cd0 + cdWindmill + FLAP_DCD * flapPos + cdInduced + CD_BETA * beta * beta + cdSep;
+      cfg.cd0 +
+      cdWindmill +
+      FLAP_DCD * flapPos +
+      cdInduced +
+      CD_BETA * beta * beta +
+      cdSep +
+      cdWave;
 
     // --- control deflections, radians -------------------------------------
     // Stick +1 pitch = nose up. Elevator TE-down is positive, so pull is
@@ -1473,17 +1762,39 @@ export function createFlightModel(opts = {}) {
       if (state.velocity.y < 0) state.velocity.y = 0;
     }
 
-    // --- Vne is not decorative --------------------------------------------
+    // --- Vne and Mmo are not decorative ------------------------------------
     // Advisory below the break so the HUD can shout; structural above it.
+    //
+    // TWO limits, whichever bites first. Vne is a dynamic-pressure limit and is
+    // a fixed IAS; Mmo is a compressibility limit and is a fixed Mach. Low down
+    // Vne is the binding one; high up Mmo is, because the same Mach number
+    // corresponds to less and less IAS as the air thins. The altitude where
+    // they cross is the corner of the envelope, and on a 737 it is around
+    // FL260. A model with only Vne lets you fly a jet clean through Mmo at
+    // cruise and never says a word.
+    // The IAS comparisons below are written exactly as they always were, rather
+    // than refactored into a shared ratio: an airframe with no Mmo must take
+    // the identical branch on the identical floating-point comparison, or the
+    // Cessna's structural-failure altitude moves by a rounding error.
     const iasMs = V * Math.sqrt(sigma);
-    state.overspeed = iasMs > VNE_MS;
-    if (iasMs > VNE_MS * OVERSPEED_BREAK) {
+    const hasMmo = MMO !== Infinity;
+    state.overspeed = iasMs > VNE_MS || (hasMmo && mach > MMO);
+    if (
+      iasMs > VNE_MS * OVERSPEED_BREAK ||
+      (hasMmo && mach > MMO * OVERSPEED_BREAK)
+    ) {
       overspeedTime += h;
       if (CRASH_ON && overspeedTime > 0.5) {
+        // Name whichever limit is proportionally further past — that is the
+        // one that actually broke it.
+        const byMach = hasMmo && mach / MMO > iasMs / VNE_MS;
         triggerCrash(
           'overspeed',
-          `structural failure — ${(iasMs * MS_TO_KTS).toFixed(0)} KIAS past a ` +
-            `${(VNE_MS * MS_TO_KTS).toFixed(0)} kt Vne`,
+          byMach
+            ? `structural failure — M${mach.toFixed(2)} past an ` +
+                `M${MMO.toFixed(2)} Mmo`
+            : `structural failure — ${(iasMs * MS_TO_KTS).toFixed(0)} KIAS ` +
+                `past a ${(VNE_MS * MS_TO_KTS).toFixed(0)} kt Vne`,
           iasMs,
           gh,
         );
@@ -1513,6 +1824,7 @@ export function createFlightModel(opts = {}) {
     state.alphaRad = alpha;
     state.betaRad = beta;
     state.airspeedMs = V;
+    state.mach = mach;
     state.separation = sep;
     state.flapsPos = flapPos;
     state.flaps = flapPos;
@@ -1658,10 +1970,22 @@ export function createFlightModel(opts = {}) {
     // descent, which reads as a bug rather than as a glider start.
     engineSpool = agl > 0 ? 0.7 : 0;
     state.rpm = cfg.idleRpm + engineSpool * (cfg.maxRpm - cfg.idleRpm);
+    if (PROPULSION === 'turbofan') {
+      state.n1Pct =
+        N1_IDLE + (N1_MAX - N1_IDLE) * Math.pow(clamp(engineSpool, 0, 1), 0.35);
+      state.rpm = 0;
+    } else {
+      state.n1Pct = 0;
+    }
+    state.mach = 0;
     state.flapsPos = 0;
     state.flaps = 0;
     state.brakes = 0;
     accumulator = 0;
+    // A teleport must not be interpolated FROM wherever the aeroplane used to
+    // be — that would draw it streaking across the map for one frame.
+    havePrev = false;
+    renderAlpha = 0;
     lastGround = ground;
     flattenContactGround(ground);
     sampleGroundNormal(_local.x, _local.z, ground);
@@ -1716,6 +2040,11 @@ export function createFlightModel(opts = {}) {
     accumulator += frame;
     let n = 0;
     while (accumulator >= FIXED_DT && n < MAX_SUBSTEPS) {
+      // Keep the state from BEFORE this substep so the renderer can draw
+      // between the two most recent simulated instants. See renderTransform().
+      _prevPos.copy(state.position);
+      _prevQuat.copy(state.orientation);
+      havePrev = true;
       integrate(FIXED_DT, gh);
       accumulator -= FIXED_DT;
       n++;
@@ -1723,6 +2052,9 @@ export function createFlightModel(opts = {}) {
     // Spiral-of-death guard: if we hit the cap the machine is behind, and
     // hoarding the backlog only makes the next frame worse. Drop it.
     if (n >= MAX_SUBSTEPS) accumulator = 0;
+
+    // Leftover time that has NOT been simulated, as a fraction of a substep.
+    renderAlpha = accumulator / FIXED_DT;
 
     refreshDisplay(gh);
     return state;
@@ -1734,7 +2066,28 @@ export function createFlightModel(opts = {}) {
 
   reset();
 
-  return { state, config, step, reset };
+  /**
+   * The pose to DRAW this frame, interpolated between the last two substeps.
+   *
+   * Cosmetic only: nothing in the physics reads it, and `state.position` is
+   * still the authoritative simulated pose. Callers that need truth — the
+   * ground sampler, the autopilot, any harness — must keep using `state`.
+   *
+   * @param {THREE.Vector3} outPos
+   * @param {THREE.Quaternion} outQuat
+   */
+  function renderTransform(outPos, outQuat) {
+    if (!havePrev) {
+      outPos.copy(state.position);
+      outQuat.copy(state.orientation);
+      return;
+    }
+    const a = renderAlpha < 0 ? 0 : renderAlpha > 1 ? 1 : renderAlpha;
+    outPos.copy(_prevPos).lerp(state.position, a);
+    outQuat.copy(_prevQuat).slerp(state.orientation, a);
+  }
+
+  return { state, config, step, reset, renderTransform };
 }
 
 /* ---------------------------------------------------------------------------
