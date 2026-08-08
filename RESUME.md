@@ -1,7 +1,12 @@
 # RESUME — Ken Flight Sim
 
-Paused **2026-08-07** for a machine restart. **Everything is committed; the working
-tree is clean and both gates are green.** Nothing is lost.
+Paused **2026-08-08**. **Everything is committed; the working tree is clean and
+both gates are green.** Nothing is lost.
+
+**The Boeing 737-800 is done and flyable — press `I` to switch aircraft.** It
+is on the branch `jet-flight-model`, five commits, NOT merged and NOT deployed.
+See the plan-of-record section at the bottom, which is now a record of what was
+built and measured rather than a plan.
 
 ## Restart here
 
@@ -12,7 +17,8 @@ npm run dev                                  # http://localhost:5173
 ```
 
 No servers are running — they were stopped to free the machine. `npm run build`
-and `npm run check:all` (~620 assertions across 15 harnesses) both pass at HEAD.
+and `npm run check:all` (1,313 assertions across 19 harnesses) both pass on
+`jet-flight-model`. `main` is untouched at `39c5b75`.
 
 **Do not run `npm install`.** No Homebrew on this machine.
 
@@ -27,6 +33,7 @@ and `npm run check:all` (~620 assertions across 15 harnesses) both pass at HEAD.
 | `L` · `[` `]` · `Y` · `U`/`J` | autopilot · heading bug · sync bug · altitude bug |
 | `F` · `B` · `G` · `C` · `R` · `V` | flaps · brakes · gear · camera · reset · panel view |
 | `,` · `.` · `K` | **trim** nose down · nose up · neutral |
+| `I` | **change aircraft** — Cessna 172 / Boeing 737-800 |
 
 **Trim is how you hold altitude.** Set power, then tap `,` / `.` until the VSI
 reads zero, then let go of the stick. Measured: 32 ft of drift over 60 s at
@@ -186,115 +193,169 @@ Two measurement traps that cost real time:
 to `www.geoheat.com`). Needs 60+ seconds before the viewport stops being black.
 The "Privacy Shield / Download extension" panel is a deceptive ad — never click it.
 
-## Boeing 737-800 — plan of record (started 2026-08-07)
+## Boeing 737-800 — DONE AND FLYABLE (2026-08-07/08)
 
-**BOTH AIRCRAFT, SELECTABLE. The Cessna is not being replaced.** Ken was
-explicit: "make sure we can pick between the current cesna or a 737, don't just
-change the only option." Every step below preserves the C172 as the default.
+**Both aircraft are selectable. Press `I`.** The Cessna is the default and is
+byte-for-byte the aeroplane it was: every flight-model number in envelope,
+trim, autopilot and instruments diffs identical against baselines captured at
+`39c5b75`.
 
-**Local only for now** — no deploying to flightlens.us until the kinks are out.
-game.flightlens.us keeps serving the Cessna-only build.
+**Still LOCAL ONLY. Nothing deployed.** game.flightlens.us is still serving the
+Cessna-only build. Deploy when you have flown this and are happy with it.
 
-### Step 1 — DONE (`791acbc`, merged to main, NOT deployed)
-
-`src/physics/airframes/c172.js` is now the Cessna as data — 20 config keys, six
-groups (`aero`, `controls`, `flaps`, `prop`, `gear`, `limits`). `flightModel.js`
-keeps 18 module-scope constants, all genuinely physics or integration.
-A second aircraft is one sibling file plus one line at the call site.
-
-**Gate passed and independently re-verified:** envelope, trim and autopilot
-output byte-identical to the pre-refactor baselines. build green, check:all
-green at **1,208 assertions across 16 harnesses**.
-
-#### THE IMPORTANT PART — what a 737 still needs in CODE, not data
-
-The refactor clears its own bar (an invented 60 t jet flies as pure data), but
-it is NOT enough for a *good* 737. Fix 1–3 before anyone models the jet; 4 is a
-quiet trap:
-
-1. **Propulsion is a piston with a propeller on it.** `shaftW = P_MAX · lapse ·
-   spool` then `T = shaftW·η / ∛(V³ + knee³)` — naturally-aspirated power lapse
-   and fixed-pitch prop roll-off. A turbofan is roughly flat thrust and *rises*
-   in relative terms where a prop sags. Magnitude can be faked with a huge
-   `maxPowerW`; the SHAPE is wrong through the whole climb. Wants a
-   `propulsion: 'piston' | 'turbofan'` branch.
-2. **`state.rpm` is an rpm gauge.** A jet shows N1 %. `idleRpm: 20, maxRpm: 100`
-   produces a plausible-looking number, which is worse than an obviously wrong
-   one.
-3. **No compressibility at all** — no Prandtl–Glauert on CL_ALPHA, no Mach drag
-   rise, no Mmo. Vne is pure IAS. A 737 cruises at M0.78 where those dominate.
-   **The biggest physics gap.**
-4. **`CL_MAX` is clamped to 0.9..2.4.** A high-wing-loading airframe with slats
-   hits the ceiling and its stall speed comes out silently wrong. One line.
-5. No gear-retraction axis or gear drag increment (a 172's gear is welded down).
-6. Flaps are one continuous 0..1 axis — no detents, no slats as a separate
-   surface, no speedbrake, spoilers or reversers. A 737's schedule is a table
-   with a placard speed per notch.
-7. One thrust vector on the centreline — no engine-out asymmetry.
-8. Some feel literals still inline in `integrate()`: flap blow-back band, stall
-   hysteresis and warning threshold, tailplane/aileron blanking.
-9. `aircraft/model.js` needs a 737 mesh and hardcodes a −1.2 m contact patch
-   that must match `gearHeightM`.
-
-**So the earlier 3–5 hour estimate for the jet was optimistic.** Items 1–3 are
-real model work, not config, and item 3 is a new subsystem.
-
-### Superseded — original step 1 description
-
-flightModel.js had 67 module-scope constants describing exactly one aeroplane.
-`DEFAULTS` already carried mass, wing area, span, power, cd0 and the inertias;
-what stayed hardcoded were the aero derivatives, control travel, flaps, the prop
-model, the gear contact table, and the limits.
-
-The refactor makes an airframe a DATA FILE (`src/physics/airframes/c172.js`), so
-a 737 is a sibling file rather than a code change.
-
-**Gate: behaviour-preserving.** A baseline of envelope / trim / autopilot output
-was captured before the change and lives at:
+Branch: **`jet-flight-model`**, five commits, not merged to `main`. `main` is
+untouched at `39c5b75`. The git log is the real documentation — every number
+that moved says what it was measured against.
 
 ```
-/private/tmp/claude-501/-Users-KenAltmann-Desktop-Ken-Flight-Sim/ab3e450b-5ca2-43df-8ed0-8fb9d26a6eb6/scratchpad/baseline/
-    envelope.txt   trim.txt   autopilot.txt
+cd9b8f8  Autopilot: the same law, the jet's own gains
+33ac1ac  Aircraft picker: two aeroplanes, one key, and the Cessna still boots
+9aaa108  b738model: a 737 you can look at, and a toolkit both aeroplanes share
+a62b918  b738: a Boeing 737-800, as data, flown until the numbers were true
+2e12c39  flightModel: an engine can be a turbofan, and a wing can feel Mach
 ```
 
-Verify it yourself with:
+Gates: `npm run build` green, `npm run check:all` green — **1,313 assertions
+across 19 harnesses**, up from 1,208 across 16.
+
+### Fly it
 
 ```bash
+cd "/Users/KenAltmann/Desktop/Ken Flight Sim"
 export PATH="$HOME/.local/node/bin:$PATH"
-B=/private/tmp/claude-501/-Users-KenAltmann-Desktop-Ken-Flight-Sim/ab3e450b-5ca2-43df-8ed0-8fb9d26a6eb6/scratchpad/baseline
-npm run envelope 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | diff "$B/envelope.txt" -
+npm run dev
 ```
 
-An empty diff means the refactor moved WHERE the numbers live without changing
-what they are. A non-empty diff means behaviour changed — find out why; do not
-update the baseline and do not relax an assertion. (That scratchpad is
-session-scoped and may be cleaned up; if it is gone, regenerate a baseline from
-the last commit before the refactor.)
+`I` cycles the aircraft. The choice persists in localStorage and
+`?aircraft=b738` forces it. Everything else works the same on both.
 
-The diff must be empty. Every number — rotate
-55 kt, best climb 743 fpm, climb 764 → 297 fpm with altitude, the stall break,
-the landing — has to come out identical, because only the LOCATION of the
-numbers changed.
+**Flying the 737 is not flying the Cessna.** Rotate at 145 kt, not 55. It lifts
+off at about 172 and needs 1,772 m of runway. Do not haul it into a 30-degree
+climb and let go of the stick at 1,200 ft — it will pitch down hard and hit the
+ground, which is what happened the first time it was flown here. Trim it.
 
-### Then, in order
+The tail strikes at 10.8 degrees nose-up on the wheels. That is correct and it
+is the real number for a -800.
 
-2. **737 flight model** — `airframes/b738.js`: Mach drag rise above ~M0.7,
-   turbofan spool lag (N1 takes 5–8 s, not a prop's instant response), slats as
-   well as flaps, spoilers, ~250–450 kt envelope, Vne ~340 KIAS / M0.82.
-3. **737 3D model** — swept wings, two underwing nacelles, winglets, larger
-   gear. A sibling of the procedural C172 in `aircraft/model.js`.
-4. **Aircraft picker** — in the place picker / menu, and it must survive a
-   `reset`. Per-aircraft spawns: a jet wants KSEA's long runway or an airborne
-   start, not KBFI 32L at idle.
-5. **Per-aircraft autopilot gains** — the current ones are tuned for 40–160 kt
-   and its airspeed protection floor is 58 kt. A jet needs its own set.
-6. **Tile prefetch at 450 kt** — the DEM pager was tuned for ~100 kt and is
-   untested at 4.5x that. Genuinely unknown; expect this to need work.
+### What each step did
 
-### Deliberately deferred
+| Step | State |
+|---|---|
+| 1 · airframe as data | done previously (`791acbc`) |
+| 1.5 · turbofan, Mach, CLmax rail, N1 | done (`2e12c39`) |
+| 2 · `airframes/b738.js` | done (`a62b918`) |
+| 3 · 3D model + `lofting.js` | done (`9aaa108`) |
+| 4 · picker, camera, gauges | done (`33ac1ac`) |
+| 5 · per-aircraft autopilot gains | done (`cd9b8f8`) |
+| 6 · tile prefetch at 450 kt | **measured — no work needed, see below** |
 
-**The glass cockpit.** A 737 wants a PFD/ND, which is effectively a new
-2,000-line module. Skipping it is roughly half the work, and a real 737 carries
-standby analog instruments for exactly these readings — so the existing six-pack
-is not a cop-out. Its own round later, better for having a flying jet to build
-against.
+### Step 6: the DEM pager already keeps up
+
+RESUME used to say "genuinely unknown; expect this to need work". It was
+measured instead, and it does not need work.
+
+Method: fly the jet fast, record the terrain height the simulation actually
+used at each point along the path, wait six seconds for the pager to settle,
+then re-sample those same world coordinates. Any difference is terrain that
+sharpened AFTER you flew over it — which is the symptom.
+
+```
+  433 KTAS near Rainier   worst delta 0.00 m over 20 samples
+  337 KTAS over Seattle   worst delta 0.00 m over 22 samples  (z14 still
+                          loading at the time: 58 tiles resident, 70 pending)
+```
+
+Zero, not "small". `tilesMissing 0`, `capViolations 0`, 58 MB resident against
+a 100 MB cap. The reason it works is that `LEAD_SECONDS = 60` in elevation.js
+gives 13.4 km of lead at 433 kt, still inside the z13 radius of 30 km and still
+under the `LEAD_MAX_M` 20 km clamp. The design had the headroom by accident.
+
+**The one thing to watch if anything ever gets faster:** z14's radius is 9 km
+and the lead at jet speed is 13.4 km, so the fine layer's desired disc no
+longer contains the aircraft. It did not bite (the measurement above was taken
+over Seattle precisely to catch it) because z13 covers the gap, but at a higher
+`LEAD_SECONDS` or a faster aeroplane it would.
+
+### The 737, as flown
+
+`npm run check:jet` — 54 checks. `npm run check:b738` — 35 checks on the mesh.
+
+```
+  rotate            148 KIAS        ground roll   1,772 m
+  lift-off          172 KIAS        climb         2,300 fpm
+  stall, flap 40    110 KIAS        clean         warns at 164, mushes
+  cruise            M0.78 at FL350, 93% thrust, alpha 2.6 deg
+  ceiling           holds M0.77 at FL390 on full thrust
+  Mmo               flags at M0.82 / 265 KIAS — 75 kt INSIDE the placard
+  roll rate         16.9 deg/s at 160 kt
+  landing           145 kt at 478 fpm, stopped in 1,133 m
+  tail strike       10.8 deg on the wheels
+```
+
+Arrival table, measured, in `b738.js` beside `limits.crashLoadG`: 631 fpm
+survives at 3.04 g, 863 fpm collapses the gear, 1,070 fpm overloads the
+airframe. The GEAR fails first, on closing speed, before any load holds for
+60 ms — which is correct. The legs are the fuse.
+
+### Deliberately NOT done
+
+- **The glass cockpit.** Still its own round, as planned. The jet flies on the
+  six-pack with a real N1 gauge in place of the tachometer — face rebuilt,
+  0-110%, green from 85, redline 104. That is a defensible standby panel, not
+  a placeholder.
+- **Engine-out asymmetry.** One thrust vector on the centreline. `b738.js`
+  says so where it sets both prop asymmetry arms to zero.
+- **Flap detents, slats as a separate surface, spoilers, speedbrakes,
+  reversers.** Flaps are still one continuous 0..1 axis, so `flaps.vfeMs` is a
+  compromise at the flaps-15 placard (200 kt) rather than a real per-detent
+  schedule. The file says so. Detents must land in `b738.js` and
+  `b738model.js` together or the aeroplane you see stops being the one you fly.
+- **The 90-degree autopilot turn takes 82 s** and overshoots 25 deg of bank by
+  about 3. It settles to zero error and does not oscillate, so the roll axis
+  keeps the Cessna's gains until someone flies it and disagrees.
+
+### Traps found the hard way — all of these cost real time
+
+1. **`bakeStatic` takes no options.** A `skip` callback is accepted by
+   JavaScript, ignored by the function, and silently merges the things you
+   meant to keep. The real mechanism is `userData.animated = true`.
+2. **`Box3.setFromObject` measures LOCAL space until something has rendered**,
+   because every `matrixWorld` is still identity. It put the engine nacelle
+   1.9 m above the wheels instead of 0.45 — a measurement error that reads
+   exactly like a modelling error.
+3. **A PD from altitude error straight to the elevator oscillates a heavy
+   aeroplane, and MORE DAMPING MAKES IT WORSE.** Vertical speed lags pitch by
+   most of a quarter cycle, so the "damping" term excites the phugoid. Use a
+   cascade: vertical speed → pitch ATTITUDE → elevator, damped on pitch rate.
+   Same shape as the `RATE_TAU` bug already in the autopilot's notes.
+4. **`state.rpm` is 0 on a turbofan, deliberately.** Three separate places were
+   reading it and getting a frozen fan, a dead needle and a stale HUD row.
+   `state.engineGauge` says which number to read.
+5. **"Max pitch while `onGround`" is not the tail-strike angle.** `onGround`
+   means some contact is loaded and the skid IS a contact — the aeroplane
+   levers off its tail and climbs away still reporting `onGround` at 14 deg.
+   Measure pitch at wheel height.
+6. **A linear gear damper peaks at FIRST CONTACT**, where a real oleo is still
+   soft. `c = 300,000` wrote the aeroplane off on a normal 630 fpm landing.
+7. **The `baked:xxxxxxxx` mesh hash in `check:aircraft` is nondeterministic
+   run to run.** It is decoration, not an assertion. Do not chase it when
+   diffing that harness — everything else in the file is stable.
+
+### If you want to change a 737 number
+
+Go to `src/physics/airframes/b738.js`. Every number has the reasoning beside
+it and says what it was measured against. Then:
+
+```bash
+npm run check:jet && npm run check:b738
+```
+
+The Cessna must not move. Regenerate a baseline from `main` and diff if you
+touch anything in `flightModel.js` or `units.js`:
+
+```bash
+git stash && npm run envelope > /tmp/base.txt && git stash pop
+npm run envelope | diff /tmp/base.txt -
+```
+
+
