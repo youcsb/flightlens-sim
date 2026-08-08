@@ -733,6 +733,14 @@ export function createOverlay(container, o = {}) {
  * about a second and a half.
  */
 const ACTIONS = [
+  /**
+   * AIRCRAFT first, because on a phone this sheet IS the keyboard and the
+   * aircraft picker was desktop-only when it shipped. The `I` key was the
+   * whole interface for choosing between two aeroplanes, which on touch meant
+   * the 737 could only be reached by typing ?aircraft=b738 into the URL — i.e.
+   * not at all, for anyone actually holding the thing.
+   */
+  ['KeyI', 'AIRCRAFT'],
   ['KeyC', 'VIEW'],
   ['KeyV', 'PANEL'],
   ['KeyT', 'TIME'],
