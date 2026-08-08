@@ -1258,15 +1258,37 @@ export function createFlightModel(opts = {}) {
     const rHat = (r * SPAN) / (2 * vRef);
 
     // --- flaps: travel rate, then blow-back above Vfe ----------------------
-    // Blow-back. Each placard contributes the position it permits, faded over
-    // the same 12 m/s band as the single-Vfe case, and the flaps may go to
-    // whichever permits the most. Below every placard that is simply 1.0.
+    // Blow-back. Each placard contributes the position it permits, and the
+    // flaps may go to whichever permits the most.
+    //
+    // THE FADE BAND IS NARROW HERE — 3 m/s, not the single-Vfe path's 12.
+    // A placard is a limit, not a suggestion: below it you get the whole gate.
+    // Reusing the 12 m/s (23 kt) softening meant you had to be 23 kt UNDER a
+    // placard before the gate fully deployed, so flaps 5 gave 2.3 degrees at
+    // 238 kt instead of 5. The wide band exists on the single-Vfe path to keep
+    // a Cessna's one limit from being a hard switch; with a staircase there is
+    // always another step below, so the softening is not needed and actively
+    // lies about what the lever is worth.
     let blowBack;
     if (VFE_SCHEDULE) {
+      /**
+       * INDICATED airspeed, not true. A placard is an IAS number — it is a
+       * dynamic-pressure limit and that is what the airflow actually applies
+       * to the flap. The single-Vfe path below compares TRUE airspeed, which
+       * is wrong in the same way but invisible on a Cessna: at 500 ft the two
+       * differ by 1%. This aeroplane cruises at 2,500 m where TAS runs ~10%
+       * over IAS, so every gate was judged against a speed the aeroplane was
+       * not doing and sat one notch behind the lever the whole way down.
+       *
+       * The old path is deliberately left on V. Changing it would move the
+       * Cessna's numbers, and its baseline is the thing that proves none of
+       * this work touched it.
+       */
+      const iasMsFlap = V * Math.sqrt(sigma);
       blowBack = 0;
       for (let i = 0; i < VFE_SCHEDULE.length; i++) {
         const e = VFE_SCHEDULE[i];
-        const allowed = e.pos * clamp(1 - (V - e.ms) / 12, 0, 1);
+        const allowed = e.pos * clamp(1 - (iasMsFlap - e.ms) / 3, 0, 1);
         if (allowed > blowBack) blowBack = allowed;
       }
     } else {

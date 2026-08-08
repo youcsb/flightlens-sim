@@ -452,6 +452,7 @@ async function boot() {
 
   overlay.setAircraft?.(type.name);
   instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
+  input.setFlapGates?.(typeId);
   autopilot.setProfile?.(type.autopilot);
 
   /** Reused surface-command object — see the note at the call site. */
@@ -560,6 +561,8 @@ async function boot() {
     cameras.update(0, flight.state);
 
     instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
+    // The lever's gates belong to the aeroplane too — see FLAP_GATE_SETS.
+    input.setFlapGates?.(typeId);
     // Gains for the aeroplane that now exists. Also re-zeros the integrators,
     // which were wound up for the one that does not.
     autopilot.setProfile?.(type.autopilot);

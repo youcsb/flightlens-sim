@@ -619,7 +619,11 @@ head('8b. the flap placard is a STAIRCASE, not one number');
   assert('250 kt gets SOME flap, not none', at250 > 0.05,
     `${(at250 * 40).toFixed(0)} deg — a single 200 kt Vfe gave zero here`);
   band('  and not full flap either', at250 * 40, 1, 9, 'deg');
-  band('flap available at 195 kt', at195 * 40, 10, 22, 'deg');
+  // 10..26: the loop holds ~195 kt but dips under the 190 kt flaps-25
+  // placard on the way, so either 15 or 25 is a correct answer here. The
+  // gate-by-gate table is the precise guard; this one only has to show that
+  // more flap is available than at 250 kt and less than at 150.
+  band('flap available at 195 kt', at195 * 40, 10, 26, 'deg');
   band('flap available at 150 kt', at150 * 40, 22, 40, 'deg');
   assert('more speed never means more flap', at250 <= at195 && at195 <= at150,
     'the staircase must be monotonic');
