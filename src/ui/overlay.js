@@ -663,6 +663,7 @@ export function createOverlay(container, o = {}) {
     setAutopilot(ap) {
       const txt = ap.engaged
         ? `HDG ${String(Math.round(ap.headingBug)).padStart(3, '0')} · ALT ${Math.round(ap.altitudeBug)}`
+          + (ap.vsBug ? ` · V/S ${ap.vsBug > 0 ? '+' : ''}${Math.round(ap.vsBug)}` : '')
         : 'off';
       if (stAp.textContent !== txt) stAp.textContent = txt;
       stAp.classList.toggle('v', true);
@@ -750,6 +751,8 @@ const ACTIONS = [
   ['KeyL', 'A/P'],
   ['KeyY', 'BUG=HDG'],
   ['KeyU', 'ALT +100', true],
+  ['Quote', 'V/S +', true],
+  ['Semicolon', 'V/S −', true],
   ['KeyJ', 'ALT −100', true],
   ['BracketLeft', 'HDG −', true],
   ['BracketRight', 'HDG +', true],
@@ -894,6 +897,7 @@ const KEYMAP = [
   [', · .', 'trim nose down / up'],
   ['K', 'trim to neutral'],
   ['L', 'autopilot on / off'],
+  ['; · \'', 'V/S select −/+ (hold)'],
   ['[ · ]', 'heading bug −/+ (hold)'],
   ['Y', 'bug to present heading'],
   ['U · J', 'altitude bug +/− 100'],

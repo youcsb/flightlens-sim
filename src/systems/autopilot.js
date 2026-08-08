@@ -327,6 +327,21 @@ export function createAutopilot() {
   let engaged = false;
   let headingBug = 0;
   let altitudeBug = 1000;
+  /**
+   * SELECTED VERTICAL SPEED, fpm. 0 means AUTO — the altitude law picks the
+   * rate, which is what this autopilot did before there was a V/S selector.
+   *
+   * Non-zero puts it in V/S MODE: climb or descend at the rate you asked for
+   * until the altitude bug is reached, then capture and hold. That is what a
+   * real autopilot does and it is the reason this exists — `maxVsFpm` is an
+   * automatic-mode ceiling (600 fpm on the Cessna), so before this the only
+   * way to climb faster than the gain schedule allowed was to fly it by hand.
+   *
+   * The selection is NOT clamped to maxVsFpm. Ask for 3,000 fpm in a 172 and
+   * you will get whatever the aeroplane can actually do — the airspeed
+   * protection below is what stops it mushing, and it is the honest limiter.
+   */
+  let vsBug = 0;
 
   // Integrator state. Zeroed on every engage — see the header note.
   let bankI = 0;
@@ -411,6 +426,11 @@ export function createAutopilot() {
     get altitudeBug() {
       return altitudeBug;
     },
+    /** Selected vertical speed, fpm; 0 = automatic. Read by the HUD, which
+     *  takes the api object rather than status(). */
+    get vsBug() {
+      return vsBug;
+    },
 
     /**
      * Toggle. On engage the bugs snap to the CURRENT heading and altitude, so
@@ -441,6 +461,9 @@ export function createAutopilot() {
       }
       headingBug = Math.round(state.headingDeg ?? 0);
       altitudeBug = Math.round((state.altitudeFt ?? 0) / 100) * 100;
+      // A rate selected on a previous engagement is not what you want on this
+      // one; engaging should always start in the predictable automatic mode.
+      vsBug = 0;
       resetIntegrators();
       engaged = true;
       lastReason = '';
@@ -464,6 +487,23 @@ export function createAutopilot() {
     nudgeAltitude(deltaFt) {
       altitudeBug = clamp(altitudeBug + deltaFt, 0, 30000);
       return altitudeBug;
+    },
+    /**
+     * Adjust the selected vertical speed, fpm. Passing 0 through zero turns
+     * V/S mode OFF and hands the rate back to the altitude law.
+     * @returns {number} the new selection
+     */
+    nudgeVs(deltaFpm) {
+      vsBug = clamp(vsBug + deltaFpm, -4000, 4000);
+      // Snap through zero rather than past it, so "back to AUTO" is reachable
+      // with the same key you climbed with.
+      if (Math.abs(vsBug) < 50) vsBug = 0;
+      return vsBug;
+    },
+    /** Hand the rate back to the altitude law. */
+    clearVs() {
+      vsBug = 0;
+      return 0;
     },
 
     /**
@@ -522,6 +562,7 @@ export function createAutopilot() {
         engaged,
         headingBug,
         altitudeBug,
+        vsBug,
         lastReason,
       };
     },
@@ -570,7 +611,22 @@ export function createAutopilot() {
 
       // --- vertical: altitude -> vertical speed -> elevator ------------------
       const altErr = altitudeBug - (state.altitudeFt ?? 0);
-      let vsTarget = clamp(altErr * G.kAltToVs, -G.maxVsFpm, G.maxVsFpm);
+      /**
+       * V/S MODE, with altitude capture.
+       *
+       * With a rate selected, fly it — but only in the direction of the bug,
+       * and never past it. `room` below already stops the automatic law
+       * overshooting the target altitude; the same clamp is applied here, so
+       * selecting +2,000 fpm with the bug 300 ft above you levels off at the
+       * bug instead of blowing through it. Selecting a climb when the bug is
+       * BELOW you does nothing, which is the sane reading of a contradiction.
+       */
+      let vsTarget;
+      if (vsBug !== 0 && Math.abs(altErr) > 20 && Math.sign(vsBug) === Math.sign(altErr)) {
+        vsTarget = vsBug;
+      } else {
+        vsTarget = clamp(altErr * G.kAltToVs, -G.maxVsFpm, G.maxVsFpm);
+      }
 
       // Airspeed protection, in two stages.
       //
@@ -584,6 +640,12 @@ export function createAutopilot() {
       //
       // The integrator is also dumped downward, or its accumulated nose-up
       // command survives the recovery and flies straight back into the stall.
+      // Do not fly toward the bug faster than the remaining altitude justifies
+      // — this is the capture, and it has to bound a SELECTED rate as well as
+      // an automatic one or V/S mode sails straight through the target.
+      const capture = clamp(altErr * G.kAltToVs, -Math.abs(vsTarget), Math.abs(vsTarget));
+      if (Math.abs(capture) < Math.abs(vsTarget)) vsTarget = capture;
+
       const kts = state.airspeedKts ?? 0;
       const room = (kts - G.vsFloorKts) / (G.vsProtectKts - G.vsFloorKts);
       if (room < 0) {

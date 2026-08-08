@@ -92,7 +92,9 @@ let altRepeat = 0;
  * Nudging is inherently a "do it again until it looks right" gesture, so it is
  * the one thing here that has to survive a finger left on the button.
  */
-const REPEATABLE_KEYS = new Set(['BracketLeft', 'BracketRight', 'KeyU', 'KeyJ']);
+const REPEATABLE_KEYS = new Set([
+  'BracketLeft', 'BracketRight', 'KeyU', 'KeyJ', 'Semicolon', 'Quote',
+]);
 
 // ---------------------------------------------------------------------------
 // Places you can start from.
@@ -456,6 +458,7 @@ async function boot() {
   autopilot.setProfile?.(type.autopilot);
 
   /** Reused surface-command object — see the note at the call site. */
+  let vsRepeat = 0;
   const surf = { pitch: 0, roll: 0, yaw: 0, flaps: 0, flapsExact: true };
   /** Last flap selection we warned about, so the toast fires once per press. */
   let lastFlapWant = -1;
@@ -765,6 +768,25 @@ async function boot() {
         const step = altRepeat > 30 ? 300 : altRepeat > 12 ? 200 : 100;
         const bug = autopilot.nudgeAltitude(code === 'KeyU' ? step : -step);
         overlay.toast(`ALT bug ${bug} ft`);
+        break;
+      }
+      // --- vertical speed --------------------------------------------------
+      case 'Semicolon':
+      case 'Quote': {
+        /**
+         * V/S SELECT. The autopilot's automatic climb rate is capped by
+         * `maxVsFpm` — 600 fpm on the Cessna — which is a sensible default and
+         * a poor ceiling when you actually want to get somewhere. Selecting a
+         * rate here overrides it until the altitude bug is captured.
+         *
+         * 100 fpm a press with the same accelerating hold as the other bugs.
+         * The selection snaps through zero back to AUTO, so the key you climbed
+         * with is the key that hands the rate back.
+         */
+        vsRepeat = e.repeat ? Math.min(vsRepeat + 1, 60) : 0;
+        const step = vsRepeat > 30 ? 500 : vsRepeat > 12 ? 200 : 100;
+        const vs = autopilot.nudgeVs(code === 'Quote' ? step : -step);
+        overlay.toast(vs === 0 ? 'V/S auto' : `V/S ${vs > 0 ? '+' : ''}${vs} fpm`);
         break;
       }
       case 'Digit1':
