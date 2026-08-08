@@ -329,8 +329,28 @@ class Spring3 {
 // Mode table
 // ---------------------------------------------------------------------------
 
-const MODE_NAMES = ['chase', 'cockpit', 'orbit', 'flyby'];
-const MODE_FOV = [CHASE_FOV, COCKPIT_FOV, ORBIT_FOV, FLYBY_FOV_MAX];
+/**
+ * The modes the C key cycles.
+ *
+ * 'flyby' — the planted tripod the aircraft passes, the "belly view" — is
+ * REMOVED, not deleted. It ghosted: the aeroplane rendered as two overlapping
+ * images, visible in motion and impossible to catch in a still frame. The
+ * render interpolation added to flightModel (see renderTransform) and the
+ * camera's switch to framing the DRAWN pose both helped and neither fixed it,
+ * and the residual measured shake — 0.4 px — is far too small to explain what
+ * was on screen. The cause is still unknown.
+ *
+ * Everything that implements it is left in place below, so putting it back is
+ * adding the name to these two arrays. See RESUME.md for the diagnosis that
+ * was never run: capture consecutive frames via WebGLRenderTarget readback and
+ * diff them, which separates "drawn twice in one frame" from "alternating
+ * across frames". Those have different causes.
+ *
+ * Worth being honest in here: whatever it is may well affect the other three
+ * views too, below the threshold where anyone notices. This is a workaround.
+ */
+const MODE_NAMES = ['chase', 'cockpit', 'orbit'];
+const MODE_FOV = [CHASE_FOV, COCKPIT_FOV, ORBIT_FOV];
 
 /**
  * @param {THREE.Object3D} aircraftGroup The aircraft root from createAircraft().
