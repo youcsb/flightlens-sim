@@ -455,7 +455,7 @@ async function boot() {
   autopilot.setProfile?.(type.autopilot);
 
   /** Reused surface-command object — see the note at the call site. */
-  const surf = { pitch: 0, roll: 0, yaw: 0, flaps: 0 };
+  const surf = { pitch: 0, roll: 0, yaw: 0, flaps: 0, flapsExact: true };
 
   const dem = getRegionStats();
   console.info(
@@ -863,6 +863,8 @@ async function boot() {
       surf.roll = inputs.roll;
       surf.yaw = inputs.yaw;
       surf.flaps = state.flapsPos;
+      // Already rate- and blow-back-limited by the model; do not ramp it twice.
+      surf.flapsExact = true;
       aircraft.setControlSurfaces(surf);
       // WHICH NUMBER DRIVES THE SPINNER IS THE AIRFRAME'S TO SAY. A piston
       // publishes rpm and leaves n1Pct at zero; a turbofan does the reverse,
@@ -941,9 +943,17 @@ async function boot() {
     renderer,
     terrain,
     sky,
-    flight,
+    /**
+     * GETTERS, not values. `flight` and `aircraft` are BOTH reassigned when
+     * the aircraft type changes, so capturing them by value froze window.sim
+     * on whichever aeroplane booted first. Everything still worked — the app
+     * uses the live bindings — but every probe through window.sim was reading
+     * a disposed model, which cost real time chasing a flap bug that was not
+     * there. A debug surface that lies is worse than no debug surface.
+     */
+    get flight() { return flight; },
     cameras,
-    aircraft,
+    get aircraft() { return aircraft; },
     input,
     sound,
     autopilot,

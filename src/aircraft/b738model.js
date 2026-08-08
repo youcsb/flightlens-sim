@@ -960,6 +960,9 @@ export function createB738(scene, opts = {}) {
 
   const flapOrigin = (mirror) =>
     new THREE.Vector3(0, wingPlanform((FLAP_SPAN[0] + FLAP_SPAN[1]) / 2).y, FLAP_HINGE_Z);
+  /** Named so a harness (and a debug probe) can find the FLAPS specifically
+   *  rather than taking the largest rotation in the graph, which is usually
+   *  the elevator. */
   const flapL = hingedPanel({
     parent: wingRoot, planform: wingPlanform, airfoil: AF_WING,
     a: FLAP_SPAN[0], b: FLAP_SPAN[1], steps: 10,
@@ -974,6 +977,9 @@ export function createB738(scene, opts = {}) {
     origin: flapOrigin(false), axis: new THREE.Vector3(1, 0, 0), mirror: false,
     material: paintWing,
   });
+
+  flapL.pivot.name = 'flapL';
+  flapR.pivot.name = 'flapR';
 
   const ailOrigin = new THREE.Vector3(0, wingPlanform((AIL_SPAN[0] + AIL_SPAN[1]) / 2).y, AIL_HINGE_Z);
   const ailL = hingedPanel({
@@ -1302,7 +1308,23 @@ export function createB738(scene, opts = {}) {
     sPitch = toward(sPitch, clamp(c.pitch ?? 0, -1, 1), SURFACE_RATE * dt);
     sRoll = toward(sRoll, clamp(c.roll ?? 0, -1, 1), SURFACE_RATE * dt);
     sYaw = toward(sYaw, clamp(c.yaw ?? 0, -1, 1), SURFACE_RATE * dt);
-    sFlap = toward(sFlap, clamp(c.flaps ?? 0, 0, 1), FLAP_RATE * dt);
+    /**
+     * `flapsExact` means the caller is handing us a POSITION, not a lever.
+     *
+     * flightModel's `state.flapsPos` has ALREADY been through the travel rate
+     * and the blow-back limit. Ramping it again here at the same rate makes the
+     * visual a first-order lag chasing a moving target, and it never catches
+     * up: measured on the 737 at flapsPos 0.37, the wing was drawn at 8.8 deg
+     * against an expected 14.8. The Cessna hid it because its flaps travel 2.5x
+     * faster, so the lag is small enough to miss.
+     *
+     * The ramp stays the default because a caller driving this from a raw stick
+     * — every harness does — still needs it, and check-*.mjs measures it.
+     */
+    const flapTarget = clamp(c.flaps ?? 0, 0, 1);
+    sFlap = c && c.flapsExact
+      ? flapTarget
+      : toward(sFlap, flapTarget, FLAP_RATE * dt);
 
     // Stick back (+pitch) = elevator TRAILING EDGE UP = nose up. The hinge axis
     // is +X, and rotating +X by a positive angle sends the trailing edge DOWN,

@@ -883,6 +883,10 @@ export function createAircraft(scene, opts = {}) {
   const aileronL = mkWingSurface(AIL_SPAN, AIL_HINGE_Z, true);
   const flapR = mkWingSurface(FLAP_SPAN, FLAP_HINGE_Z, false);
   const flapL = mkWingSurface(FLAP_SPAN, FLAP_HINGE_Z, true);
+  // Named so a harness can find the FLAPS specifically rather than taking the
+  // largest rotation in the graph, which is usually the elevator.
+  flapR.pivot.name = 'flapR';
+  flapL.pivot.name = 'flapL';
 
   // ---- horizontal tail ---------------------------------------------------
   const hstabHingeZ = hstabPlanform(1.0).zLE + hstabPlanform(1.0).chord * HSTAB.hingeFrac;
@@ -1427,7 +1431,23 @@ export function createAircraft(scene, opts = {}) {
     sPitch = toward(sPitch, clamp((c && c.pitch) || 0, -1, 1), SURFACE_RATE * dt);
     sRoll = toward(sRoll, clamp((c && c.roll) || 0, -1, 1), SURFACE_RATE * dt);
     sYaw = toward(sYaw, clamp((c && c.yaw) || 0, -1, 1), SURFACE_RATE * dt);
-    sFlap = toward(sFlap, clamp((c && c.flaps) || 0, 0, 1), FLAP_RATE * dt);
+    /**
+     * `flapsExact` means the caller is handing us a POSITION, not a lever.
+     *
+     * flightModel's `state.flapsPos` has ALREADY been through the travel rate
+     * and the blow-back limit. Ramping it again here at the same rate makes the
+     * visual a first-order lag chasing a moving target, and it never catches
+     * up: measured on the 737 at flapsPos 0.37, the wing was drawn at 8.8 deg
+     * against an expected 14.8. The Cessna hid it because its flaps travel 2.5x
+     * faster, so the lag is small enough to miss.
+     *
+     * The ramp stays the default because a caller driving this from a raw stick
+     * — every harness does — still needs it, and check-*.mjs measures it.
+     */
+    const flapTarget = clamp((c && c.flaps) || 0, 0, 1);
+    sFlap = c && c.flapsExact
+      ? flapTarget
+      : toward(sFlap, flapTarget, FLAP_RATE * dt);
 
     const pitch = sPitch;
     const roll = sRoll;
