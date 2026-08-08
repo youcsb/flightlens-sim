@@ -454,6 +454,9 @@ async function boot() {
   instruments.setEngineGauge?.(flight.state.engineGauge, typeId);
   autopilot.setProfile?.(type.autopilot);
 
+  /** Reused surface-command object — see the note at the call site. */
+  const surf = { pitch: 0, roll: 0, yaw: 0, flaps: 0 };
+
   const dem = getRegionStats();
   console.info(
     `[sim] spawn ${spawn.label} @ ${spawn.lat.toFixed(5)}, ` +
@@ -841,7 +844,26 @@ async function boot() {
       // of 1/240 s — about a metre of noise at jet speeds, which reads as a
       // ghosted aeroplane. See renderTransform() in flightModel.js.
       flight.renderTransform(acMount.position, acMount.quaternion);
-      aircraft.setControlSurfaces(inputs);
+      /**
+       * THE FLAPS THE AEROPLANE SEES, NOT THE ONES THE LEVER ASKED FOR.
+       *
+       * `inputs.flaps` is the raw lever. `state.flapsPos` is where the flaps
+       * actually ARE after the flight model has applied its travel rate and,
+       * crucially, BLOW-BACK: above Vfe the airflow pushes them back up and
+       * they refuse to extend. The 737's Vfe is 200 kt, so on a 250 kt cruise
+       * the lever moves, the physics correctly keeps the flaps stowed — and
+       * the visual model, driven from the lever, deflected them anyway.
+       *
+       * That is the exact failure b738model.js's header warns about: the
+       * aeroplane you see stops being the one you fly. It also made the panel
+       * look broken, because the gauge reads `flapsPos` and was telling the
+       * truth while the wing was lying.
+       */
+      surf.pitch = inputs.pitch;
+      surf.roll = inputs.roll;
+      surf.yaw = inputs.yaw;
+      surf.flaps = state.flapsPos;
+      aircraft.setControlSurfaces(surf);
       // WHICH NUMBER DRIVES THE SPINNER IS THE AIRFRAME'S TO SAY. A piston
       // publishes rpm and leaves n1Pct at zero; a turbofan does the reverse,
       // deliberately, because a plausible-looking rpm on a jet is worse than
