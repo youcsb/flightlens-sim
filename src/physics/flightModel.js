@@ -464,6 +464,23 @@ export function createFlightModel(opts = {}) {
   const FLAP_DCLMAX = FLAP.dClMax;
   const FLAP_DCD = FLAP.dCd;
   const VFE_MS = FLAP.vfeMs;
+  /**
+   * FLAP PLACARD SCHEDULE — a max position per speed, optional.
+   *
+   * `vfeMs` alone says "above this speed no flap at all", which is true of a
+   * Cessna and false of every airliner. A 737 may select flaps 1 and 5 at
+   * 250 kt, 15 at 200, 25 at 190 and 40 at 162: the limit is a STAIRCASE, and
+   * collapsing it to its lowest step means the aeroplane refuses all flap at a
+   * perfectly normal 250 kt descent speed. Which is exactly what it did.
+   *
+   * Each entry is { pos, ms }: at or below `ms`, flap may extend to `pos`.
+   * Absent, the single-vfeMs behaviour below is used unchanged — so a Cessna
+   * takes the identical code path it always has.
+   */
+  const VFE_SCHEDULE =
+    Array.isArray(FLAP.vfeSchedule) && FLAP.vfeSchedule.length
+      ? FLAP.vfeSchedule
+      : null;
 
   // Propulsion response and single-engine asymmetry.
   /**
@@ -1241,7 +1258,20 @@ export function createFlightModel(opts = {}) {
     const rHat = (r * SPAN) / (2 * vRef);
 
     // --- flaps: travel rate, then blow-back above Vfe ----------------------
-    const blowBack = clamp(1 - (V - VFE_MS) / 12, 0, 1);
+    // Blow-back. Each placard contributes the position it permits, faded over
+    // the same 12 m/s band as the single-Vfe case, and the flaps may go to
+    // whichever permits the most. Below every placard that is simply 1.0.
+    let blowBack;
+    if (VFE_SCHEDULE) {
+      blowBack = 0;
+      for (let i = 0; i < VFE_SCHEDULE.length; i++) {
+        const e = VFE_SCHEDULE[i];
+        const allowed = e.pos * clamp(1 - (V - e.ms) / 12, 0, 1);
+        if (allowed > blowBack) blowBack = allowed;
+      }
+    } else {
+      blowBack = clamp(1 - (V - VFE_MS) / 12, 0, 1);
+    }
     const flapCmd = Math.min(clamp(inFlaps, 0, 1), blowBack);
     flapPos = moveToward(flapPos, flapCmd, FLAP_TRAVEL_RATE * h);
 

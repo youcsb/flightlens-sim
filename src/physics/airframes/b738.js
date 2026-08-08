@@ -419,7 +419,36 @@ export const B738 = {
      * full flap is available 90 kt too fast. Detents are the fix; until then
      * this errs toward being usable on approach.
      */
-    vfeMs: 102.9,
+    vfeMs: 83.3,
+    /**
+     * THE REAL PLACARD TABLE. 737-800 flap limit speeds, as (axis position,
+     * m/s indicated) — the axis runs 0..1 over 0..40 degrees, so flaps 5 is
+     * 0.125, flaps 15 is 0.375, flaps 25 is 0.625.
+     *
+     *     flaps 1 / 5     250 kt    128.6 m/s
+     *     flaps 15        200 kt    102.9
+     *     flaps 25        190 kt     97.7
+     *     flaps 30        175 kt     90.0
+     *     flaps 40        162 kt     83.3
+     *
+     * This replaces the compromise a single vfeMs forced. That comment used to
+     * read "pick the 162 kt full-flap figure and you cannot take any flap at a
+     * normal approach speed; pick 250 and full flap is available 90 kt too
+     * fast" — so it split the difference at 200 and the aeroplane then refused
+     * ALL flap at the 250 kt it spawns and descends at. A staircase is what the
+     * aeroplane actually has, and flightModel takes one now.
+     *
+     * `vfeMs` stays as the full-flap placard, both as the fallback for a model
+     * without schedule support and because it is the number a pilot means by
+     * "Vfe" on this type.
+     */
+    vfeSchedule: [
+      { pos: 0.125, ms: 128.6 },
+      { pos: 0.375, ms: 102.9 },
+      { pos: 0.625, ms: 97.7 },
+      { pos: 0.75, ms: 90.0 },
+      { pos: 1.0, ms: 83.3 },
+    ],
   },
 
   // -------------------------------------------------------------------------

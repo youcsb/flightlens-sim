@@ -582,6 +582,55 @@ head('8. arrivals — the gear is the fuse, and it fails before the wing');
 }
 
 // ---------------------------------------------------------------------------
+head('8b. the flap placard is a STAIRCASE, not one number');
+// ---------------------------------------------------------------------------
+{
+  // A 737 may select flaps 1 and 5 at 250 kt, 15 at 200, 40 at 162. A single
+  // Vfe cannot say that, and collapsing the table to its lowest step made the
+  // aeroplane refuse ALL flap at the 250 kt it spawns and descends at — which
+  // is what "flaps work on the ground but not over downtown" was.
+  //
+  // Measured as the most flap the lever can actually get out, held at a speed.
+  const maxFlapAt = (kts) => {
+    const m = jet();
+    air(m, 2000, kts);
+    let best = 0;
+    for (let i = 0; i < 60 * 25; i++) {
+      // Hold the speed rather than let it decay: the whole point is what is
+      // permitted AT a speed, and a jet with flaps out sheds 50 kt in 25 s.
+      const err = kts - m.state.indicatedAirspeedKts;
+      m.step(1 / 60, inputs({
+        pitch: vsHold(-500)(m.state),
+        throttle: clampN(0.35 + err * 0.02, 0, 1),
+        flaps: 1,
+      }), ground());
+      if (m.state.flapsPos > best) best = m.state.flapsPos;
+    }
+    return best;
+  };
+
+  const at250 = maxFlapAt(250);
+  const at195 = maxFlapAt(195);
+  const at150 = maxFlapAt(150);
+  say('flap available at 250 kt', `${(at250 * 40).toFixed(0)} deg`);
+  say('flap available at 195 kt', `${(at195 * 40).toFixed(0)} deg`);
+  say('flap available at 150 kt', `${(at150 * 40).toFixed(0)} deg`);
+
+  assert('250 kt gets SOME flap, not none', at250 > 0.05,
+    `${(at250 * 40).toFixed(0)} deg — a single 200 kt Vfe gave zero here`);
+  band('  and not full flap either', at250 * 40, 1, 9, 'deg');
+  band('flap available at 195 kt', at195 * 40, 10, 22, 'deg');
+  band('flap available at 150 kt', at150 * 40, 22, 40, 'deg');
+  assert('more speed never means more flap', at250 <= at195 && at195 <= at150,
+    'the staircase must be monotonic');
+
+  // And the Cessna must still be on the single-Vfe path, untouched.
+  const c = createFlightModel({ airframe: C172, groundHeightFn: ground });
+  assert('the C172 declares no schedule', !C172.flaps.vfeSchedule,
+    'it keeps the identical single-vfeMs code path');
+}
+
+// ---------------------------------------------------------------------------
 head('9. handling — roll rate, and no propeller asymmetry');
 // ---------------------------------------------------------------------------
 {
